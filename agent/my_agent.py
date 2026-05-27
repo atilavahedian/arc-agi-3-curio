@@ -68,12 +68,12 @@ class MyAgent(Agent):
         # `self.game_id` is set by the framework. It may be the short id
         # ("ls20") or include a version suffix ("ls20-9607627b"), so we
         # compare on the prefix to be safe.
-        pool = [a for a in GameAction if a is not GameAction.RESET]
+        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
         if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in pool]
-            action = random.choices(pool, weights=weights, k=1)[0]
+            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
+            action = random.choices(candidate_actions, weights=weights, k=1)[0]
         else:
-            action = random.choice(pool)
+            action = random.choice(candidate_actions)
         # ────────────────────────────────────────────────────────────────────
 
         if action.is_complex():

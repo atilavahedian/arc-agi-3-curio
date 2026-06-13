@@ -473,6 +473,16 @@ class MyAgent(Agent):
         self._prev_action: Optional[str] = None
         self._avail: set[int] = set()  # latest frame's available actions
         self._move_votes: dict[int, Counter[Cell]] = defaultdict(Counter)
+        # SLIDE/NODE-MAZE (tu93 family) perception: NET displacement of the
+        # minority-pixel avatar, voted PER ACTION in parallel to _move_votes.
+        # The multi-group gate (line ~945) records nothing here — a node-maze
+        # avatar (color body + accent pixel) and the corridor repaint behind
+        # it move as >=2 deltas, so _move_votes never trusts a direction.  This
+        # store is a STRICTLY ADDITIVE observer: it is read only by the slide
+        # head, never by _movement_rules / _walls, so it cannot perturb any
+        # floor game.  A zero-displacement-but-budget-spent result records a
+        # blocked edge.
+        self._slide_votes: dict[int, Counter[Cell]] = defaultdict(Counter)
         self._avatar_sigs: Counter[frozenset] = Counter()  # {(color, dx, dy)}
         self._avatar_votes: Counter[int] = Counter()  # color fallback evidence
         self._walls: set[Cell] = set()
@@ -579,6 +589,20 @@ class MyAgent(Agent):
         self._sw_strikes = 0
         self._sw_benched: Optional[int] = None
         self._sw_nogoal: Optional[tuple] = None  # (key, phases) of a dry BFS
+        # ── slide / node-maze head (tu93 family) ──
+        # A directional node-maze: each ACTION steps the avatar one corridor
+        # node toward that direction (blocked moves spend budget, no motion).
+        # The board is a regular binary corridor/wall lattice; the exit is a
+        # rare-color component.  All state here is per-level GEOGRAPHY (the
+        # board, exit and probe spend are level data) except the engaged flag
+        # and the directional probe map, which are cheap to rebuild.  Strikes
+        # bench the head for the level on repeated dry plans (PC/SW pattern).
+        self._sl_engaged = False           # sticky once a maze is confirmed
+        self._sl_probe: Counter[int] = Counter()  # directional probe spend
+        self._sl_dirmap: dict[int, Cell] = {}     # act -> unit step (probed)
+        self._sl_plan: deque[GameAction] = deque()
+        self._sl_strikes = 0
+        self._sl_benched: Optional[int] = None
         # ── win-path replay + level-start signatures (efficiency) ──
         # paths are keyed (level index, masked start-frame hash): replay
         # only ever fires when the SAME level restarts from the SAME start
@@ -687,6 +711,12 @@ class MyAgent(Agent):
             self._sw_strikes = 0
             self._sw_benched = None
             self._sw_nogoal = None
+            # the slide maze level replays deterministically: void the plan
+            # and refresh the strikes/bench (board rewinds to its start), keep
+            # the engaged flag and direction map (physics)
+            self._sl_plan.clear()
+            self._sl_strikes = 0
+            self._sl_benched = None
             # the dead life's win-path recording is garbage; the frame
             # after RESET is a level start (the engine replays the level)
             self._wp_log.clear()
@@ -800,6 +830,13 @@ class MyAgent(Agent):
             self._ed_benched = None
             self._ed_spent = 0
             self._ed_miss = 0
+            # slide-maze geography: the board and exit are new; the plan,
+            # probe spend, strikes and bench are level data (engaged flag and
+            # the learned direction map persist as physics)
+            self._sl_plan.clear()
+            self._sl_probe.clear()
+            self._sl_strikes = 0
+            self._sl_benched = None
 
         if self._wp_pending_start:
             # first frame of a level (game start, level-up, or post-death

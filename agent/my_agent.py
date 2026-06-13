@@ -192,6 +192,14 @@ SW_BFS_CAP = 6000       # (anchor x phase-vector) product-graph state budget
 SW_STRIKES = 10         # model surprises before the switch planner benches
                         # the level (novelty search takes over)
 
+# ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
+# modules (lattice/GF2, editor, attribute-state, port-align, switch) and
+# their gates, leaving ONLY the generic core — object perception, movement-
+# rule voting, BFS routing, novelty exploration, HUD masking, affordance.
+# Unset (default) is bit-identical to the full agent.  This isolates how
+# much of the score is the family heads vs. the generic substrate.
+GENERIC_ONLY = os.environ.get("CURIO_GENERIC_ONLY", "") == "1"
+
 Grid = list[list[int]]
 Cell = tuple[int, int]
 
@@ -2699,7 +2707,12 @@ class MyAgent(Agent):
 
     # ── planning ─────────────────────────────────────────────────────────
     def _policy(self, grid: Optional[Grid], latest_frame: FrameData) -> GameAction:
-        if grid is not None:
+        # CURIO_GENERIC_ONLY ablation: skip every family-specific head and
+        # its gate, dropping straight through to the generic core (warmup,
+        # novelty, BFS routing).  `not GENERIC_ONLY` is a module-level const
+        # that is True by default, so the branch below is bit-identical to
+        # the full agent when the toggle is unset.
+        if grid is not None and not GENERIC_ONLY:
             # triple-gated lattice solver (click-only + board + learned
             # recolor effect); returns None whenever the gate doesn't apply
             lattice = self._lattice_policy(grid, latest_frame)

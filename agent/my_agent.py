@@ -607,7 +607,6 @@ class MyAgent(Agent):
         self._sl_engaged = False           # sticky once a maze is confirmed
         self._sl_probe: Counter[int] = Counter()  # directional probe spend
         self._sl_dirmap: dict[int, Cell] = {}     # act -> unit step (probed)
-        self._sl_plan: deque[GameAction] = deque()
         self._sl_corridor: Optional[int] = None   # learned passable color
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
@@ -719,10 +718,10 @@ class MyAgent(Agent):
             self._sw_strikes = 0
             self._sw_benched = None
             self._sw_nogoal = None
-            # the slide maze level replays deterministically: void the plan
-            # and refresh the strikes/bench (board rewinds to its start), keep
-            # the engaged flag and direction map (physics)
-            self._sl_plan.clear()
+            # the slide maze level replays deterministically: refresh the
+            # strikes/bench (board rewinds to its start), keep the engaged
+            # flag and direction map (physics).  The head re-plans every step
+            # so there is no standing plan to void.
             self._sl_strikes = 0
             self._sl_benched = None
             # the dead life's win-path recording is garbage; the frame
@@ -838,10 +837,9 @@ class MyAgent(Agent):
             self._ed_benched = None
             self._ed_spent = 0
             self._ed_miss = 0
-            # slide-maze geography: the board and exit are new; the plan,
-            # probe spend, corridor colour, strikes and bench are level data
+            # slide-maze geography: the board and exit are new; the probe
+            # spend, corridor colour, strikes and bench are level data
             # (engaged flag and the learned direction map persist as physics)
-            self._sl_plan.clear()
             self._sl_probe.clear()
             self._sl_corridor = None
             self._sl_strikes = 0

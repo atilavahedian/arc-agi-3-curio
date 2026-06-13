@@ -608,6 +608,7 @@ class MyAgent(Agent):
         self._sl_probe: Counter[int] = Counter()  # directional probe spend
         self._sl_dirmap: dict[int, Cell] = {}     # act -> unit step (probed)
         self._sl_plan: deque[GameAction] = deque()
+        self._sl_corridor: Optional[int] = None   # learned passable color
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
         # ── win-path replay + level-start signatures (efficiency) ──
@@ -838,10 +839,11 @@ class MyAgent(Agent):
             self._ed_spent = 0
             self._ed_miss = 0
             # slide-maze geography: the board and exit are new; the plan,
-            # probe spend, strikes and bench are level data (engaged flag and
-            # the learned direction map persist as physics)
+            # probe spend, corridor colour, strikes and bench are level data
+            # (engaged flag and the learned direction map persist as physics)
             self._sl_plan.clear()
             self._sl_probe.clear()
+            self._sl_corridor = None
             self._sl_strikes = 0
             self._sl_benched = None
 
@@ -2913,6 +2915,19 @@ class MyAgent(Agent):
             lattice = self._lattice_policy(grid, latest_frame)
             if lattice is not None:
                 return lattice
+            # directional node-maze solver (tu93 family).  Dispatched BEFORE
+            # the editor: both share the [1,2,3,4] action set, but the slide
+            # gate is far stricter (a clean binary corridor/wall lattice + a
+            # unique accent avatar on a node + a rare-colour exit node), so it
+            # returns None on tr87 (no lattice, in-place glyph cycle) and
+            # ls20 (irregular tiles + register), leaving those heads intact —
+            # while winning the race on a true maze, where the editor's loose
+            # in-place-cycle gate would otherwise mis-engage on the slide
+            # animation and stall.  Its own <=4-action directional probe
+            # replaces the 500-step novelty opening.
+            slide = self._slide_policy(grid, latest_frame)
+            if slide is not None:
+                return slide
             # factored cursor+editor model (tr87 family), gated inside on
             # no clicks + a trusted in-place cycle verb + no movement
             # rules at engage time.  Runs BEFORE the warmup bench: the
@@ -3728,6 +3743,342 @@ class MyAgent(Agent):
             if r in goals:
                 return goals[r], r
         return None, 0
+
+    # ── slide / node-maze head (tu93 family) ────────────────────────────
+    def _sl_lattice(
+        self, grid: Grid, av_center: Optional[Cell] = None
+    ) -> Optional[tuple[int, int, int, set, int, int]]:
+        """Detect a regular binary corridor/wall lattice over the frame.
+
+        Returns (pitch, ox, oy, nodes, cA, cB) where nodes are the lattice
+        node anchors on the pitch sublattice and cA/cB are the two board
+        colors (one is the passable corridor, the other the wall — which is
+        which is learned by the head).  None when the frame isn't a clean
+        two-colour repeating lattice (keeps ls20's irregular tiles and
+        tr87's glyph cycle out of the head)."""
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        if len(counts) < 3:
+            return None
+        bg = counts.most_common(1)[0][0]
+        comps = components(grid)
+        # the board: same-shaped square blocks of exactly two colours that
+        # tile the frame on one pitch.  Group anchors by (color, shape).
+        shape_anchors: dict[tuple, list[Cell]] = defaultdict(list)
+        for color, cells in comps:
+            if color == bg:
+                continue
+            mx = min(x for x, _y in cells)
+            my = min(y for _x, y in cells)
+            w = max(x for x, _y in cells) - mx + 1
+            h = max(y for _x, y in cells) - my + 1
+            shape_anchors[(color, w, h)].append((mx, my))
+        # the two board colours are the two most-prolific same-square-shape
+        # block classes that share one block size
+        squares = [(len(a), c, w, a) for (c, w, h), a in shape_anchors.items()
+                   if w == h and 2 <= w <= 6 and len(a) >= LATTICE_MIN_CELLS]
+        if len(squares) < 2:
+            return None
+        squares.sort(reverse=True)
+        # require the top two share the block size (the corridor/wall pair)
+        if squares[0][2] != squares[1][2]:
+            return None
+        blk = squares[0][2]
+        cA, cB = squares[0][1], squares[1][1]
+        anchors = squares[0][3] + squares[1][3]
+        xs = sorted({x for x, _y in anchors})
+        ys = sorted({y for _x, y in anchors})
+        if len(xs) < 3 or len(ys) < 3:
+            return None
+        # block pitch = the smallest consistent anchor gap; node pitch is two
+        # blocks (corridor + wall straddle), the spacing the avatar steps by
+        gaps = Counter(b - a for a, b in zip(xs, xs[1:]) if b > a)
+        gaps.update(b - a for a, b in zip(ys, ys[1:]) if b > a)
+        if not gaps:
+            return None
+        blk_pitch, _ = gaps.most_common(1)[0]
+        if blk_pitch < blk:
+            return None
+        pitch = blk_pitch * 2
+        # node phase: anchor on the avatar — it always sits EXACTLY on a node,
+        # whereas a board-block origin can be off by a block (the avatar
+        # itself hides the node block it occupies, and the very first level's
+        # board can start mid-pitch).  Span nodes over the whole board extent.
+        if av_center is not None:
+            ox = av_center[0] % pitch
+            oy = av_center[1] % pitch
+        else:
+            ox, oy = xs[0] % pitch, ys[0] % pitch
+        bx0, bx1 = min(xs), max(xs) + blk
+        by0, by1 = min(ys), max(ys) + blk
+        if av_center is not None:
+            bx0 = min(bx0, av_center[0]); bx1 = max(bx1, av_center[0])
+            by0 = min(by0, av_center[1]); by1 = max(by1, av_center[1])
+        nodes = {(x, y)
+                 for x in range(ox, GRID, pitch)
+                 for y in range(oy, GRID, pitch)
+                 if bx0 - pitch <= x <= bx1 + pitch
+                 and by0 - pitch <= y <= by1 + pitch}
+        if len(nodes) < LATTICE_MIN_CELLS:
+            return None
+        return (pitch, ox, oy, nodes, cA, cB)
+
+    def _sl_node(self, cell: Cell, lat: tuple) -> Optional[Cell]:
+        """Snap a cell to the nearest ACTUAL lattice node (over the node
+        set, by Chebyshev distance).  Rounding alone is fragile when the
+        avatar's accent sits at an arbitrary sub-offset inside its body
+        (the offset varies by level/sprite); nearest-over-the-set tolerates
+        any offset up to a half pitch.  None if no node is within range."""
+        pitch, ox, oy, nodes, _cA, _cB = lat
+        cx, cy = cell
+        best: Optional[tuple[int, Cell]] = None
+        for nx, ny in nodes:
+            d = max(abs(nx - cx), abs(ny - cy))
+            if best is None or d < best[0]:
+                best = (d, (nx, ny))
+        if best is None or best[0] > pitch:
+            return None
+        return best[1]
+
+    def _sl_exit_node(
+        self, grid: Grid, lat: tuple, av_cells: set
+    ) -> Optional[Cell]:
+        """The rare-colour goal component (smallest non-board, non-avatar,
+        non-budget-bar blob), snapped to its lattice node."""
+        pitch, ox, oy, nodes, cA, cB = lat
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        bg = counts.most_common(1)[0][0]
+        best: Optional[tuple[int, Cell]] = None
+        for color, cells in components(grid):
+            if color in (bg, cA, cB):
+                continue
+            cs = set(cells)
+            if cs & av_cells:
+                continue
+            ys = {y for _x, y in cs}
+            xs = {x for x, _y in cs}
+            # skip wide thin border strips (budget / status bars)
+            if len(cs) >= 20 and (len(ys) <= 2 or len(xs) <= 2):
+                continue
+            if best is None or len(cs) < best[0]:
+                best = (len(cs), min(cs), cs)
+        if best is None:
+            return None
+        # snap the exit blob's CENTRE (its min-corner can sit a half-block
+        # off a node when the goal sprite isn't block-aligned)
+        cs2 = best[2]
+        cx = (min(x for x, _y in cs2) + max(x for x, _y in cs2)) // 2
+        cy = (min(y for _x, y in cs2) + max(y for _x, y in cs2)) // 2
+        node = self._sl_node((cx, cy), lat)
+        return node if node is not None and node in nodes else None
+
+    def _sl_avatar_cells(
+        self, grid: Grid, anchor: Cell, lat: Optional[tuple] = None
+    ) -> set:
+        """The avatar's body+accent pixels: components touching the accent,
+        EXCLUDING the two board colours when the lattice is known (so a body
+        block abutting a wall block doesn't drag the wall in), or just the
+        background colour while bootstrapping.  Tight blob → its centre snaps
+        to the right node."""
+        if lat is not None:
+            skip = {lat[4], lat[5]}
+        else:
+            counts: Counter[int] = Counter()
+            for row in grid:
+                counts.update(row)
+            skip = {counts.most_common(1)[0][0]}
+        out: set = set()
+        for c, cells in components(grid):
+            if c in skip:
+                continue
+            cs = set(cells)
+            if any(abs(x - anchor[0]) <= 1 and abs(y - anchor[1]) <= 1
+                   for x, y in cs):
+                out |= cs
+        return out
+
+    def _sl_body_center(
+        self, grid: Grid, anchor: Cell, lat: Optional[tuple] = None
+    ) -> Cell:
+        """Bounding-box centre of the avatar body — a jitter-proof anchor for
+        snapping (the accent's sub-offset varies, the body centre doesn't)."""
+        cells = self._sl_avatar_cells(grid, anchor, lat)
+        if not cells:
+            return anchor
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        return ((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2)
+
+    def _sl_route(
+        self, grid: Grid, start: Cell, lat: tuple, corridor: int
+    ) -> Optional[tuple[list[int], Cell]]:
+        """BFS over the node graph (edge in dir d iff the straddle block
+        between adjacent nodes is the corridor colour) to the exit node.
+        Returns (action list, exit node) or None."""
+        pitch, ox, oy, nodes, cA, cB = lat
+        av_cells = self._sl_avatar_cells(grid, start, lat)
+        # snap the avatar BODY CENTRE (jitter-proof) to its node
+        snode = self._sl_node(self._sl_body_center(grid, start, lat), lat)
+        exit_node = self._sl_exit_node(grid, lat, av_cells)
+        if exit_node is None or snode is None or snode not in nodes:
+            return None
+        half = pitch // 2
+
+        def passable(nx: int, ny: int, dx: int, dy: int) -> bool:
+            sx, sy = nx + dx * half, ny + dy * half
+            # sample the straddle block interior (a couple of probes guards
+            # against the avatar's accent landing on the sample pixel)
+            for ddx in (0, 1):
+                for ddy in (0, 1):
+                    px, py = sx + ddx, sy + ddy
+                    if 0 <= px < GRID and 0 <= py < GRID \
+                            and grid[py][px] == corridor:
+                        return True
+            return False
+
+        # default cardinal mapping, OVERRIDDEN by any confidently-probed
+        # action direction: a probe that hit a wall at the start node learns
+        # nothing, so its default is retained rather than dropping the edge
+        DIRS = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}
+        DIRS.update(self._sl_dirmap)
+        seen = {snode}
+        dq: deque[tuple[Cell, list[int]]] = deque([(snode, [])])
+        while dq:
+            pos, path = dq.popleft()
+            if pos == exit_node:
+                return (path, exit_node)
+            for a, (dx, dy) in DIRS.items():
+                if dx == dy == 0:
+                    continue
+                if passable(pos[0], pos[1], dx, dy):
+                    nxt = (pos[0] + dx * pitch, pos[1] + dy * pitch)
+                    if nxt in nodes and nxt not in seen:
+                        seen.add(nxt)
+                        dq.append((nxt, path + [a]))
+        return None
+
+    def _slide_policy(
+        self, grid: Grid, latest_frame: FrameData
+    ) -> Optional[GameAction]:
+        """Directional node-maze solver (tu93 family).  Gate (load-bearing
+        beyond the [1,2,3,4] action set it shares with ls20/tr87): a clean
+        binary corridor/wall lattice, a unique tiny accent avatar snapped to
+        a node, and a rare-colour exit node.  A <=4-action directional probe
+        learns each action's unit step (replacing the 500-step warmup); then
+        BFS over the node graph routes to the exit.  The corridor colour (vs
+        wall) is a self-correcting hypothesis: a planned step that the avatar
+        DIDN'T take (zero slide-vote) flips it.  Strikes bench the level."""
+        avail = set(latest_frame.available_actions or []) \
+            - {GameAction.RESET.value}
+        # action-set gate: movement-only, no clicks
+        if not avail or not avail <= {1, 2, 3, 4}:
+            return None
+        level = latest_frame.levels_completed
+        if self._sl_benched == level:
+            return None
+        # structural gate
+        accent = self._sl_avatar_anchor(grid)
+        if accent is None:
+            return None
+        av_anchor = accent[0]
+        # anchor the node phase on the avatar (it always sits on a node)
+        av_center = self._sl_body_center(grid, av_anchor)
+        lat = self._sl_lattice(grid, av_center)
+        if lat is None:
+            return None
+        pitch, ox, oy, nodes, cA, cB = lat
+        av_cells = self._sl_avatar_cells(grid, av_anchor, lat)
+        snode = self._sl_node(self._sl_body_center(grid, av_anchor, lat), lat)
+        if snode is None or snode not in nodes:
+            return None
+        exit_node = self._sl_exit_node(grid, lat, av_cells)
+        if exit_node is None:
+            return None
+
+        # learn the corridor colour: the board colour that, as a straddle,
+        # the avatar has been observed to cross.  Bootstrap: the colour whose
+        # straddles immediately surround the avatar's node is the corridor (a
+        # corridor must touch the start, walls box it in).  Default to the
+        # board colour with more straddle cells adjacent to the start node.
+        if self._sl_corridor is None:
+            self._sl_corridor = self._sl_guess_corridor(grid, snode, lat)
+        corridor = self._sl_corridor
+
+        # directional probe: learn each action's unit step before routing, so
+        # the node-graph plan is expressed in the engine's real directions.
+        # one probe per action; the probe NEVER strikes (it only spends the
+        # <=4 opening actions and reads the result from _slide_votes).
+        self._sl_sync_dirmap(lat)
+        for a in sorted(avail):
+            if a not in self._sl_dirmap and self._sl_probe[a] < SL_PROBE_CAP:
+                self._sl_probe[a] += 1
+                return self._step(GameAction.from_id(a))
+
+        self._sl_engaged = True
+        # RE-PLAN every step (a 36-node BFS is cheap): blind plan replay
+        # desyncs the instant any edge reading is off, so route fresh from
+        # the avatar's current node and take only the first action.  This is
+        # self-correcting across jitter and mis-classified corridors.
+        route = self._sl_route(grid, av_anchor, lat, corridor)
+        if route is None:
+            # the corridor-colour hypothesis may be inverted on this board:
+            # try the alternate once and adopt it if it routes
+            alt = cB if corridor == cA else cA
+            route = self._sl_route(grid, av_anchor, lat, alt)
+            if route is not None:
+                self._sl_corridor = alt
+        if route is None or not route[0]:
+            self._sl_strikes += 1
+            if self._sl_strikes >= SL_STRIKES:
+                self._sl_benched = level
+            return None
+        return self._step(GameAction.from_id(route[0][0]))
+
+    def _sl_guess_corridor(self, grid: Grid, snode: Cell, lat: tuple) -> int:
+        """The board colour that appears as a straddle adjacent to the start
+        node more often (a corridor must connect the avatar to the maze)."""
+        pitch, ox, oy, nodes, cA, cB = lat
+        half = pitch // 2
+        tally: Counter[int] = Counter()
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            sx, sy = snode[0] + dx * half, snode[1] + dy * half
+            for ddx in (0, 1):
+                for ddy in (0, 1):
+                    px, py = sx + ddx, sy + ddy
+                    if 0 <= px < GRID and 0 <= py < GRID:
+                        v = grid[py][px]
+                        if v in (cA, cB):
+                            tally[v] += 1
+        if not tally:
+            return cA
+        return tally.most_common(1)[0][0]
+
+    def _sl_sync_dirmap(self, lat: tuple) -> None:
+        """Resolve each action's unit step from its dominant non-zero slide
+        vote.  The accent pixel jitters +/-1 across the minor axis as the
+        body re-renders, so QUANTIZE the displacement to node cells (round by
+        pitch) and keep only the dominant axis — that strips the jitter and
+        yields a clean cardinal unit step (one node per action)."""
+        pitch = lat[0]
+        for a, votes in self._slide_votes.items():
+            nz = [(n, d) for d, n in votes.items() if d != (0, 0)]
+            if not nz:
+                continue
+            nz.sort(reverse=True)
+            _n, (ddx, ddy) = nz[0]
+            cx = round(ddx / pitch)
+            cy = round(ddy / pitch)
+            if abs(cx) >= abs(cy):
+                cy = 0
+            else:
+                cx = 0
+            sx = (cx > 0) - (cx < 0)
+            sy = (cy > 0) - (cy < 0)
+            if (sx, sy) != (0, 0):
+                self._sl_dirmap[a] = (sx, sy)
 
     # ── lattice puzzle solver (ft09 family) ─────────────────────────────
     def _lattice_policy(

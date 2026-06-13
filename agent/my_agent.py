@@ -133,6 +133,9 @@ LATTICE_PROBE_CAP = 8   # probe clicks per appearance class before giving up
 LATTICE_DEATH_CAP = 3   # in-level GAME_OVERs after engaging before the lattice
                         # solver is benched (replays are deterministic)
 LATTICE_BFS_CAP = 6000  # BFS state budget for neighborhood-mask boards
+GX_RESET_CAP = 4        # graph-explorer RESET-backtracks per level before it
+                        # defers to novelty (analog of LATTICE_DEATH_CAP:
+                        # bounds wasted opening re-walks; tuned on HELD-18)
 ATTR_BBOX = 16          # attribute-register bbox cap (px): a HUD glyph box
                         # is compact; death repaints (lives pips + restored
                         # rings + glyph reset together) span the frame and
@@ -437,6 +440,9 @@ class MyAgent(Agent):
             self._gx_route_dest: Optional[int] = None  # the route's target node
             self._gx_start: Optional[int] = None       # level-start node hash
             self._gx_resets = 0                        # RESET-backtracks spent
+            # (state, action-key) the explorer just issued as a RESET-inducing
+            # action; confirmed and turned into a start edge on the next start
+            self._gx_pending_reset: Optional[tuple[int, str]] = None
             # appearance signatures of clicks exhausted ANYWHERE (cross-state
             # pruning); appearance is physics, so this persists across levels
             self._gx_global_tried_sig: set[int] = set()
@@ -591,6 +597,16 @@ class MyAgent(Agent):
                 # GAME_OVER frames before the RESET lands don't double-count
                 self._game_overs += 1
                 self._level_deaths += 1
+                if self._gx_on and self._prev_key is not None \
+                        and self._prev_action is not None \
+                        and self._gx_pending_reset is None:
+                    # CORRECT-RESET DETECTION: a death IS a reset-inducing
+                    # event — the action that caused it teleports to the level
+                    # start.  Stash it; the start edge is recorded on the next
+                    # start frame (GAME_OVER destroys the diff, so _learn can't
+                    # see it).  Guarded so a non-graph run is untouched.
+                    self._gx_pending_reset = (
+                        self._prev_key, self._prev_action)
             self._prev_grid, self._prev_key, self._prev_action = None, None, None
             self._plan.clear()
             self._lattice_plan.clear()
@@ -748,6 +764,19 @@ class MyAgent(Agent):
             self._seen_starts.add(key)
             self._wp_replay = self._wp_paths.get((self._wp_level, key))
             self._wp_idx = 0
+            if self._gx_on:
+                # canonical level-start node: RESET/death edges point here so
+                # the explorer can deliberately backtrack to it (this frame is
+                # the first after game start, level-up, or a respawn/RESET)
+                self._gx_start = key
+                if self._gx_pending_reset is not None:
+                    # the action that triggered this respawn was a confirmed
+                    # reset-inducing action: record its edge to the start and
+                    # mark it tried so the explorer never re-issues it as new
+                    rkey, rstate = self._gx_pending_reset
+                    self._transitions[(rstate, rkey)] = key
+                    self._tried[rstate].add(rkey)
+                    self._gx_pending_reset = None
 
         action: Optional[GameAction] = None
         if self._wp_replay is not None:
@@ -4170,7 +4199,30 @@ class MyAgent(Agent):
                 return self._gx_emit(key, node["optmap"].get(
                     nxt, (nxt, *self._gx_key_to_action(nxt))))
 
-        # 4. No reachable frontier: defer to v7 revisit-ranker.
+        # 4. No reachable frontier in the current graph: RESET-backtrack to
+        # the level start (last resort, bounded) so exploration resumes from
+        # a known node instead of wandering by 1-step lookahead.  RESET is
+        # only worthwhile when we are NOT already at the start and the start
+        # node still has frontier to reach.
+        if avail and GameAction.RESET.value in avail \
+                and self._gx_start is not None and key != self._gx_start \
+                and self._gx_resets < GX_RESET_CAP:
+            start_node = self._gx_nodes.get(self._gx_start)
+            start_has_frontier = start_node is None or bool(
+                self._gx_untried(self._gx_start, start_node))
+            if start_has_frontier:
+                self._gx_resets += 1
+                self._gx_route.clear()
+                self._gx_route_dest = None
+                self._tried[key].add("0")        # this RESET edge is spent
+                self._gx_pending_reset = (key, "0")
+                action = GameAction.RESET
+                action.reasoning = {"why": "graph-explore RESET-backtrack"}
+                self._prev_action = "0"
+                return action
+
+        # 5. Graph genuinely exhausted (or RESET unavailable / capped):
+        # defer to the v7 revisit-ranker so behavior degrades gracefully.
         return self._novelty_body(grid, latest_frame)
 
     def _gx_key_to_action(

@@ -16,6 +16,7 @@ You don't normally need to call this directly — `make submit` runs it for you.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from textwrap import dedent
 

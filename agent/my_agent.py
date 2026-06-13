@@ -136,6 +136,9 @@ LATTICE_BFS_CAP = 6000  # BFS state budget for neighborhood-mask boards
 GX_RESET_CAP = 4        # graph-explorer RESET-backtracks per level before it
                         # defers to novelty (analog of LATTICE_DEATH_CAP:
                         # bounds wasted opening re-walks; tuned on HELD-18)
+GX_LETHAL_HITS = 2      # deaths on the SAME click-class before the graph
+                        # explorer bans it (avoids one-off coincident-hazard
+                        # false positives; appearance physics, persists)
 ATTR_BBOX = 16          # attribute-register bbox cap (px): a HUD glyph box
                         # is compact; death repaints (lives pips + restored
                         # rings + glyph reset together) span the frame and
@@ -446,6 +449,19 @@ class MyAgent(Agent):
             # appearance signatures of clicks exhausted ANYWHERE (cross-state
             # pruning); appearance is physics, so this persists across levels
             self._gx_global_tried_sig: set[int] = set()
+            # LETHAL-CLICK MEMORY (win-speed lever): appearance signatures of
+            # sprites whose click was the last action before a GAME_OVER.  A
+            # death restarts the CURRENT level (confirmed empirically — these
+            # games never rewind to level 0), so every repeated lethal click
+            # inflates that level's action count, and the squared-efficiency
+            # metric punishes it quadratically.  Deadliness is appearance
+            # physics, so excluding the class everywhere (like _click_dead)
+            # stops the death-loop churn that bleeds the per-level score.
+            # Requires GX_LETHAL_HITS deaths on the SAME class before banning
+            # (a one-off death can be a coincident hazard elsewhere on the
+            # board, not the clicked sprite).
+            self._gx_lethal_hits: Counter[int] = Counter()
+            self._gx_lethal_sig: set[int] = set()
         # ── v2 world model ──
         self._prev_grid: Optional[Grid] = None
         self._prev_key: Optional[int] = None
@@ -607,6 +623,23 @@ class MyAgent(Agent):
                     # see it).  Guarded so a non-graph run is untouched.
                     self._gx_pending_reset = (
                         self._prev_key, self._prev_action)
+                    # LETHAL-CLICK MEMORY: if the fatal action was a click,
+                    # tally a death against the clicked sprite's appearance
+                    # class (read off the pre-death grid, still in _prev_grid).
+                    # GX_LETHAL_HITS deaths on the same class ban it — the
+                    # explorer then never re-clicks that hazard, killing the
+                    # death-loop that inflates the level's action count.
+                    if self._prev_action.startswith("6:"):
+                        try:
+                            lx, ly = map(int, self._prev_action[2:].split(","))
+                            lsig = signature_under(
+                                components(self._prev_grid), (lx, ly))
+                        except ValueError:
+                            lsig = 0
+                        if lsig:
+                            self._gx_lethal_hits[lsig] += 1
+                            if self._gx_lethal_hits[lsig] >= GX_LETHAL_HITS:
+                                self._gx_lethal_sig.add(lsig)
             self._prev_grid, self._prev_key, self._prev_action = None, None, None
             self._plan.clear()
             self._lattice_plan.clear()
@@ -4027,8 +4060,8 @@ class MyAgent(Agent):
         sig = signature_under(comps, coords)
         if sig == 0:
             return 0                             # background click
-        if self._click_dead(sig):
-            return -1                            # proven dead: exclude
+        if self._click_dead(sig) or sig in self._gx_lethal_sig:
+            return -1                            # proven dead / lethal: exclude
         changed, tries = self._click_effects.get(sig, (0, 0))
         if tries == 0 and sig not in self._gx_global_tried_sig:
             return 3                             # unseen salient class: top
@@ -4078,10 +4111,12 @@ class MyAgent(Agent):
             if opt[2] is not None:
                 sig = node.get("sig", {}).get(akey)
                 # cross-state pruning: a click whose class is globally
-                # exhausted (proven dead anywhere) is never re-offered
+                # exhausted (proven dead anywhere) or proven lethal is never
+                # re-offered
                 if sig is not None and (
                         sig in self._gx_global_tried_sig
-                        or self._click_dead(sig)):
+                        or self._click_dead(sig)
+                        or sig in self._gx_lethal_sig):
                     continue
             out.append(akey)
         out.sort(key=lambda a: (-node["salience"].get(a, 0), a))
@@ -4287,8 +4322,9 @@ class MyAgent(Agent):
             if sig in seen_sig:
                 continue                          # one rep per class per state
             seen_sig.add(sig)
-            if sig in self._gx_global_tried_sig or self._click_dead(sig):
-                continue                          # spent/dead class: skip
+            if sig in self._gx_global_tried_sig or self._click_dead(sig) \
+                    or sig in self._gx_lethal_sig:
+                continue                          # spent/dead/lethal: skip
             xs = [c[0] for c in cells]
             ys = [c[1] for c in cells]
             cx, cy = sum(xs) // len(xs), sum(ys) // len(ys)

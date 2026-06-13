@@ -4248,11 +4248,14 @@ class MyAgent(Agent):
         if len(top) == 1:
             return top[0]
         opts = [node["optmap"][a] for a in top]
-        # any clicks in the tier: rank by affordance; else balance simples
+        # any clicks in the tier: rank by affordance; else balance simples.
+        # _afford_rank drops click options whose LIVE signature is dead (the
+        # grid can differ from the node's first-visit frame under HUD masking),
+        # so the reordered list may be shorter or empty — fall back to top[0].
         if any(o[2] is not None for o in opts):
             opts = self._afford_rank(grid, opts)
         opts = self._use_balance(opts)
-        return opts[0][0]
+        return opts[0][0] if opts else top[0]
 
     def _gx_click_targets(self, grid: Optional[Grid]) -> list[Cell]:
         """Tamed ACTION6 candidates for the graph explorer: ONE click per

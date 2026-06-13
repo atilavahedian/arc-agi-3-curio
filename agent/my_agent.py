@@ -4255,10 +4255,49 @@ class MyAgent(Agent):
         return opts[0][0]
 
     def _gx_click_targets(self, grid: Optional[Grid]) -> list[Cell]:
-        """Provisional: reuse the legacy targeting until the taming
-        increment lands (commit c).  Kept as its own method so legacy
-        _novelty_policy / lp85's enumeration stay untouched."""
-        return self._click_targets(grid)
+        """Tamed ACTION6 candidates for the graph explorer: ONE click per
+        connected-component centroid (snapped onto the component when the raw
+        centroid falls off-color), deduped to at most one representative per
+        distinct shape_signature per state (we only need to learn what a
+        CLASS does — that transfers), and pruned of dead / globally-exhausted
+        signatures.  This collapses a grid of identical tiles from dozens of
+        redundant clicks to a handful of class-reps, shrinking per-node
+        branching so the BFS frontier stays tractable.  Ordering preserves
+        rarest-color / smallest-component first (smallest comps first), so the
+        salience tiering lines up with the legacy enumeration's intuition.
+
+        Separate from _click_targets so legacy novelty / lp85's exact
+        rarest-color enumeration is untouched."""
+        if grid is None:
+            return [(32, 32)]
+        comps = components(grid)
+        if not comps:
+            return [(32, 32)]
+        # color rarity: rarest colors first (matches _click_targets intent)
+        color_count: Counter[int] = Counter(c for c, _cells in comps)
+        ordered = sorted(
+            comps, key=lambda c: (color_count[c[0]], len(c[1])))
+        out: list[Cell] = []
+        seen_sig: set[int] = set()
+        for color, cells in ordered:
+            sig = shape_signature(color, cells)
+            if sig in seen_sig:
+                continue                          # one rep per class per state
+            seen_sig.add(sig)
+            if sig in self._gx_global_tried_sig or self._click_dead(sig):
+                continue                          # spent/dead class: skip
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            cx, cy = sum(xs) // len(xs), sum(ys) // len(ys)
+            if (cx, cy) not in cells:
+                # centroid fell off the component (concave/ring shapes):
+                # snap to the nearest on-component cell (deterministic min)
+                cx, cy = min(cells, key=lambda p: (p[0]-cx)**2 + (p[1]-cy)**2)
+            out.append((cx, cy))
+        # dedup coords, keep order
+        s: set[Cell] = set()
+        deduped = [t for t in out if not (t in s or s.add(t))]
+        return deduped or [(32, 32)]
 
     def _novelty_body(
         self, grid: Optional[Grid], latest_frame: FrameData

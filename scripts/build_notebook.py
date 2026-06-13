@@ -131,6 +131,16 @@ def build() -> dict:
                 python main.py --agent myagent
         """
     )
+    # Optional A/B: bake the graph explorer into THIS notebook's run command.
+    # Env vars set on the in-notebook shell line DO take effect on Kaggle
+    # (unlike local-machine env vars, which never propagate into the kernel).
+    # Build with: CURIO_BUILD_EXPLORER=graph make notebook
+    if os.getenv("CURIO_BUILD_EXPLORER") == "graph":
+        run_cell_source = run_cell_source.replace(
+            "python main.py --agent myagent",
+            "CURIO_EXPLORER=graph python main.py --agent myagent",
+        )
+        print("[build_notebook] BAKED CURIO_EXPLORER=graph into run cell")
     run_cell = code_cell(run_cell_source)
 
     dummy_submission_cell = code_cell(

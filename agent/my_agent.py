@@ -209,6 +209,12 @@ SL_STRIKES = 6          # dry/failed slide plans before the maze head benches
                         # the level (novelty search takes over)
 SL_PROBE_CAP = 1        # directional probes per action before the slide head
                         # trusts (or rejects) that action's unit step
+OV_MIN_ANCHORS = 2      # hollow goal-overlay boxes a frame needs before the
+                        # overlay-align head trusts the static-goal signature
+                        # (re86: a single box is too weak to distinguish from
+                        # an incidental ring; two fixed boxes are the family)
+OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
+                        # level (mirrors PC_STRIKES — novelty takes over)
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -410,6 +416,85 @@ def pat_rots(pat: tuple) -> list[tuple]:
     return out
 
 
+def overlay_anchors(
+    grid: Grid, outline_color: int
+) -> dict[int, list[Cell]]:
+    """Static goal-overlay anchors: hollow 3x3 boxes whose 8-neighbourhood is
+    all `outline_color` and whose centre is a single other (non-background)
+    pixel.  Returns {centre_colour: [centre cells]}.  Pure read — the
+    overlay-align head must cover each centre with a same-colour piece pixel
+    (re86's win check ignores the outline ring, matching only the centres)."""
+    counts: Counter[int] = Counter()
+    for row in grid:
+        counts.update(row)
+    bg = counts.most_common(1)[0][0]
+    out: dict[int, list[Cell]] = defaultdict(list)
+    for y in range(1, GRID - 1):
+        row = grid[y]
+        for x in range(1, GRID - 1):
+            c = row[x]
+            if c == outline_color or c == bg:
+                continue
+            if all(grid[y + dy][x + dx] == outline_color
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                   if (dx, dy) != (0, 0)):
+                out[c].append((x, y))
+    return {k: v for k, v in out.items()}
+
+
+def piece_footprint(
+    grid: Grid, center: Cell, arm_color: int
+) -> frozenset[Cell]:
+    """The 8-connected blob of the selected piece: cells equal to the piece's
+    arm colour OR the selection hole (0), flood-filled from its centre.  The
+    selected diagonal-X renders its centre as -1/0 intermittently, so the
+    flood admits BOTH the arm colour and 0 to keep the blob whole."""
+    cx, cy = center
+    seen = {center}
+    dq = [center]
+    fp: list[Cell] = []
+    while dq:
+        x, y = dq.pop()
+        fp.append((x, y))
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < GRID and 0 <= ny < GRID \
+                        and (nx, ny) not in seen \
+                        and grid[ny][nx] in (0, arm_color):
+                    seen.add((nx, ny))
+                    dq.append((nx, ny))
+    return frozenset(fp)
+
+
+def cover_centers(
+    footprint: frozenset[Cell], center: Cell, anchors: list[Cell],
+    step: int, cur: Cell,
+) -> Optional[Cell]:
+    """The step-grid centre position at which the piece footprint covers ALL
+    given anchor centres, nearest to the current centre.  `footprint` and
+    `center` describe the piece as currently rendered; translations are
+    restricted to multiples of `step` (the learned move magnitude) so the
+    result is exactly reachable by the arrow rules.  None when no translation
+    on the step lattice covers every anchor (a non-axis shape, or anchors the
+    arms cannot reach)."""
+    if not anchors:
+        return None
+    cx, cy = center
+    rel = frozenset((px - cx, py - cy) for px, py in footprint)
+    aset = set(anchors)
+    best: Optional[tuple[int, Cell]] = None
+    for tdy in range(-(GRID - 1), GRID, step):
+        for tdx in range(-(GRID - 1), GRID, step):
+            ncx, ncy = cx + tdx, cy + tdy
+            cells = {(ncx + rx, ncy + ry) for rx, ry in rel}
+            if aset <= cells:
+                cost = abs(ncx - cur[0]) + abs(ncy - cur[1])
+                if best is None or cost < best[0]:
+                    best = (cost, (ncx, ncy))
+    return best[1] if best else None
+
+
 def canon_window(grid: Grid, x: int, y: int, p: int) -> tuple:
     """Rotation-canonical pixel tuple of a p x p window: the same card
     appearance hashes equal wherever it sits and however it is rotated
@@ -562,6 +647,19 @@ class MyAgent(Agent):
         self._pc_idprobe = 0
         self._pc_xform_spent = 0
         self._pc_benched: Optional[int] = None
+        # ── overlay-align head (re86 family): selected piece placed to cover
+        # a STATIC goal-overlay's anchor centres.  The outline colour and the
+        # SELECT verb are physics (same on every level); the per-colour anchor
+        # sets, solved-colour set and failure counters are per-level geography.
+        self._ov_outline_votes: Counter[int] = Counter()  # physics
+        self._ov_select: Optional[int] = None       # the cycle-selection verb
+        self._ov_level = -1
+        self._ov_solved: set[int] = set()           # colours already covered
+        self._ov_plan: deque[int] = deque()         # queued MOVE action ids
+        self._ov_target: Optional[Cell] = None      # centre we are driving to
+        self._ov_strikes = 0
+        self._ov_benched: Optional[int] = None
+        self._ov_last_center: Optional[Cell] = None  # progress watchdog
         # ── editor model (tr87 family): cursor + in-place glyph cycling ──
         # verb classifications, marker votes, step deltas and probe spend
         # are physics (what an action DOES looks the same on every level);
@@ -702,6 +800,16 @@ class MyAgent(Agent):
             self._pc_idprobe = 0
             self._pc_strikes = 0
             self._pc_benched = None
+            # the overlay level replays deterministically: void the in-flight
+            # plan/target and solved-colour progress, give a benched run a
+            # fresh life (strikes die with the budget that earned them).  The
+            # outline colour and SELECT verb are physics — kept.
+            self._ov_solved.clear()
+            self._ov_plan.clear()
+            self._ov_target = None
+            self._ov_strikes = 0
+            self._ov_benched = None
+            self._ov_last_center = None
             # the editor's level replays deterministically too: keep the
             # mutate boxes and goal candidates, give a benched run a fresh
             # life (strikes die with the budget that earned them)
@@ -815,6 +923,14 @@ class MyAgent(Agent):
             self._pc_strikes = 0
             self._pc_bounce = 0
             self._pc_idprobe = 0
+            # overlay geography: the new level has its own anchor centres and
+            # piece roster (outline colour and SELECT verb are physics).
+            self._ov_solved.clear()
+            self._ov_plan.clear()
+            self._ov_target = None
+            self._ov_strikes = 0
+            self._ov_benched = None
+            self._ov_last_center = None
             # switch geography: masks, phase patches, fall bans and probe
             # spend are positional level data (footprint passability — the
             # _stepped/_block signature stores — is appearance physics)
@@ -2133,6 +2249,197 @@ class MyAgent(Agent):
                 return None
         return None
 
+    # ── overlay-align head (re86 family): cover static goal anchors ────────
+    def _ov_outline(self, grid: Grid) -> Optional[int]:
+        """The static goal-overlay's outline colour: the colour that forms
+        the MOST hollow 3x3 boxes (a non-background colour ringing single
+        centre pixels).  None when fewer than OV_MIN_ANCHORS boxes of any one
+        colour exist — the family signature is absent (a plain movement game
+        has no such overlay)."""
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        bg = counts.most_common(1)[0][0]
+        # candidate outline colours: each forms boxes whose ring is that
+        # colour.  Count boxes per outline colour by trial.
+        box_count: Counter[int] = Counter()
+        for y in range(1, GRID - 1):
+            for x in range(1, GRID - 1):
+                c = grid[y][x]
+                if c == bg:
+                    continue
+                ring = grid[y - 1][x - 1]
+                if ring == bg or ring == c:
+                    continue
+                if all(grid[y + dy][x + dx] == ring
+                       for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                       if (dx, dy) != (0, 0)):
+                    box_count[ring] += 1
+        if not box_count:
+            return None
+        color, n = box_count.most_common(1)[0]
+        return color if n >= OV_MIN_ANCHORS else None
+
+    def _ov_select_verb(
+        self, avail: set[int], rules: dict[int, Cell]
+    ) -> Optional[int]:
+        """The cycle-selection verb: the available simple action that is NOT a
+        movement rule (re86: ACTION5 jumps the selection hole to another
+        piece, translating nothing — so it never earns a move rule)."""
+        cands = [a for a in sorted(avail)
+                 if a not in rules and not GameAction.from_id(a).is_complex()
+                 and a != GameAction.RESET.value]
+        return cands[0] if len(cands) == 1 else None
+
+    def _ov_selected(self, grid: Grid) -> Optional[tuple[Cell, int]]:
+        """The selected piece: (centre cell, arm colour).  The centre is the
+        unique colour-0 selection hole; the arm colour is the dominant non-
+        background, non-outline colour in its 8-connected blob.  None when no
+        single 0 hole is present (a transient animation frame)."""
+        holes = [(x, y) for y in range(GRID) for x in range(GRID)
+                 if grid[y][x] == 0]
+        if len(holes) != 1:
+            return None
+        cx, cy = holes[0]
+        cnt: Counter[int] = Counter()
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < GRID and 0 <= y < GRID:
+                    v = grid[y][x]
+                    if v not in (0,) and v >= 0:
+                        cnt[v] += 1
+        # the arm colour dominates the local window; drop the outline (it only
+        # appears as box rings, which are sparse near a free-standing piece)
+        if not cnt:
+            return None
+        arm = cnt.most_common(1)[0][0]
+        return ((cx, cy), arm)
+
+    def _overlay_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData
+    ) -> Optional[GameAction]:
+        """Overlay-align policy, gated on: the [1,2,3,4,5]-no-ACTION6 action
+        set + a static hollow-box goal overlay (OV_MIN_ANCHORS+ boxes) + four
+        axis move rules of one magnitude>=2 + a SELECT verb that jumps the
+        selection hole rather than translating.  g50t shares the action set
+        but has a scrolling obstacle and no box overlay, so the secondary gate
+        keeps the head inert there.  Drives the selected piece's arm footprint
+        onto its same-colour anchor centres, then cycles SELECT to the next
+        colour; benches on repeated dry plans."""
+        if grid is None:
+            return None
+        avail = set(latest_frame.available_actions or [])
+        # action-set gate: re86's exact signature (move quartet + SELECT, no
+        # click).  Necessary but NOT sufficient (g50t collides) — the overlay
+        # signature below is the load-bearing discriminator.
+        if GameAction.ACTION6.value in avail:
+            return None
+        if GameAction.ACTION5.value not in avail:
+            return None
+        outline = self._ov_outline(grid)
+        if outline is None:
+            return None  # no static box overlay → not this family
+        self._ov_outline_votes[outline] += 1
+        # require the four axis move rules at one magnitude >= 2 (re86 steps
+        # 3px; g50t steps 1px — a second guard, redundant with the overlay
+        # gate but cheap).  Collect the best-voted act per axis direction.
+        rules = self._movement_rules()
+        axis = {a: d for a, d in rules.items()
+                if (d[0] == 0) != (d[1] == 0) and abs(d[0]) + abs(d[1]) >= 2}
+        mags = {abs(d[0]) + abs(d[1]) for d in axis.values()}
+        if len(axis) < 4 or len(mags) != 1:
+            return None  # full 2D control at one magnitude not learned yet
+        step = mags.pop()
+        select = self._ov_select_verb(avail, rules)
+        if select is None:
+            return None
+        self._ov_select = select
+        level = latest_frame.levels_completed
+        if self._ov_benched == level:
+            return None
+        if self._ov_strikes >= OV_STRIKES:
+            self._ov_benched = level
+            return None
+        if self._ov_level != level:
+            self._ov_level = level
+            self._ov_solved.clear()
+            self._ov_plan.clear()
+            self._ov_target = None
+            self._ov_last_center = None
+        anchors = overlay_anchors(grid, outline)
+        if not anchors:
+            return None
+        sel = self._ov_selected(grid)
+        if sel is None:
+            return None  # transient frame with no clean selection hole
+        center, arm = sel
+        # direction -> move action (unit axis of the learned step)
+        dir_act = {(0, -1): None, (0, 1): None, (-1, 0): None, (1, 0): None}
+        for a, d in axis.items():
+            u = (0, -1) if d[1] < 0 else (0, 1) if d[1] > 0 \
+                else (-1, 0) if d[0] < 0 else (1, 0)
+            dir_act[u] = a
+        # progress watchdog: an in-flight plan that left the centre unmoved
+        # means the piece bounced a wall (re86 clamps at the camera edge) —
+        # strike and re-plan
+        if self._ov_plan and self._ov_last_center is not None \
+                and center == self._ov_last_center:
+            self._ov_plan.clear()
+            self._ov_target = None
+            self._ov_strikes += 1
+            if self._ov_strikes >= OV_STRIKES:
+                self._ov_benched = level
+                return None
+        # drive an in-flight plan toward the current target
+        if self._ov_plan and self._ov_target is not None \
+                and center != self._ov_target:
+            act = self._ov_plan.popleft()
+            self._ov_last_center = center
+            return self._step(GameAction.from_id(act))
+        # target reached (or no plan): this colour is placed — mark it solved
+        if self._ov_target is not None and center == self._ov_target:
+            self._ov_solved.add(arm)
+            self._ov_target = None
+            self._ov_plan.clear()
+        # plan the selected colour's cover if it still has unsolved anchors
+        my_anchors = anchors.get(arm, [])
+        if my_anchors and arm not in self._ov_solved:
+            tgt = cover_centers(frozenset(piece_footprint(grid, center, arm)),
+                                center, my_anchors, step, center)
+            if tgt is not None and tgt != center:
+                plan: list[int] = []
+                tx, ty = tgt
+                dx, dy = tx - center[0], ty - center[1]
+                nx = abs(dx) // step
+                ny = abs(dy) // step
+                ax = dir_act[(1, 0)] if dx > 0 else dir_act[(-1, 0)]
+                ay = dir_act[(0, 1)] if dy > 0 else dir_act[(0, -1)]
+                if dx and ax is not None:
+                    plan += [ax] * nx
+                if dy and ay is not None:
+                    plan += [ay] * ny
+                if plan:
+                    self._ov_target = tgt
+                    self._ov_plan = deque(plan)
+                    act = self._ov_plan.popleft()
+                    self._ov_last_center = center
+                    return self._step(GameAction.from_id(act))
+            # this colour is placed already (tgt == center) or uncoverable
+            # (tgt is None — a non-axis shape this head defers): mark it done
+            # so SELECT advances instead of looping on it
+            self._ov_solved.add(arm)
+        # nothing to drive for this colour: cycle SELECT to the next piece.
+        # If every overlay colour is solved, the engine has already won; a
+        # full cycle with no plan that lands here repeatedly is a dry run —
+        # strike so the head eventually benches and novelty takes over.
+        unsolved = [c for c in anchors if c not in self._ov_solved]
+        if not unsolved:
+            self._ov_strikes += 1
+        self._ov_last_center = None
+        self._ov_target = None
+        return self._step(GameAction.from_id(select))
+
     # ── editor model (tr87 family): cursor + in-place glyph cycling ─────
     def _ed_note(
         self, act: int, grid: Grid,
@@ -2964,6 +3271,18 @@ class MyAgent(Agent):
             port = self._port_policy(grid, latest_frame)
             if port is not None:
                 return port
+            # overlay-align head (re86 family): a SELECTED piece (centre hole
+            # = 0) placed so its arm footprint covers a STATIC goal-overlay's
+            # anchor centres.  Gated inside on the [1,2,3,4,5]-no-ACTION6
+            # action set PLUS a static hollow-box overlay signature PLUS a
+            # cursor that JUMPS (not translates) on the 5th verb — the
+            # secondary gate is load-bearing: g50t shares the action set but
+            # has a scrolling obstacle and no box overlay, so it cannot reach
+            # the model.  Runs AFTER the port branch (re86 exposes no ACTION6,
+            # so the port gate already declined) and before warmup.
+            overlay = self._overlay_policy(grid, latest_frame)
+            if overlay is not None:
+                return overlay
             # remote-toggle switch planner (dc22 family), gated inside on
             # clicks + trusted movement rules + no register + no port
             # color + the readiness clause + SW_FRAMES diffed frames (so

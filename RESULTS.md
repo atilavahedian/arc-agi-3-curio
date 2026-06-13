@@ -3,6 +3,15 @@
 Measured numbers for the Curio ARC-AGI-3 agent. Every figure below is from
 a real local bench run; nothing is estimated or extrapolated.
 
+> **Headline (2026-06-13 final):** the night's explorer work did **not** beat
+> the shipped default on the honest proxy — HELD-18 stays at **0.07802**
+> (default config A; explorer hybrid measured 0.0391, ~2x lower). So the
+> default is unchanged and remains the submitted config. The deliverable of
+> the night is the *measurement* itself: explorer "wins slowly → low score"
+> was confirmed directly, the lethal-click memory was kept behind a toggle,
+> and the FIT regression floor is intact. **Held-out generalization did not
+> improve; the hidden-set score remains unknown until submission.**
+
 Bench command shape (per game set):
 
 ```
@@ -11,6 +20,26 @@ CURIO_SEED=<s> make play-local GAME=<csv> STEPS=4000 2>&1 | grep -E "levels=|Agg
 ```
 
 Date: 2026-06-13. Budget: 4000 steps/game. All runs at seed 0.
+
+---
+
+## Final shipped-config scorecards (config A default, seed 0, STEPS=4000)
+
+These three aggregates are the final honest measurement of the submitted
+agent (`CURIO_EXPLORER` unset, `CURIO_GENERIC_ONLY` unset — byte-identical to
+verbatim Curio v7).
+
+| game set | members | aggregate score | games at L1+ |
+|----------|---------|:---------------:|:------------:|
+| **HELD-18** (honest proxy) | 18 held-out games | **`0.07802407296184444`** | 9 |
+| **FROZEN-8** (proxy subset) | tu93 ar25 re86 ka59 g50t sb26 wa30 s5i5 | **`0.08678098667496416`** | 3 (ar25, g50t, s5i5) |
+| **all-25** (FIT + HELD-18) | full local battery | **`8.735237851346563`** | — |
+
+The all-25 aggregate is dominated by the FIT games (which the agent solves to
+high levels, e.g. ft09 6-level WIN in 124 actions) and so is **not** a
+generalization signal — it is reported only as a complete battery readout.
+The HELD-18 aggregate (`0.07802`) is the honest proxy; FROZEN-8 (`0.08678`)
+is a fixed subset of it for run-to-run tracking.
 
 ---
 
@@ -133,11 +162,12 @@ submittable config is not seed-fragile.
 ## Regression floor (FIT set, default = both toggles unset, seed 0)
 
 Confirms the submittable (default) agent holds the FIT floor. Re-measured
-fresh this stage; identical to the prior agent (bit-identical default path).
+fresh this final stage inside the all-25 battery run; every per-game level is
+identical to the prior agent (bit-identical default path).
 
 | game | required        | measured            | ok |
 |------|-----------------|---------------------|:--:|
-| ft09 | 6 levels, WIN   | 6 levels, state WIN | ✓ |
+| ft09 | 6 levels, WIN   | 6 levels, state WIN (124 actions) | ✓ |
 | cn04 | >= 5            | 5                   | ✓ |
 | tr87 | >= 3            | 3                   | ✓ |
 | ls20 | >= 2            | 2                   | ✓ |
@@ -145,7 +175,11 @@ fresh this stage; identical to the prior agent (bit-identical default path).
 | lp85 | >= 1            | 1                   | ✓ |
 | dc22 | >= 4            | 4                   | ✓ |
 
-FIT-set aggregate (default, seed 0): `30.996644710050123`.
+FIT-only aggregate (default, seed 0, FIT games run alone):
+`30.996644710050123`. (Distinct from the all-25 aggregate `8.735237851346563`
+above — that figure scores FIT and HELD-18 in one shared scorecard, so the
+two numbers are not comparable; both are real, just different batteries.)
+
 **Floor intact** — the default path is bit-identical to the prior agent when
 `CURIO_GENERIC_ONLY` and `CURIO_EXPLORER` are both unset, so neither toggle
 can touch the submitted behavior.

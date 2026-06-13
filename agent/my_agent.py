@@ -638,7 +638,18 @@ class MyAgent(Agent):
                             lsig = 0
                         if lsig:
                             self._gx_lethal_hits[lsig] += 1
-                            if self._gx_lethal_hits[lsig] >= GX_LETHAL_HITS:
+                            # PRODUCTIVITY GUARD: a class that reliably CHANGES
+                            # the world (high Laplace effect rate) is a
+                            # context-dependent control, not a pure hazard —
+                            # banning it globally throws away the only path to
+                            # the win (measured on sc25).  Per-state _tried
+                            # already stops re-clicking it from the exact death
+                            # state; only ban classes that are mostly inert
+                            # except for killing.
+                            ch, tr = self._click_effects.get(lsig, (0, 0))
+                            productive = tr > 0 and (ch + 1) / (tr + 2) > 0.5
+                            if self._gx_lethal_hits[lsig] >= GX_LETHAL_HITS \
+                                    and not productive:
                                 self._gx_lethal_sig.add(lsig)
             self._prev_grid, self._prev_key, self._prev_action = None, None, None
             self._plan.clear()

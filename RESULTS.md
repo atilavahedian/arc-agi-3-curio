@@ -183,3 +183,21 @@ two numbers are not comparable; both are real, just different batteries.)
 **Floor intact** — the default path is bit-identical to the prior agent when
 `CURIO_GENERIC_ONLY` and `CURIO_EXPLORER` are both unset, so neither toggle
 can touch the submitted behavior.
+
+---
+
+## Round 5 — coverage expansion (2026-06-13, all measured seed 0, STEPS=4000)
+
+Four new game families added; full FIT floor intact; no crashes.
+
+| Game | before | after | head |
+|------|:-----:|:-----:|------|
+| tu93 | 0 | 1 | slide / node-maze |
+| re86 | 0 | 1 | overlay-align |
+| su15 | 0 | 2 | attractor-herd |
+| sb26 | 0 | 1 | sequence-match / sort |
+
+- **all-25 scorecard: 8.74 → 9.09**; agent now scores on 17 / 25 games (was 13).
+- FIT floor intact: ft09=6 WIN, cn04=5, tr87=3, dc22=4, ls20=2, vc33=2, lp85=1; held games (ar25,m0r0,sp80,g50t,lf52,s5i5,r11l,cd82,tn36) all ≥1.
+- Held-out proxy (ka59, wa30 — untouched this round): both still 0 (no spontaneous generalization signal from these two).
+- **Known regression — speed:** the new heads have a gating leak (expensive detection on non-target games). Slowest: lp85 28 fps, dc22 29, m0r0 39, lf52 46, tn36 58 (vs ~100–160 elsewhere). Nothing DNF'd locally, but the hidden re-run has a shared ~8–9h wall-clock cap, so this could cost completed games on the real set. Fix = cheap early-outs in the new heads. To validate net effect (more coverage vs slower): submit and compare to the 0.22 baseline.

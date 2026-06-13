@@ -423,6 +423,23 @@ class MyAgent(Agent):
         self._tried: dict[int, set[str]] = defaultdict(set)
         self._state_visits: Counter[int] = Counter()
         self._steps_since_novelty = 0
+        # ── graph explorer (extends the novelty fallback; opt-in) ──
+        # CURIO_EXPLORER=graph swaps _novelty_policy for a salience-tiered
+        # global state-graph explorer (BFS frontier + RESET backtracking).
+        # Read once; with the var unset every hook below is dead code and
+        # the executed path is byte-identical to v7 (FIT floor preserved).
+        self._gx_on = os.environ.get("CURIO_EXPLORER", "") == "graph"
+        if self._gx_on:
+            # node record per masked-frame hash: built once per first visit,
+            # idempotent within a level (geography is stable within a level)
+            self._gx_nodes: dict[int, dict[str, Any]] = {}
+            self._gx_route: deque[str] = deque()      # cached BFS action-keys
+            self._gx_route_dest: Optional[int] = None  # the route's target node
+            self._gx_start: Optional[int] = None       # level-start node hash
+            self._gx_resets = 0                        # RESET-backtracks spent
+            # appearance signatures of clicks exhausted ANYWHERE (cross-state
+            # pruning); appearance is physics, so this persists across levels
+            self._gx_global_tried_sig: set[int] = set()
         # ── v2 world model ──
         self._prev_grid: Optional[Grid] = None
         self._prev_key: Optional[int] = None
@@ -659,6 +676,14 @@ class MyAgent(Agent):
             self._state_visits.clear()
             self._plan.clear()
             self._steps_since_novelty = 0
+            if self._gx_on:
+                # graph geography has the same per-level lifetime as _tried;
+                # appearance-keyed _gx_global_tried_sig persists (it's physics)
+                self._gx_nodes.clear()
+                self._gx_route.clear()
+                self._gx_route_dest = None
+                self._gx_resets = 0
+                self._gx_start = None
             # lattice geography: the palette and board are level data
             self._palette_next.clear()
             self._site_dead.clear()
@@ -3931,7 +3956,276 @@ class MyAgent(Agent):
         fill = iter(simples)
         return [o if o[2] is not None else next(fill) for o in untried]
 
+    # ── graph explorer (CURIO_EXPLORER=graph) ───────────────────────────
+    def _gx_options(
+        self, grid: Optional[Grid], avail: set[int]
+    ) -> list[tuple[str, GameAction, Optional[Cell]]]:
+        """Candidate (action-key, action, coords) for a state — same
+        primitives and key format as _novelty_policy so _tried/_transitions
+        interoperate.  ACTION6 enumerates over the explorer's own tamed
+        target set (component-centroid + signature-dedup)."""
+        options: list[tuple[str, GameAction, Optional[Cell]]] = []
+        for action in GameAction:
+            if action is GameAction.RESET:
+                continue
+            if avail and action.value not in avail:
+                continue
+            if action.is_complex():
+                for x, y in self._gx_click_targets(grid):
+                    options.append((f"6:{x},{y}", action, (x, y)))
+            else:
+                options.append((str(action.value), action, None))
+        return options
+
+    def _gx_tier(
+        self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
+        opt: tuple[str, GameAction, Optional[Cell]]
+    ) -> int:
+        """Salience tier for an untried option (higher = explore first).
+        -1 dead (excluded); 0 known-rule moves / background clicks;
+        1 simple actions still lacking a trusted rule (cheap, high info);
+        2 clicks with positive Laplace evidence; 3 clicks whose signature
+        is globally unseen and salient (a just-appeared novel sprite)."""
+        akey, _action, coords = opt
+        if coords is None:                       # simple action
+            act = int(akey)
+            rules = self._movement_rules()
+            if act in rules:
+                return 0                         # trusted rule: low info
+            if self._act_uses[act] < RULE_TRIES:
+                return 1                         # still learning: high info
+            return 0
+        sig = signature_under(comps, coords)
+        if sig == 0:
+            return 0                             # background click
+        if self._click_dead(sig):
+            return -1                            # proven dead: exclude
+        changed, tries = self._click_effects.get(sig, (0, 0))
+        if tries == 0 and sig not in self._gx_global_tried_sig:
+            return 3                             # unseen salient class: top
+        if tries > 0 and (changed + 1) / (tries + 2) > (1.0 / 2.0):
+            return 2                             # known-productive class
+        return 0
+
+    def _gx_node(
+        self, key: int, grid: Optional[Grid], avail: set[int]
+    ) -> dict[str, Any]:
+        """Build (once) and return the node record for a masked-frame hash.
+        Idempotent within a level: a state's geography/candidate set is
+        stable, so a re-visit reuses the cached record (only its untried set
+        is pruned live against _tried)."""
+        node = self._gx_nodes.get(key)
+        if node is None:
+            options = self._gx_options(grid, avail)
+            comps = components(grid) if grid is not None else []
+            salience: dict[str, int] = {}
+            actions: list[str] = []
+            optmap: dict[str, tuple[str, GameAction, Optional[Cell]]] = {}
+            sigmap: dict[str, int] = {}
+            for opt in options:
+                tier = self._gx_tier(grid, comps, opt) if grid is not None else 0
+                if tier < 0:
+                    continue                     # dead signature: never offer
+                actions.append(opt[0])
+                salience[opt[0]] = tier
+                optmap[opt[0]] = opt
+                if opt[2] is not None:
+                    sigmap[opt[0]] = signature_under(comps, opt[2])
+            node = {"actions": actions, "salience": salience,
+                    "optmap": optmap, "sig": sigmap}
+            self._gx_nodes[key] = node
+        return node
+
+    def _gx_untried(self, key: int, node: dict[str, Any]) -> list[str]:
+        """Action-keys at this node not yet tried (per-state) and not
+        globally exhausted by signature; sorted highest-salience first,
+        ties lexicographic (deterministic BFS/route reproduction)."""
+        tried = self._tried[key]
+        out: list[str] = []
+        for akey in node["actions"]:
+            if akey in tried:
+                continue
+            opt = node["optmap"][akey]
+            if opt[2] is not None:
+                sig = node.get("sig", {}).get(akey)
+                # cross-state pruning: a click whose class is globally
+                # exhausted (proven dead anywhere) is never re-offered
+                if sig is not None and (
+                        sig in self._gx_global_tried_sig
+                        or self._click_dead(sig)):
+                    continue
+            out.append(akey)
+        out.sort(key=lambda a: (-node["salience"].get(a, 0), a))
+        return out
+
+    def _gx_bfs(self, cur: int) -> Optional[tuple[list[str], int]]:
+        """Shortest path of action-keys over observed edges (_transitions)
+        from cur to the nearest node owning an untried action, maximizing
+        that node's best untried salience tier (a small per-tier bonus
+        subtracts from path cost so a tier-3 target beats a tier-1 one at
+        equal-ish distance).  Deterministic: edges iterated by lexicographic
+        action-key.  Bounded by LATTICE_BFS_CAP expansions."""
+        # adjacency restricted to current-level nodes (_gx_nodes is cleared
+        # per level), built once: keeps BFS off stale cross-level geography
+        # and turns the per-expansion edge scan into an O(1) dict lookup
+        adj: dict[int, list[str]] = defaultdict(list)
+        for (s, akey), dest in self._transitions.items():
+            if s in self._gx_nodes:
+                adj[s].append(akey)
+        for s in adj:
+            adj[s].sort()                        # deterministic expansion order
+        best: Optional[tuple[float, list[str], int]] = None
+        seen = {cur}
+        dq: deque[tuple[int, list[str]]] = deque([(cur, [])])
+        expansions = 0
+        while dq and expansions < LATTICE_BFS_CAP:
+            node_key, path = dq.popleft()
+            expansions += 1
+            if node_key != cur and node_key in self._gx_nodes:
+                ut = self._gx_untried(node_key, self._gx_nodes[node_key])
+                if ut:
+                    tier = self._gx_nodes[node_key]["salience"].get(ut[0], 0)
+                    cost = len(path) - 0.25 * tier  # salience bonus
+                    if best is None or cost < best[0]:
+                        best = (cost, path, node_key)
+            for akey in adj.get(node_key, ()):
+                dest = self._transitions.get((node_key, akey))
+                if dest is None or dest in seen:
+                    continue
+                seen.add(dest)
+                dq.append((dest, path + [akey]))
+        if best is None:
+            return None
+        return (best[1], best[2])
+
+    def _gx_emit(
+        self, key: int, choice: tuple[str, GameAction, Optional[Cell]]
+    ) -> GameAction:
+        """Mark an option tried (per-state + global-signature) and emit it."""
+        akey, action, coords = choice
+        self._tried[key].add(akey)
+        if coords is not None:
+            action.set_data({"x": coords[0], "y": coords[1]})
+            action.reasoning = {"why": f"graph-explore object at {coords}"}
+        else:
+            action.reasoning = {"why": f"graph-explore action {action.value}"}
+        self._prev_action = akey
+        return action
+
+    def _graph_explore_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData
+    ) -> GameAction:
+        """Salience-tiered global state-graph explorer.  Drop-in for the
+        novelty fallback when CURIO_EXPLORER=graph.  Local greedy choice is
+        a strict superset of v7 (pick the highest-salience untried action);
+        when the current state is exhausted, BFS the observed-edge graph to
+        the nearest high-salience frontier and walk a cached route there;
+        if the reachable graph has no frontier, backtrack via RESET to the
+        level start; if even that is spent, defer to the v7 revisit-ranker."""
+        key = self._masked_hash(grid)
+        avail = set(latest_frame.available_actions or [])
+        # the HUD mask must be frozen for node identities to be stable;
+        # before that, defer to legacy novelty to avoid phantom edges
+        if self._frames_diffed < HUD_FREEZE and not self._hud_mask:
+            return self._novelty_body(grid, latest_frame)
+        node = self._gx_node(key, grid, avail)
+        if not node["actions"]:
+            self._prev_action = "0"
+            return GameAction.RESET
+
+        # 1. LOCAL FRONTIER: highest-salience untried action in this state.
+        untried = self._gx_untried(key, node)
+        if untried:
+            self._gx_route.clear()
+            self._gx_route_dest = None
+            if self._steps_since_novelty > STUCK_LIMIT:
+                akey = self._rng.choice(untried)
+            else:
+                # tie-break within the top tier by affordance / use-balance
+                akey = self._gx_pick_top(grid, node, untried)
+            return self._gx_emit(key, node["optmap"][akey])
+
+        # 2. CACHED ROUTE to a distant frontier (re-plan on drift/empty).
+        if self._gx_route and self._gx_route_dest is not None:
+            nxt = self._gx_route[0]
+            exp_dest = self._transitions.get((key, nxt))
+            dnode = self._gx_nodes.get(self._gx_route_dest)
+            dest_live = dnode is not None and bool(
+                self._gx_untried(self._gx_route_dest, dnode))
+            if exp_dest is not None and dest_live:
+                self._gx_route.popleft()
+                return self._gx_emit(key, node["optmap"].get(
+                    nxt, (nxt, *self._gx_key_to_action(nxt))))
+            self._gx_route.clear()
+            self._gx_route_dest = None
+
+        # 3. RE-PLAN: BFS to nearest untried frontier.
+        plan = self._gx_bfs(key)
+        if plan is not None:
+            path, dest = plan
+            if path:
+                self._gx_route = deque(path)
+                self._gx_route_dest = dest
+                nxt = self._gx_route.popleft()
+                return self._gx_emit(key, node["optmap"].get(
+                    nxt, (nxt, *self._gx_key_to_action(nxt))))
+
+        # 4. No reachable frontier: defer to v7 revisit-ranker.
+        return self._novelty_body(grid, latest_frame)
+
+    def _gx_key_to_action(
+        self, akey: str
+    ) -> tuple[GameAction, Optional[Cell]]:
+        """Reconstruct (action, coords) from an action-key for walking a
+        route edge whose action isn't in the current node's optmap."""
+        if akey.startswith("6:"):
+            x, y = map(int, akey[2:].split(","))
+            return (GameAction.ACTION6, (x, y))
+        return (GameAction.from_id(int(akey)), None)
+
+    def _gx_pick_top(
+        self, grid: Optional[Grid], node: dict[str, Any], untried: list[str]
+    ) -> str:
+        """Pick within the highest-salience tier, tie-broken by the legacy
+        affordance/use-balance ordering so intra-tier behavior matches the
+        proven heuristics."""
+        if grid is None:
+            return untried[0]
+        top_tier = node["salience"].get(untried[0], 0)
+        top = [a for a in untried if node["salience"].get(a, 0) == top_tier]
+        if len(top) == 1:
+            return top[0]
+        opts = [node["optmap"][a] for a in top]
+        # any clicks in the tier: rank by affordance; else balance simples
+        if any(o[2] is not None for o in opts):
+            opts = self._afford_rank(grid, opts)
+        opts = self._use_balance(opts)
+        return opts[0][0]
+
+    def _gx_click_targets(self, grid: Optional[Grid]) -> list[Cell]:
+        """Provisional: reuse the legacy targeting until the taming
+        increment lands (commit c).  Kept as its own method so legacy
+        _novelty_policy / lp85's enumeration stay untouched."""
+        return self._click_targets(grid)
+
+    def _novelty_body(
+        self, grid: Optional[Grid], latest_frame: FrameData
+    ) -> GameAction:
+        """The verbatim v7 novelty fallback, callable when the graph
+        explorer defers (graph not yet armed, or no reachable frontier)."""
+        return self._novelty_policy_impl(grid, latest_frame)
+
     def _novelty_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData
+    ) -> GameAction:
+        if self._gx_on:
+            # all four _policy fallthroughs route here; one early-return keeps
+            # the call sites untouched, and with the toggle off this branch
+            # never executes (the impl below is the verbatim v7 fallback)
+            return self._graph_explore_policy(grid, latest_frame)
+        return self._novelty_policy_impl(grid, latest_frame)
+
+    def _novelty_policy_impl(
         self, grid: Optional[Grid], latest_frame: FrameData
     ) -> GameAction:
         key = self._masked_hash(grid)

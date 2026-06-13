@@ -138,7 +138,12 @@ GX_RESET_CAP = 4        # graph-explorer RESET-backtracks per level before it
                         # bounds wasted opening re-walks; tuned on HELD-18)
 GX_LETHAL_HITS = 2      # deaths on the SAME click-class before the graph
                         # explorer bans it (avoids one-off coincident-hazard
-                        # false positives; appearance physics, persists)
+                        # false positives, and gives the affordance library a
+                        # chance to record the class's effect rate so the
+                        # productivity guard can spare a real control before the
+                        # ban fires; HITS=1 measured worse: 0.0296 vs 0.0391 —
+                        # premature bans on un-probed productive classes;
+                        # appearance physics, persists)
 ATTR_BBOX = 16          # attribute-register bbox cap (px): a HUD glyph box
                         # is compact; death repaints (lives pips + restored
                         # rings + glyph reset together) span the frame and

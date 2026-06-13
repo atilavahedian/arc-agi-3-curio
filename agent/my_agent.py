@@ -220,6 +220,13 @@ SORT_MIN_TARGETS = 3    # equal-size hollow boxes in a horizontal run before the
                         # low-collision signature: 3+ distinct-border boxes)
 SORT_STRIKES = 6        # contradicted placements before the sort head benches
                         # the level (mirrors SL/PC — novelty takes over)
+HERD_SEL = 8            # attractor selection radius (px): a click grabs movers
+                        # whose centre lies within this radius and pulls them
+                        # toward the click.  Step toward the goal stays inside
+                        # this radius so the mover is re-grabbed every click.
+HERD_STRIKES = 24       # consecutive clicks with no board progress before the
+                        # herd head benches the level (all candidates inert /
+                        # geometry the head can't read) — novelty takes over
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -735,6 +742,19 @@ class MyAgent(Agent):
         self._sort_prev_sig: Optional[int] = None  # board hash before a place
         self._sort_strikes = 0
         self._sort_benched: Optional[int] = None
+        # ── attractor-herd model (su15 family): click acts as a black hole
+        # that grabs movable blobs within HERD_SEL and pulls them toward the
+        # click; win = herd the right blob(s) into a static goal zone.  No
+        # board state is needed beyond a per-level "inert" memory (centres the
+        # head has clicked toward without the blob moving — decorations of the
+        # same shape as a mover) and a no-progress strike counter.  All state
+        # is read off pixels via _learn's _prev_grid, so this head perturbs no
+        # floor game (gate is the exclusive {6,7} action set). ──
+        self._herd_inert: set[Cell] = set()   # centres proven non-responsive
+        self._herd_last: Optional[Cell] = None  # candidate centre last aimed
+        self._herd_strikes = 0
+        self._herd_benched: Optional[int] = None
+        self._herd_level = -1
         # ── win-path replay + level-start signatures (efficiency) ──
         # paths are keyed (level index, masked start-frame hash): replay
         # only ever fires when the SAME level restarts from the SAME start
@@ -870,6 +890,14 @@ class MyAgent(Agent):
             self._sort_prev_sig = None
             self._sort_strikes = 0
             self._sort_benched = None
+            # the herd level replays deterministically: void the inert memory
+            # and aim (the board rewinds to its start layout) and refresh the
+            # strikes so a dead life's strikes don't carry over.  The bench is
+            # KEYED BY LEVEL, so it survives a same-level replay (a level the
+            # head genuinely can't read should stay benched).
+            self._herd_inert = set()
+            self._herd_last = None
+            self._herd_strikes = 0
             # the dead life's win-path recording is garbage; the frame
             # after RESET is a level start (the engine replays the level)
             self._wp_log.clear()
@@ -3614,6 +3642,151 @@ class MyAgent(Agent):
         self._prev_action = f"6:{int(x)},{int(y)}"
         return action
 
+    # ── attractor-herd head (su15 family) ─────────────────────────────────
+    @staticmethod
+    def _herd_blobs(grid: Grid) -> tuple[Optional[dict], list[dict]]:
+        """Pixel-only goal + mover detection for the attractor-herd family.
+
+        The board is a 64x64 field with thin decoration bars hugging the top/
+        bottom edges, optional dotted guide specks (size-1 cells), a medium
+        SOLID square-ish GOAL zone, and small compact MOVER blobs.  Returns
+        (goal, movers) where each is a dict {cx, cy, size, color, bbox};
+        movers are nearest-to-goal first.  Movers that overlap the goal box
+        are dropped (a decoration sitting on the goal is not a thing to herd).
+        Static look-alikes are filtered out at the call site via responsiveness
+        (the inert memory), not here — shape alone can't separate them."""
+        comps = components(grid)
+        info: list[dict] = []
+        for color, cells in comps:
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            x0, y0, x1, y1 = min(xs), min(ys), max(xs) + 1, max(ys) + 1
+            info.append({
+                "color": color, "size": len(cells),
+                "cx": sum(xs) / len(cells), "cy": sum(ys) / len(cells),
+                "bbox": (x0, y0, x1, y1),
+            })
+        if not info:
+            return None, []
+
+        def solidity(c: dict) -> float:
+            x0, y0, x1, y1 = c["bbox"]
+            return c["size"] / max(1, (x1 - x0) * (y1 - y0))
+
+        def square(c: dict) -> float:
+            x0, y0, x1, y1 = c["bbox"]
+            w, h = x1 - x0, y1 - y0
+            return min(w, h) / max(1, max(w, h))
+
+        def is_bar(c: dict) -> bool:
+            x0, y0, x1, y1 = c["bbox"]
+            w, h = x1 - x0, y1 - y0
+            spans = w >= GRID - 4 or h >= GRID - 4
+            edge = y0 <= 1 or y1 >= GRID - 1 or x0 <= 1 or x1 >= GRID - 1
+            return spans and edge
+
+        live = [c for c in info if c["size"] >= 2 and not is_bar(c)]
+        if not live:
+            return None, []
+        goal_cands = [c for c in live
+                      if 16 <= c["size"] <= 120
+                      and solidity(c) >= 0.5 and square(c) >= 0.6]
+        goal = (max(goal_cands, key=lambda c: c["size"]) if goal_cands
+                else max(live, key=lambda c: c["size"]))
+        gx0, gy0, gx1, gy1 = goal["bbox"]
+        movers = [c for c in live
+                  if c is not goal and 4 <= c["size"] <= 16
+                  and solidity(c) >= 0.55 and square(c) >= 0.5
+                  and not (gx0 - 1 <= c["cx"] <= gx1 + 1
+                           and gy0 - 1 <= c["cy"] <= gy1 + 1)]
+        movers.sort(key=lambda c: (c["cx"] - goal["cx"]) ** 2
+                    + (c["cy"] - goal["cy"]) ** 2)
+        return goal, movers
+
+    def _herd_policy(
+        self, grid: Grid, latest_frame: FrameData
+    ) -> Optional[GameAction]:
+        """Walk a mover blob into the goal zone via successive attractor
+        clicks (su15 family).  GATE: the available-action set is EXACTLY
+        {ACTION6, ACTION7} — empirically unique to this family, so the head
+        cannot collide with any movement game or with the {6}-only click
+        games (lp85/vc33/ft09/...).  One click per call; the mover the last
+        click aimed at is judged for responsiveness off _prev_grid (a blob
+        still exactly where the head clicked toward it is a decoration ->
+        inert).  A no-progress streak benches the level."""
+        avail = set(latest_frame.available_actions or []) \
+            - {GameAction.RESET.value}
+        if avail != {GameAction.ACTION6.value, GameAction.ACTION7.value}:
+            return None
+        level = latest_frame.levels_completed
+        if self._herd_benched == level:
+            return None
+        if level != self._herd_level:
+            # new level: fresh inert/aim memory and strikes
+            self._herd_level = level
+            self._herd_inert = set()
+            self._herd_last = None
+            self._herd_strikes = 0
+
+        # ── responsiveness: did the LAST aimed candidate move? ────────────
+        # _prev_grid is the frame the head last acted on (set by _learn).  If
+        # the same-position blob is still there unchanged, it's a static
+        # look-alike — remember it so we stop aiming at it.  Any board change
+        # at all resets the no-progress strike counter.
+        progressed = False
+        if self._herd_last is not None and self._prev_grid is not None:
+            lx, ly = self._herd_last
+            if grid != self._prev_grid:
+                progressed = True
+            still = False
+            for color, cells in components(grid):
+                xs = [c[0] for c in cells]
+                ys = [c[1] for c in cells]
+                cx, cy = sum(xs) / len(cells), sum(ys) / len(cells)
+                if abs(cx - lx) < 1.0 and abs(cy - ly) < 1.0 \
+                        and len(cells) <= 16:
+                    still = True
+                    break
+            if still:
+                self._herd_inert.add((round(lx), round(ly)))
+        if progressed:
+            self._herd_strikes = 0
+        else:
+            self._herd_strikes += 1
+            if self._herd_strikes >= HERD_STRIKES:
+                self._herd_benched = level
+                return None
+
+        goal, movers = self._herd_blobs(grid)
+        movers = [m for m in movers
+                  if (round(m["cx"]), round(m["cy"])) not in self._herd_inert]
+        if goal is None or not movers:
+            # nothing actionable this frame: clear inert (geometry may have
+            # shifted) and decline — let novelty probe instead of stalling
+            self._herd_inert = set()
+            self._herd_last = None
+            return None
+
+        m = movers[0]
+        mcx, mcy = m["cx"], m["cy"]
+        gcx, gcy = goal["cx"], goal["cy"]
+        dx, dy = gcx - mcx, gcy - mcy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < 1.0:
+            tx, ty = gcx, gcy
+        else:
+            r = min(HERD_SEL, dist)         # stay in grab radius of the mover
+            tx, ty = mcx + dx / dist * r, mcy + dy / dist * r
+        tx = max(0, min(GRID - 1, int(round(tx))))
+        ty = max(0, min(GRID - 1, int(round(ty))))
+        self._herd_last = (mcx, mcy)
+        action = GameAction.ACTION6
+        action.set_data({"x": tx, "y": ty})
+        action.reasoning = {"why": f"herd mover {(round(mcx), round(mcy))} "
+                                   f"-> goal {(round(gcx), round(gcy))}"}
+        self._prev_action = f"6:{tx},{ty}"
+        return action
+
     # ── planning ─────────────────────────────────────────────────────────
     def _policy(self, grid: Optional[Grid], latest_frame: FrameData) -> GameAction:
         # CURIO_GENERIC_ONLY ablation: skip every family-specific head and
@@ -3711,6 +3884,20 @@ class MyAgent(Agent):
             sort = self._sort_policy(grid, latest_frame)
             if sort is not None:
                 return sort
+            # attractor-herd solver (su15 family), gated on the EXCLUSIVE
+            # {6,7} action set (click + secondary/undo — empirically unique to
+            # this family across the battery: every other click game is {6}
+            # only, and every ACTION7 game also exposes movement).  A click is
+            # a black hole that pulls movable blobs within HERD_SEL toward it;
+            # the head walks a mover into the static goal zone via successive
+            # in-radius clicks, learning which look-alike blobs are inert
+            # (decorations) from their non-response.  No movement rules, no
+            # avatar, no register exist in this profile, so the gate cannot
+            # collide with any floor/held game; a no-progress streak benches
+            # the level so novelty takes over.
+            herd = self._herd_policy(grid, latest_frame)
+            if herd is not None:
+                return herd
         # warmup ends early once the model is live (2+ trusted movement rules
         # and a located avatar): 500 random steps would burn through ls20's
         # 42-pip lives and cn04's 75-action budget before planning ever

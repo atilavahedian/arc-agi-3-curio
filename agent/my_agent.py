@@ -215,6 +215,11 @@ OV_MIN_ANCHORS = 2      # hollow goal-overlay boxes a frame needs before the
                         # an incidental ring; two fixed boxes are the family)
 OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
+SORT_MIN_TARGETS = 3    # equal-size hollow boxes in a horizontal run before the
+                        # sequence-match head trusts a target row (a unique,
+                        # low-collision signature: 3+ distinct-border boxes)
+SORT_STRIKES = 6        # contradicted placements before the sort head benches
+                        # the level (mirrors SL/PC — novelty takes over)
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -710,6 +715,25 @@ class MyAgent(Agent):
         self._sl_corridor: Optional[int] = None   # learned passable color
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
+        # ── sequence-match assignment head (sb26 family) ──
+        # A target ROW of hollow boxes spells an ordered colour sequence; a
+        # palette of solid tiles (same colour-multiset) must be dragged into
+        # empty slot markers inside one or more nested containers.  The win
+        # walk descends doors (a door's interior colour == the border colour
+        # of the container it opens), so the slot fill order is a DFS over the
+        # container tree, and target[i] -> dfs_slot[i] is a positional
+        # bijection.  Drags are two ACTION6 clicks (token, slot); the final
+        # slot is filled LAST so the verification auto-fires.  All state is
+        # per-level GEOGRAPHY (the board is level data): the in-flight plan of
+        # (token_colour, slot_cell) pairs and the placement cursor, plus a
+        # strike/bench self-disable on a contradicted (no-change) placement.
+        self._sort_plan: list[tuple[int, Cell]] = []   # (token colour, slot)
+        self._sort_idx = 0          # next pair in _sort_plan to emit
+        self._sort_phase = 0        # 0 = click token, 1 = click slot
+        self._sort_level = -1       # level the current plan was built for
+        self._sort_prev_sig: Optional[int] = None  # board hash before a place
+        self._sort_strikes = 0
+        self._sort_benched: Optional[int] = None
         # ── win-path replay + level-start signatures (efficiency) ──
         # paths are keyed (level index, masked start-frame hash): replay
         # only ever fires when the SAME level restarts from the SAME start
@@ -835,6 +859,16 @@ class MyAgent(Agent):
             # so there is no standing plan to void.
             self._sl_strikes = 0
             self._sl_benched = None
+            # the sort level replays deterministically: void the in-flight
+            # placement plan (the board rewinds to its empty start), refresh
+            # the strikes/bench so a dead life's strikes don't carry over.
+            self._sort_plan = []
+            self._sort_idx = 0
+            self._sort_phase = 0
+            self._sort_level = -1
+            self._sort_prev_sig = None
+            self._sort_strikes = 0
+            self._sort_benched = None
             # the dead life's win-path recording is garbage; the frame
             # after RESET is a level start (the engine replays the level)
             self._wp_log.clear()
@@ -964,6 +998,16 @@ class MyAgent(Agent):
             self._sl_corridor = None
             self._sl_strikes = 0
             self._sl_benched = None
+            # sort geography: the new level has its own target row, palette
+            # and container tree — drop the plan, reset the placement cursor
+            # and refresh the strikes/bench (nothing here is physics).
+            self._sort_plan = []
+            self._sort_idx = 0
+            self._sort_phase = 0
+            self._sort_level = -1
+            self._sort_prev_sig = None
+            self._sort_strikes = 0
+            self._sort_benched = None
 
         if self._wp_pending_start:
             # first frame of a level (game start, level-up, or post-death

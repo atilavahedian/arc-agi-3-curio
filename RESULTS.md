@@ -82,9 +82,58 @@ generic perception+planning substrate is doing most of the held-set work.
 
 ---
 
-## Regression floor (FIT set, toggle OFF, seed 0)
+## Submittable-config matrix (HELD-18, seed 0, STEPS=4000)
 
-Confirms default behavior is unchanged by adding the toggle.
+The decision metric is the HELD-18 aggregate. Three submittable shapes are
+measured. The graph explorer (`CURIO_EXPLORER=graph`) only replaces the
+generic *fallthrough* in `_novelty_policy`; family heads still run first in
+`_policy` unless `CURIO_GENERIC_ONLY=1` also disables them — so a true
+"explorer + family heads" hybrid and an "explorer alone" run are both
+expressible with the existing toggles.
+
+| # | config | env | HELD-18 aggregate | L1+ |
+|---|--------|-----|:-----------------:|:---:|
+| **A** | **default (family heads, v7 novelty)** | *(none)* | **`0.07802407296184444`** | 9 |
+| B | explorer alone | `CURIO_EXPLORER=graph CURIO_GENERIC_ONLY=1` | `0.04048432535920809` | 9 |
+| C | hybrid (explorer + family heads) | `CURIO_EXPLORER=graph` | `0.03910295557622979` | 11 |
+
+**Winner: A (default).** It scores ~2x the explorer configs. The graph
+explorer reaches *more* levels (C: tu93 0→3, lf52→2-class, bp35 0→1) but
+**wins slowly** — the extra completed levels carry bloated action counts, so
+the `(baseline/actions)^2` term doesn't recover the cost, and meanwhile the
+explorer loses generic games the v7 novelty fallback carries (e.g. `g50t`
+1→0). Net: more levels, lower score. This is the "wins slowly → low score"
+problem from the brief, measured directly.
+
+Note C reproduces the prior stage's documented "explorer" number
+(`0.03910295557622979`) exactly — confirming that figure was the *hybrid*
+(family heads on, explorer fallthrough). Explorer-alone (B) is marginally
+higher than hybrid (0.0405 vs 0.0391): on this set the family-head + explorer
+combination nets slightly negative vs explorer-only, because the family head
+that carries `g50t` is overridden by explorer geography elsewhere. Both lose
+to A by a wide margin.
+
+No default change is made: A is already the shipped behavior and is
+byte-identical to the prior agent when both toggles are unset. The explorer
+remains a documented toggle, never the default — exactly per the
+regression-floor rule.
+
+### Seed stability (winner, config A, HELD-18)
+
+| seed | HELD-18 aggregate |
+|------|:-----------------:|
+| 0 | `0.07802407296184444` |
+| 7 | `0.07904488915365787` |
+
+Stable across seeds (0.078–0.079 band); seed 7 is marginally higher. The
+submittable config is not seed-fragile.
+
+---
+
+## Regression floor (FIT set, default = both toggles unset, seed 0)
+
+Confirms the submittable (default) agent holds the FIT floor. Re-measured
+fresh this stage; identical to the prior agent (bit-identical default path).
 
 | game | required        | measured            | ok |
 |------|-----------------|---------------------|:--:|
@@ -96,6 +145,7 @@ Confirms default behavior is unchanged by adding the toggle.
 | lp85 | >= 1            | 1                   | ✓ |
 | dc22 | >= 4            | 4                   | ✓ |
 
-FIT-set aggregate (toggle OFF, seed 0): `30.996644710050123`.
-**Floor intact** — the ablation toggle is bit-identical to the prior agent
-when `CURIO_GENERIC_ONLY` is unset.
+FIT-set aggregate (default, seed 0): `30.996644710050123`.
+**Floor intact** — the default path is bit-identical to the prior agent when
+`CURIO_GENERIC_ONLY` and `CURIO_EXPLORER` are both unset, so neither toggle
+can touch the submitted behavior.

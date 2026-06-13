@@ -727,7 +727,8 @@ class MyAgent(Agent):
         # per-level GEOGRAPHY (the board is level data): the in-flight plan of
         # (token_colour, slot_cell) pairs and the placement cursor, plus a
         # strike/bench self-disable on a contradicted (no-change) placement.
-        self._sort_plan: list[tuple[int, Cell]] = []   # (token colour, slot)
+        # plan entries: (token colour, token click cell, slot cell)
+        self._sort_plan: list[tuple[int, Cell, Cell]] = []
         self._sort_idx = 0          # next pair in _sort_plan to emit
         self._sort_phase = 0        # 0 = click token, 1 = click slot
         self._sort_level = -1       # level the current plan was built for
@@ -3297,6 +3298,322 @@ class MyAgent(Agent):
         cells = min(comps, key=len)
         return (min(cells), cells)
 
+    # ── sequence-match assignment model (sb26 family) ──────────────────────
+    def _sort_hollow_boxes(
+        self, grid: Grid
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Every same-colour component that is a HOLLOW rectangular ring (its
+        cells are exactly the bounding-box perimeter, interior is some OTHER
+        colour).  Returns (colour, x0, y0, x1, y1) per box.  These are the
+        target-row glyphs, the container walls and the nested-door frames —
+        the whole sb26 board is built from hollow boxes."""
+        out: list[tuple[int, int, int, int, int]] = []
+        for color, cells in components(grid):
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            w, h = x1 - x0 + 1, y1 - y0 + 1
+            if w < 4 or h < 4:
+                continue
+            ring = 2 * (w + h) - 4
+            # a clean ring: every cell on the perimeter, none inside, and the
+            # count matches a full rectangular outline (a 1px gap on a door's
+            # mouth is tolerated by the +/-2 slack)
+            if all(x in (x0, x1) or y in (y0, y1) for x, y in cells) \
+                    and abs(len(cells) - ring) <= 2:
+                out.append((color, x0, y0, x1, y1))
+        return out
+
+    def _sort_solid_tiles(
+        self, grid: Grid, bg: int
+    ) -> list[tuple[int, frozenset[Cell]]]:
+        """Solid (filled, non-hollow) rectangular blocks: the palette tiles
+        and the placed tokens render as a solid square of one colour."""
+        out: list[tuple[int, frozenset[Cell]]] = []
+        for color, cells in components(grid):
+            if color == bg:
+                continue
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            w = max(xs) - min(xs) + 1
+            h = max(ys) - min(ys) + 1
+            if 2 <= w <= 8 and 2 <= h <= 8 and len(cells) == w * h:
+                out.append((color, cells))
+        return out
+
+    def _sort_target_row(
+        self, boxes: list[tuple[int, int, int, int, int]]
+    ) -> Optional[list[tuple[int, int]]]:
+        """The target sequence: the topmost horizontal run of >= 3 equal-size
+        hollow boxes sharing one y-band, left-to-right.  Returns
+        [(colour, centre_x), ...] or None.  Distinct border colours are NOT
+        required (a target may repeat a colour) but >= 2 distinct colours are,
+        so a plain grid of identical cells never reads as a target row."""
+        if len(boxes) < SORT_MIN_TARGETS:
+            return None
+        by_band: dict[tuple, list[tuple[int, int, int, int, int]]] = \
+            defaultdict(list)
+        for b in boxes:
+            _c, x0, y0, x1, y1 = b
+            by_band[(y0, x1 - x0, y1 - y0)].append(b)
+        bands = [grp for grp in by_band.values() if len(grp) >= SORT_MIN_TARGETS]
+        if not bands:
+            return None
+        # topmost band (smallest y0) is the target row
+        band = min(bands, key=lambda g: g[0][2])
+        band = sorted(band, key=lambda b: b[1])
+        colors = [b[0] for b in band]
+        if len(set(colors)) < 2:
+            return None
+        return [(b[0], (b[1] + b[3]) // 2) for b in band]
+
+    def _sort_policy(
+        self, grid: Grid, latest_frame: FrameData
+    ) -> Optional[GameAction]:
+        """Solve a sequence-match assignment puzzle (sb26 family).
+
+        GATE (very specific, low collision): clicks available, NO movement
+        rules, NO avatar, plus the structural signature — a target ROW of
+        >= 3 equal-size hollow boxes, empty slot markers (one uniform colour)
+        inside larger container boxes, and a palette of solid tiles whose
+        colour-multiset equals the target multiset.
+
+        The win walk descends doors (interior colour == the opened
+        container's border colour) so the fill order is a DFS over the
+        container tree; target[i] -> dfs_slot[i] is a positional bijection.
+        Each call emits ONE click of a two-click drag (token, then slot); the
+        final slot is filled last and ACTION5 fires the verification.  A
+        placement that does not change the board is a strike; SORT_STRIKES
+        benches the level."""
+        avail = set(latest_frame.available_actions or []) \
+            - {GameAction.RESET.value}
+        if GameAction.ACTION6.value not in avail:
+            return None
+        if self._movement_rules() or self._find_avatar(grid):
+            return None
+        level = latest_frame.levels_completed
+        if self._sort_benched == level:
+            return None
+
+        # ── replay an in-flight plan ──────────────────────────────────────
+        if self._sort_plan and self._sort_level == level \
+                and self._sort_idx < len(self._sort_plan):
+            return self._sort_emit(grid)
+
+        # ── (re)build the plan from the board ─────────────────────────────
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        bg = counts.most_common(1)[0][0]
+        boxes = self._sort_hollow_boxes(grid)
+        targets = self._sort_target_row(boxes)
+        if not targets:
+            return None
+        tgt_colors = [c for c, _x in targets]
+        # palette tiles: solid blocks whose colour multiset == target multiset
+        tiles = self._sort_solid_tiles(grid, bg)
+        # group candidate palette tiles by colour; a colour may repeat
+        pal_by_color: dict[int, list[Cell]] = defaultdict(list)
+        # the palette sits in its own row strip (max y); take the solid tiles
+        # on the lowest band so placed-token blocks inside containers don't
+        # masquerade as palette
+        if not tiles:
+            return None
+        max_y = max(min(y for _x, y in cells) for _c, cells in tiles)
+        pal_tiles = [(c, cells) for c, cells in tiles
+                     if min(y for _x, y in cells) >= max_y - 2]
+        for c, cells in pal_tiles:
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            pal_by_color[c].append(((min(xs) + max(xs)) // 2,
+                                    (min(ys) + max(ys)) // 2))
+        if Counter(c for c, _ in pal_tiles) != Counter(tgt_colors):
+            return None
+
+        # containers: the hollow boxes that are NOT the target row and are
+        # large enough to hold slots (bigger than a target glyph)
+        tgt_centers = {x for _c, x in targets}
+        glyph_w = None
+        for _c, x0, y0, x1, y1 in boxes:
+            if (x0 + x1) // 2 in tgt_centers:
+                glyph_w = x1 - x0
+                tgt_y_band = y0
+                break
+        if glyph_w is None:
+            return None
+        containers = [b for b in boxes
+                      if not ((b[1] + b[3]) // 2 in tgt_centers
+                              and b[2] == tgt_y_band)
+                      and (b[3] - b[1]) > glyph_w]
+        if not containers:
+            return None
+
+        # slot markers: small uniform-colour solid blocks sitting INSIDE a
+        # container (not the palette, not a target glyph).  Their colour is
+        # uniform across all empty slots; doors are hollow boxes inside a
+        # container whose interior colour matches some container's border.
+        slot_blocks = [(c, cells) for c, cells in tiles
+                       if min(y for _x, y in cells) < max_y - 2]
+        in_cont = []
+        for c, cells in slot_blocks:
+            cx = sum(x for x, _y in cells) // len(cells)
+            cy = sum(y for _x, y in cells) // len(cells)
+            for _bc, x0, y0, x1, y1 in containers:
+                if x0 < cx < x1 and y0 < cy < y1:
+                    in_cont.append((c, (cx, cy), (x0, y0, x1, y1)))
+                    break
+        if not in_cont:
+            return None
+        # the slot marker colour is the most common colour among in-container
+        # solid blocks
+        slot_color = Counter(c for c, _ctr, _box in in_cont).most_common(1)[0][0]
+        empty_slots = [(ctr, box) for c, ctr, box in in_cont if c == slot_color]
+        if len(empty_slots) != len(tgt_colors):
+            return None
+
+        order = self._sort_dfs_slots(containers, empty_slots, boxes, bg, grid)
+        if order is None or len(order) != len(tgt_colors):
+            return None
+
+        # positional bijection target[i] -> dfs_slot[i]; fill the final slot
+        # LAST so the verification fires only when the board is complete
+        plan: list[tuple[int, Cell, Cell]] = []
+        used: dict[int, int] = defaultdict(int)
+        for (tc, _tx), slot in zip(targets, order):
+            picks = pal_by_color.get(tc)
+            if not picks:
+                return None
+            cell = picks[used[tc] % len(picks)]
+            used[tc] += 1
+            plan.append((tc, cell, slot))
+        self._sort_plan = plan
+        self._sort_idx = 0
+        self._sort_phase = 0
+        self._sort_level = level
+        self._sort_prev_sig = None
+        return self._sort_emit(grid)
+
+    def _sort_dfs_slots(
+        self,
+        containers: list[tuple[int, int, int, int, int]],
+        empty_slots: list[tuple[Cell, tuple]],
+        boxes: list[tuple[int, int, int, int, int]],
+        bg: int, grid: Grid,
+    ) -> Optional[list[Cell]]:
+        """The fill order the win walk visits slots in: descend each
+        container left-to-right; a DOOR (a hollow box inside a container whose
+        interior colour equals some container's BORDER colour) recurses into
+        that container, then control returns.  Returns the ordered slot cells,
+        or None if the door graph is malformed."""
+        # index containers by border colour (the door target key)
+        cont_by_color: dict[int, tuple] = {}
+        for b in containers:
+            cont_by_color[b[0]] = b
+        # slots per container (keyed by the container's full 5-tuple so it
+        # agrees with doors_in and walk()), left-to-right.  A slot's stored
+        # box is the (x0,y0,x1,y1) of the container it sits in; match it back
+        # to the 5-tuple.
+        slots_in: dict[tuple, list[Cell]] = defaultdict(list)
+        for ctr, box in empty_slots:
+            for cb in containers:
+                if cb[1:5] == tuple(box):
+                    slots_in[cb].append(ctr)
+                    break
+        # doors per container: a hollow box strictly inside a container whose
+        # interior colour matches another container's border colour
+        doors_in: dict[tuple, list[tuple[int, Cell]]] = defaultdict(list)
+        for dc, dx0, dy0, dx1, dy1 in boxes:
+            for cb in containers:
+                _bc, cx0, cy0, cx1, cy1 = cb
+                if cb[:5] == (dc, dx0, dy0, dx1, dy1):
+                    continue
+                if cx0 < dx0 and dx1 < cx1 and cy0 < dy0 and dy1 < cy1:
+                    interior = grid[(dy0 + dy1) // 2][(dx0 + dx1) // 2]
+                    if interior in cont_by_color and interior != cb[0]:
+                        doors_in[cb].append((interior,
+                                             ((dx0 + dx1) // 2,
+                                              (dy0 + dy1) // 2)))
+                    break
+
+        # walk: at each container, interleave slots and doors by x-position
+        order: list[Cell] = []
+        visited: set[tuple] = set()
+
+        def walk(cont: tuple) -> bool:
+            if cont in visited:
+                return False
+            visited.add(cont)
+            items: list[tuple[int, str, object]] = []
+            for ctr in slots_in.get(cont, []):
+                items.append((ctr[0], "slot", ctr))
+            for icolor, dctr in doors_in.get(cont, []):
+                items.append((dctr[0], "door", icolor))
+            items.sort(key=lambda t: t[0])
+            for _x, kind, payload in items:
+                if kind == "slot":
+                    order.append(payload)  # type: ignore[arg-type]
+                else:
+                    child = cont_by_color.get(payload)  # type: ignore[index]
+                    if child is None or not walk(child):
+                        return False
+            return True
+
+        # root = the top-most / left-most container that no door points into
+        door_targets = {ic for ds in doors_in.values() for ic, _ in ds}
+        roots = [c for c in containers if c[0] not in door_targets]
+        if not roots:
+            roots = containers
+        root = min(roots, key=lambda b: (b[2], b[1]))
+        if not walk(root):
+            return None
+        # any container not reached (disconnected door graph) → bail
+        if len(order) != len(empty_slots):
+            return None
+        return order
+
+    def _sort_emit(self, grid: Grid) -> Optional[GameAction]:
+        """Emit one click of the current two-click drag.  Phase 0 selects the
+        token, phase 1 drops it on the slot and advances the cursor; after the
+        last slot, ACTION5 fires the verification.  A placement that left the
+        board unchanged is a strike (mis-parsed slot/token)."""
+        if self._sort_idx >= len(self._sort_plan):
+            # all placed: trigger the verification look
+            self._sort_idx += 1  # one-shot guard
+            return self._sort_look()
+        _tc, token_cell, slot_cell = self._sort_plan[self._sort_idx]
+        if self._sort_phase == 0:
+            # before selecting, check the prior placement actually landed
+            if self._sort_prev_sig is not None:
+                if grid_hash(grid) == self._sort_prev_sig:
+                    self._sort_strikes += 1
+                    if self._sort_strikes >= SORT_STRIKES:
+                        self._sort_benched = self._sort_level
+                        self._sort_plan = []
+                        return None
+                self._sort_prev_sig = None
+            self._sort_phase = 1
+            return self._sort_click(token_cell, "sort: select token")
+        # phase 1: drop on the slot, advance
+        self._sort_phase = 0
+        self._sort_prev_sig = grid_hash(grid)
+        self._sort_idx += 1
+        return self._sort_click(slot_cell, "sort: place in slot")
+
+    def _sort_look(self) -> GameAction:
+        action = GameAction.ACTION5
+        action.reasoning = {"why": "sort: verify placement"}
+        self._prev_action = str(GameAction.ACTION5.value)
+        return action
+
+    def _sort_click(self, cell: Cell, why: str) -> GameAction:
+        x, y = cell
+        action = GameAction.ACTION6
+        action.set_data({"x": int(x), "y": int(y)})
+        action.reasoning = {"why": why}
+        self._prev_action = f"6:{int(x)},{int(y)}"
+        return action
+
     # ── planning ─────────────────────────────────────────────────────────
     def _policy(self, grid: Optional[Grid], latest_frame: FrameData) -> GameAction:
         # CURIO_GENERIC_ONLY ablation: skip every family-specific head and
@@ -3383,6 +3700,17 @@ class MyAgent(Agent):
             switch = self._switch_policy(grid, latest_frame)
             if switch is not None:
                 return switch
+            # sequence-match assignment solver (sb26 family), gated inside on
+            # clicks + NO movement rules + NO avatar + the structural target-
+            # row / slots / matching-palette signature.  This [5,6,7]-style
+            # no-avatar profile is structurally absent from every movement
+            # floor game, so the gate cannot fire where an avatar or movement
+            # rules exist; the strike/bench self-disable contains a mis-parse.
+            # Runs after the switch branch and before warmup: a placement plan
+            # is exact, so there is no value in random opening clicks.
+            sort = self._sort_policy(grid, latest_frame)
+            if sort is not None:
+                return sort
         # warmup ends early once the model is live (2+ trusted movement rules
         # and a located avatar): 500 random steps would burn through ls20's
         # 42-pip lives and cn04's 75-action budget before planning ever

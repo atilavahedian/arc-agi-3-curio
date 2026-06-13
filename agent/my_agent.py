@@ -652,7 +652,9 @@ class MyAgent(Agent):
         # SELECT verb are physics (same on every level); the per-colour anchor
         # sets, solved-colour set and failure counters are per-level geography.
         self._ov_outline_votes: Counter[int] = Counter()  # physics
+        self._ov_deltas: dict[int, Counter[Cell]] = defaultdict(Counter)  # phys
         self._ov_select: Optional[int] = None       # the cycle-selection verb
+        self._ov_idprobe = 0        # arrow-probe cursor (learn the 4 deltas)
         self._ov_level = -1
         self._ov_solved: set[int] = set()           # colours already covered
         self._ov_plan: deque[int] = deque()         # queued MOVE action ids
@@ -810,6 +812,7 @@ class MyAgent(Agent):
             self._ov_strikes = 0
             self._ov_benched = None
             self._ov_last_center = None
+            self._ov_idprobe = 0
             # the editor's level replays deterministically too: keep the
             # mutate boxes and goal candidates, give a benched run a fresh
             # life (strikes die with the budget that earned them)
@@ -931,6 +934,7 @@ class MyAgent(Agent):
             self._ov_strikes = 0
             self._ov_benched = None
             self._ov_last_center = None
+            self._ov_idprobe = 0
             # switch geography: masks, phase patches, fall bans and probe
             # spend are positional level data (footprint passability — the
             # _stepped/_block signature stores — is appearance physics)
@@ -2291,26 +2295,32 @@ class MyAgent(Agent):
                  and a != GameAction.RESET.value]
         return cands[0] if len(cands) == 1 else None
 
-    def _ov_selected(self, grid: Grid) -> Optional[tuple[Cell, int]]:
+    def _ov_selected(
+        self, grid: Grid, outline: int
+    ) -> Optional[tuple[Cell, int]]:
         """The selected piece: (centre cell, arm colour).  The centre is the
-        unique colour-0 selection hole; the arm colour is the dominant non-
-        background, non-outline colour in its 8-connected blob.  None when no
+        unique colour-0 selection hole; the arm colour is the most common
+        colour among the cells NEAR the hole, excluding the background, the
+        outline ring and 0 itself (the arms radiate from the centre, so the
+        nearest non-background non-outline colour is the piece).  None when no
         single 0 hole is present (a transient animation frame)."""
         holes = [(x, y) for y in range(GRID) for x in range(GRID)
                  if grid[y][x] == 0]
         if len(holes) != 1:
             return None
         cx, cy = holes[0]
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        bg = counts.most_common(1)[0][0]
         cnt: Counter[int] = Counter()
         for dy in range(-4, 5):
             for dx in range(-4, 5):
                 x, y = cx + dx, cy + dy
                 if 0 <= x < GRID and 0 <= y < GRID:
                     v = grid[y][x]
-                    if v not in (0,) and v >= 0:
+                    if v >= 0 and v not in (0, bg, outline):
                         cnt[v] += 1
-        # the arm colour dominates the local window; drop the outline (it only
-        # appears as box rings, which are sparse near a free-standing piece)
         if not cnt:
             return None
         arm = cnt.most_common(1)[0][0]
@@ -2320,13 +2330,16 @@ class MyAgent(Agent):
         self, grid: Optional[Grid], latest_frame: FrameData
     ) -> Optional[GameAction]:
         """Overlay-align policy, gated on: the [1,2,3,4,5]-no-ACTION6 action
-        set + a static hollow-box goal overlay (OV_MIN_ANCHORS+ boxes) + four
-        axis move rules of one magnitude>=2 + a SELECT verb that jumps the
-        selection hole rather than translating.  g50t shares the action set
-        but has a scrolling obstacle and no box overlay, so the secondary gate
-        keeps the head inert there.  Drives the selected piece's arm footprint
-        onto its same-colour anchor centres, then cycles SELECT to the next
-        colour; benches on repeated dry plans."""
+        set + a static hollow-box goal overlay (OV_MIN_ANCHORS+ boxes) + a
+        single colour-0 selection hole.  Once engaged it probes ACTION1..4 to
+        learn the four axis MOVE deltas from the HOLE's own displacement (the
+        arms span the whole frame, so the generic GROUP_BBOX-capped vote never
+        trusts them), at one magnitude >= 2; the remaining simple action is the
+        SELECT verb that jumps the hole to another piece.  g50t shares the
+        action set but has a scrolling obstacle and no box overlay, so the
+        secondary gate keeps the head inert there.  Drives the selected piece's
+        arm footprint onto its same-colour anchor centres, then cycles SELECT
+        to the next colour; benches on repeated dry/blocked plans."""
         if grid is None:
             return None
         avail = set(latest_frame.available_actions or [])
@@ -2341,20 +2354,39 @@ class MyAgent(Agent):
         if outline is None:
             return None  # no static box overlay → not this family
         self._ov_outline_votes[outline] += 1
-        # require the four axis move rules at one magnitude >= 2 (re86 steps
-        # 3px; g50t steps 1px — a second guard, redundant with the overlay
-        # gate but cheap).  Collect the best-voted act per axis direction.
-        rules = self._movement_rules()
-        axis = {a: d for a, d in rules.items()
-                if (d[0] == 0) != (d[1] == 0) and abs(d[0]) + abs(d[1]) >= 2}
-        mags = {abs(d[0]) + abs(d[1]) for d in axis.values()}
-        if len(axis) < 4 or len(mags) != 1:
-            return None  # full 2D control at one magnitude not learned yet
-        step = mags.pop()
-        select = self._ov_select_verb(avail, rules)
-        if select is None:
+        anchors = overlay_anchors(grid, outline)
+        if not anchors:
             return None
-        self._ov_select = select
+        sel = self._ov_selected(grid, outline)
+        if sel is None:
+            return None  # transient frame with no clean selection hole
+        center, arm = sel
+        # LEARN MOVE DELTAS the head's own way: the generic move-vote path caps
+        # mover bbox at GROUP_BBOX, but re86's arms span the whole frame, so
+        # the arrows never earn a rule there.  Instead read the selection
+        # hole's own displacement: a small one-axis step is a MOVE delta; the
+        # SELECT verb jumps the hole to a far/diagonal piece (never recorded).
+        if self._prev_action is not None and self._prev_action.isdigit() \
+                and self._prev_grid is not None \
+                and self._ov_last_center is not None:
+            pa = int(self._prev_action)
+            ddx = center[0] - self._ov_last_center[0]
+            ddy = center[1] - self._ov_last_center[1]
+            mag = abs(ddx) + abs(ddy)
+            if 0 < mag <= 6 and (ddx == 0) != (ddy == 0):
+                self._ov_deltas[pa][(ddx, ddy)] += 1
+        # the four axis MOVE actions: those with a trusted one-axis delta.
+        # SELECT is the available simple action with no such delta.
+        axis: dict[int, Cell] = {}
+        for a in sorted(avail):
+            if a == GameAction.RESET.value \
+                    or GameAction.from_id(a).is_complex():
+                continue
+            if self._ov_deltas[a]:
+                d, n = self._ov_deltas[a].most_common(1)[0]
+                if n >= VOTE_THRESHOLD:
+                    axis[a] = d
+        mags = {abs(d[0]) + abs(d[1]) for d in axis.values()}
         level = latest_frame.levels_completed
         if self._ov_benched == level:
             return None
@@ -2366,14 +2398,28 @@ class MyAgent(Agent):
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
-            self._ov_last_center = None
-        anchors = overlay_anchors(grid, outline)
-        if not anchors:
+            self._ov_idprobe = 0
+        # PROBE PHASE: arrows aren't all learned yet.  Cycle ACTION1..4 once
+        # each (and SELECT can't be probed — it desyncs selection), recording
+        # the hole displacement.  Bail out of probing once all four deltas are
+        # trusted at one magnitude.
+        simple = [a for a in sorted(avail)
+                  if a != GameAction.RESET.value
+                  and not GameAction.from_id(a).is_complex()
+                  and a != GameAction.ACTION5.value]
+        if len(axis) < 4 or len(mags) != 1:
+            if self._ov_idprobe < len(simple) * VOTE_THRESHOLD:
+                act = simple[self._ov_idprobe % len(simple)]
+                self._ov_idprobe += 1
+                self._ov_last_center = center
+                return self._step(GameAction.from_id(act))
+            return None  # probing exhausted without 4 clean axis deltas
+        step = mags.pop()
+        select = self._ov_select_verb(
+            avail, {a: d for a, d in axis.items()})
+        if select is None:
             return None
-        sel = self._ov_selected(grid)
-        if sel is None:
-            return None  # transient frame with no clean selection hole
-        center, arm = sel
+        self._ov_select = select
         # direction -> move action (unit axis of the learned step)
         dir_act = {(0, -1): None, (0, 1): None, (-1, 0): None, (1, 0): None}
         for a, d in axis.items():

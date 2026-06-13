@@ -202,6 +202,13 @@ SW_CLICK_COST = 2       # budget units a click edge spends (dc22 charges a
 SW_BFS_CAP = 6000       # (anchor x phase-vector) product-graph state budget
 SW_STRIKES = 10         # model surprises before the switch planner benches
                         # the level (novelty search takes over)
+SL_ACCENT_MAX = 4       # max pixels a node-maze avatar accent color may span
+                        # for the slide observer to track it (a unique tiny
+                        # marker, not a sprawling object)
+SL_STRIKES = 6          # dry/failed slide plans before the maze head benches
+                        # the level (novelty search takes over)
+SL_PROBE_CAP = 1        # directional probes per action before the slide head
+                        # trusts (or rejects) that action's unit step
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -979,6 +986,20 @@ class MyAgent(Agent):
             # EDIT: classify this action's diff for the editor model
             # (cross-level repaints are not action physics)
             self._ed_note(act, grid, groups)
+            # SLIDE/NODE-MAZE perception (tu93 family): the avatar carries a
+            # unique accent pixel (a single-pixel minority component); track
+            # its NET displacement from the pre-action grid to the settled
+            # frame and vote it per action.  This is a pure additive observer
+            # — it writes ONLY _slide_votes, never _move_votes / rules / walls,
+            # so it cannot perturb any other family.  It runs even when the
+            # multi-group gate below records nothing (the corridor repaint
+            # behind a moving avatar reads as a second mover).  Zero-but-spent
+            # records a blocked edge (the budget ticked, the avatar held).
+            pa = self._sl_avatar_anchor(self._prev_grid)
+            ca = self._sl_avatar_anchor(grid)
+            if pa is not None and ca is not None and pa[1] == ca[1]:
+                self._slide_votes[act][(ca[0][0] - pa[0][0],
+                                        ca[0][1] - pa[0][1])] += 1
         if len(groups) == 1:
             # all movers share one delta → one rigid group: avatar candidate.
             # Multi-color sprites (ls20's 12-over-9 player, cn04's selected
@@ -2809,6 +2830,40 @@ class MyAgent(Agent):
             return None
         sig, n = self._avatar_sigs.most_common(1)[0]
         return sig if n >= VOTE_THRESHOLD else None
+
+    def _sl_avatar_anchor(
+        self, grid: Grid
+    ) -> Optional[tuple[Cell, int]]:
+        """Anchor of the node-maze avatar's accent: the rarest non-background
+        color that forms ONE tiny stable component (a single accent pixel or
+        a handful).  Returns (anchor cell, color), or None when no unique
+        rare accent exists (most games — this keeps the slide observer inert).
+        Pure read; never mutates state."""
+        counts: Counter[int] = Counter()
+        for row in grid:
+            counts.update(row)
+        if len(counts) < 3:
+            return None
+        bg = counts.most_common(1)[0][0]
+        # candidate accent colors: rare ones, capped tiny so a busy frame's
+        # least-common-but-still-large color never qualifies
+        rare = [c for c, n in counts.items()
+                if c != bg and 0 < n <= SL_ACCENT_MAX]
+        if not rare:
+            return None
+        comps = components(grid)
+        best: Optional[tuple[int, Cell, int]] = None  # (size, anchor, color)
+        for color in rare:
+            cc = [cells for c, cells in comps if c == color]
+            if len(cc) != 1:
+                continue  # ambiguous: not a unique accent
+            cells = cc[0]
+            cand = (len(cells), min(cells), color)
+            if best is None or cand < best:
+                best = cand
+        if best is None:
+            return None
+        return (best[1], best[2])
 
     def _match_signature(
         self, grid: Grid, sig: frozenset

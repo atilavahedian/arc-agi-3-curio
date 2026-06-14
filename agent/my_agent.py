@@ -1188,8 +1188,20 @@ class MyAgent(Agent):
             # multi-group gate below records nothing (the corridor repaint
             # behind a moving avatar reads as a second mover).  Zero-but-spent
             # records a blocked edge (the budget ticked, the avatar held).
-            pa = self._sl_avatar_anchor(self._prev_grid)
-            ca = self._sl_avatar_anchor(grid)
+            #
+            # SPEED EARLY-OUT (round 5 leak fix): tu93's action set is
+            # movement-only ([1,2,3,4], no clicks).  _sl_avatar_anchor runs
+            # full-grid component segmentation; firing it twice per step on a
+            # click game (lp85/dc22/...) is pure waste — the slide head can
+            # never engage there.  Gate on the CHEAP action-set signal first
+            # (self._avail was set this frame, before _learn) so non-maze
+            # games skip the two anchor scans entirely.  Does not change WHEN
+            # the slide head fires on a real [1,2,3,4] maze.
+            if self._avail - {GameAction.RESET.value} <= {1, 2, 3, 4}:
+                pa = self._sl_avatar_anchor(self._prev_grid)
+                ca = self._sl_avatar_anchor(grid)
+            else:
+                pa = ca = None
             if pa is not None and ca is not None and pa[1] == ca[1]:
                 self._slide_votes[act][(ca[0][0] - pa[0][0],
                                         ca[0][1] - pa[0][1])] += 1

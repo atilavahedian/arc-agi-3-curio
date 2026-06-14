@@ -3430,10 +3430,30 @@ class MyAgent(Agent):
             - {GameAction.RESET.value}
         if GameAction.ACTION6.value not in avail:
             return None
-        if self._movement_rules() or self._find_avatar(grid):
-            return None
         level = latest_frame.levels_completed
         if self._sort_benched == level:
+            return None
+        # SPEED EARLY-OUT (round 5 leak fix): the gate below must reject
+        # avatar/movement games, but _find_avatar runs full-grid component
+        # segmentation — paying that (plus the box/tile scans) EVERY step on a
+        # non-sb26 click game (lp85/dc22/...) is the leak.  _movement_rules is
+        # cheap, so test it first (short-circuits before the avatar scan on any
+        # game with a trusted rule).  Then a ONE-TIME-PER-LEVEL structural
+        # probe: sb26's board (a target ROW of >=3 equal hollow boxes) is
+        # present from the level's first frame and replays deterministically,
+        # so when that cheap row signature is absent the game is not this
+        # family — bench the level so the expensive avatar/box/tile scans never
+        # run again here.  Guarded by `not self._sort_plan` so an in-flight
+        # placement plan is never re-probed.  Does not change WHEN the head
+        # fires on a real sb26 board.
+        if self._movement_rules():
+            return None
+        if not self._sort_plan:
+            probe_boxes = self._sort_hollow_boxes(grid)
+            if not self._sort_target_row(probe_boxes):
+                self._sort_benched = level
+                return None
+        if self._find_avatar(grid):
             return None
 
         # ── replay an in-flight plan ──────────────────────────────────────

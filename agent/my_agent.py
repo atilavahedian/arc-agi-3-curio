@@ -243,6 +243,13 @@ HERD_SEL = 8            # attractor selection radius (px): a click grabs movers
 HERD_STRIKES = 24       # consecutive clicks with no board progress before the
                         # herd head benches the level (all candidates inert /
                         # geometry the head can't read) — novelty takes over
+HERD_TRIAL = 8          # exploratory clicks the herd head may spend on a level
+                        # BEFORE the attractor physics is confirmed (a clicked
+                        # mover moved toward the click).  Round 6 tighten: a
+                        # genuine su15 mover responds to its first valid aim, so
+                        # 8 leaves margin for a few inert decoys; a non-herd
+                        # {6,7} board never confirms and benches at this budget,
+                        # deferring to baseline instead of flailing for 24.
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -768,6 +775,16 @@ class MyAgent(Agent):
         # floor game (gate is the exclusive {6,7} action set). ──
         self._herd_inert: set[Cell] = set()   # centres proven non-responsive
         self._herd_last: Optional[Cell] = None  # candidate centre last aimed
+        self._herd_aim: Optional[Cell] = None  # click point the last aim targeted
+        self._herd_confirmed = False  # attractor physics proven on THIS level:
+                                      # a clicked mover moved TOWARD the click.
+                                      # Round 6 tighten: until proven, the head
+                                      # only spends a small trial budget — a
+                                      # {6,7} game that is NOT herd never shows
+                                      # this response and defers to baseline.
+        self._herd_trials = 0         # exploratory clicks spent before confirm
+        self._herd_any_progress = False  # board ever changed on THIS level (a
+                                      # dead {6,7} board never changes -> bench)
         self._herd_strikes = 0
         self._herd_benched: Optional[int] = None
         self._herd_level = -1
@@ -913,6 +930,10 @@ class MyAgent(Agent):
             # head genuinely can't read should stay benched).
             self._herd_inert = set()
             self._herd_last = None
+            self._herd_aim = None
+            self._herd_confirmed = False
+            self._herd_trials = 0
+            self._herd_any_progress = False
             self._herd_strikes = 0
             # the dead life's win-path recording is garbage; the frame
             # after RESET is a level start (the engine replays the level)
@@ -3788,10 +3809,14 @@ class MyAgent(Agent):
         if self._herd_benched == level:
             return None
         if level != self._herd_level:
-            # new level: fresh inert/aim memory and strikes
+            # new level: fresh inert/aim memory, strikes, and confirmation
             self._herd_level = level
             self._herd_inert = set()
             self._herd_last = None
+            self._herd_aim = None
+            self._herd_confirmed = False
+            self._herd_trials = 0
+            self._herd_any_progress = False
             self._herd_strikes = 0
 
         # ── responsiveness: did the LAST aimed candidate move? ────────────
@@ -3805,23 +3830,57 @@ class MyAgent(Agent):
             if grid != self._prev_grid:
                 progressed = True
             still = False
+            # nearest small blob to the aimed centre after the click
+            nearest: Optional[tuple[float, float, float]] = None  # (d, cx, cy)
             for color, cells in components(grid):
                 xs = [c[0] for c in cells]
                 ys = [c[1] for c in cells]
                 cx, cy = sum(xs) / len(cells), sum(ys) / len(cells)
+                if len(cells) <= 16:
+                    d = (cx - lx) ** 2 + (cy - ly) ** 2
+                    if nearest is None or d < nearest[0]:
+                        nearest = (d, cx, cy)
                 if abs(cx - lx) < 1.0 and abs(cy - ly) < 1.0 \
                         and len(cells) <= 16:
                     still = True
-                    break
             if still:
                 self._herd_inert.add((round(lx), round(ly)))
+            # CONFIDENCE GATE (round 6 tighten): confirm the ATTRACTOR PHYSICS
+            # before trusting this as the herd family.  The aimed mover must
+            # have moved measurably TOWARD the click point we issued — that is
+            # the family's defining mechanic.  A {6,7} game that is NOT herd
+            # never produces this directed response, so it never confirms and
+            # the trial budget below benches it (deferring to baseline) instead
+            # of letting the head flail for HERD_STRIKES clicks.
+            if not self._herd_confirmed and self._herd_aim is not None \
+                    and nearest is not None:
+                _d, ncx, ncy = nearest
+                ax, ay = self._herd_aim
+                before = ((ax - lx) ** 2 + (ay - ly) ** 2) ** 0.5
+                after = ((ax - ncx) ** 2 + (ay - ncy) ** 2) ** 0.5
+                # moved toward the click by a real margin (not pixel jitter)
+                if (not still) and before - after >= 1.5:
+                    self._herd_confirmed = True
         if progressed:
             self._herd_strikes = 0
+            self._herd_any_progress = True
         else:
             self._herd_strikes += 1
             if self._herd_strikes >= HERD_STRIKES:
                 self._herd_benched = level
                 return None
+        # DEAD-BOARD bench (round 6 tighten): if after a small trial budget the
+        # head has neither confirmed the attractor physics (a mover moved toward
+        # a click) NOR seen ANY board change at all, this {6,7} board is almost
+        # certainly NOT the herd family — bench so baseline exploration runs
+        # instead of the head flailing for the full HERD_STRIKES window.  su15
+        # always produces board changes early (so _herd_any_progress is set and
+        # this never fires on the family); a truly inert non-herd board never
+        # does, so it defers fast.
+        if not self._herd_confirmed and not self._herd_any_progress \
+                and self._herd_trials >= HERD_TRIAL:
+            self._herd_benched = level
+            return None
 
         goal, movers = self._herd_blobs(grid)
         movers = [m for m in movers
@@ -3846,6 +3905,9 @@ class MyAgent(Agent):
         tx = max(0, min(GRID - 1, int(round(tx))))
         ty = max(0, min(GRID - 1, int(round(ty))))
         self._herd_last = (mcx, mcy)
+        self._herd_aim = (float(tx), float(ty))  # click point, for confirm check
+        if not self._herd_confirmed:
+            self._herd_trials += 1  # spend a trial click toward confirmation
         action = GameAction.ACTION6
         action.set_data({"x": tx, "y": ty})
         action.reasoning = {"why": f"herd mover {(round(mcx), round(mcy))} "

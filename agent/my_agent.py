@@ -2435,6 +2435,17 @@ class MyAgent(Agent):
             return None
         if GameAction.ACTION5.value not in avail:
             return None
+        # SPEED EARLY-OUT (round 5 leak fix): _ov_outline is a full interior
+        # double-scan testing every cell as a hollow-3x3-box centre.  Once a
+        # level is benched (this game isn't re86, or the head gave up on a
+        # mis-parse) that scan was still paid EVERY step here — the leak on any
+        # [1,2,3,4,5]-no-ACTION6 game that survives the cheap action-set gate.
+        # The benched flag is the cheapest possible signal, so test it BEFORE
+        # the scan; a benched level already declined, so this never changes
+        # WHEN the head fires on a live re86 board.
+        level = latest_frame.levels_completed
+        if self._ov_benched == level:
+            return None
         outline = self._ov_outline(grid)
         if outline is None:
             return None  # no static box overlay → not this family
@@ -2472,9 +2483,6 @@ class MyAgent(Agent):
                 if n >= VOTE_THRESHOLD:
                     axis[a] = d
         mags = {abs(d[0]) + abs(d[1]) for d in axis.values()}
-        level = latest_frame.levels_completed
-        if self._ov_benched == level:
-            return None
         if self._ov_strikes >= OV_STRIKES:
             self._ov_benched = level
             return None

@@ -228,9 +228,12 @@ OV_MIN_TOTAL = 4        # total hollow-box anchor centres (summed across all
                         # while an incidental ring pair never reaches it.
 OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
-SORT_MIN_TARGETS = 3    # equal-size hollow boxes in a horizontal run before the
-                        # sequence-match head trusts a target row (a unique,
-                        # low-collision signature: 3+ distinct-border boxes)
+SORT_MIN_TARGETS = 4    # equal-size hollow boxes in a horizontal run before the
+                        # sequence-match head trusts a target row.  Round 6
+                        # tighten: raised 3->4 — a 3-box row is a plausible
+                        # incidental alignment on a hidden click game, whereas
+                        # sb26's target rows run 4-7 boxes, so 4 keeps the family
+                        # while rejecting the thin 3-box false positive.
 SORT_STRIKES = 6        # contradicted placements before the sort head benches
                         # the level (mirrors SL/PC — novelty takes over)
 HERD_SEL = 8            # attractor selection radius (px): a click grabs movers

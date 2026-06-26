@@ -209,6 +209,11 @@ SL_STRIKES = 6          # dry/failed slide plans before the maze head benches
                         # the level (novelty search takes over)
 SL_PROBE_CAP = 1        # directional probes per action before the slide head
                         # trusts (or rejects) that action's unit step
+SL_MIN_NODES = 12       # lattice nodes a board must expose before the slide head
+                        # trusts a genuine node-maze (tu93's smallest 39x39 maze
+                        # clears this easily; an incidental two-colour tiling on a
+                        # hidden non-maze game does not — keeps the head dormant
+                        # unless the maze structure is unambiguous)
 OV_MIN_ANCHORS = 2      # hollow goal-overlay boxes a frame needs before the
                         # overlay-align head trusts the static-goal signature
                         # (re86: a single box is too weak to distinguish from
@@ -4952,12 +4957,26 @@ class MyAgent(Agent):
         if lat is None:
             return None
         pitch, ox, oy, nodes, cA, cB = lat
+        # CONFIDENCE GATE (round 6 tighten): a genuine node-maze exposes many
+        # lattice nodes.  An incidental two-colour tiling on a hidden non-maze
+        # game can pass the cheap lattice detector with only a handful of
+        # nodes — engaging there sends the head walking BFS routes on a board
+        # that is not a maze, losing levels the baseline would explore.  Demand
+        # a substantial node count so the head stays dormant unless the maze
+        # structure is unambiguous.
+        if len(nodes) < SL_MIN_NODES:
+            return None
         av_cells = self._sl_avatar_cells(grid, av_anchor, lat)
         snode = self._sl_node(self._sl_body_center(grid, av_anchor, lat), lat)
         if snode is None or snode not in nodes:
             return None
         exit_node = self._sl_exit_node(grid, lat, av_cells)
         if exit_node is None:
+            return None
+        # the goal must be a DISTINCT node from the start: a "maze" whose exit
+        # snaps onto the avatar's own node is a mis-parse (the rare-colour blob
+        # is decoration, not a goal) — defer to baseline rather than act.
+        if exit_node == snode:
             return None
 
         # learn the corridor colour: the board colour that, as a straddle,
@@ -4979,7 +4998,6 @@ class MyAgent(Agent):
                 self._sl_probe[a] += 1
                 return self._step(GameAction.from_id(a))
 
-        self._sl_engaged = True
         # RE-PLAN every step (a 36-node BFS is cheap): blind plan replay
         # desyncs the instant any edge reading is off, so route fresh from
         # the avatar's current node and take only the first action.  This is
@@ -4997,6 +5015,12 @@ class MyAgent(Agent):
             if self._sl_strikes >= SL_STRIKES:
                 self._sl_benched = level
             return None
+        # CONFIDENCE GATE (round 6 tighten): only mark the level engaged once a
+        # CONCRETE corridor route to the exit exists.  Engaging on the mere
+        # structural signature (before a route is proven) lets a mis-parsed
+        # board capture the head; requiring a real route means a non-maze board
+        # that cannot be routed falls through to baseline exploration instead.
+        self._sl_engaged = True
         return self._step(GameAction.from_id(route[0][0]))
 
     def _sl_guess_corridor(self, grid: Grid, snode: Cell, lat: tuple) -> int:

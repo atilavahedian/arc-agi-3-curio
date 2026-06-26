@@ -201,3 +201,24 @@ Four new game families added; full FIT floor intact; no crashes.
 - FIT floor intact: ft09=6 WIN, cn04=5, tr87=3, dc22=4, ls20=2, vc33=2, lp85=1; held games (ar25,m0r0,sp80,g50t,lf52,s5i5,r11l,cd82,tn36) all ≥1.
 - Held-out proxy (ka59, wa30 — untouched this round): both still 0 (no spontaneous generalization signal from these two).
 - **Known regression — speed:** the new heads have a gating leak (expensive detection on non-target games). Slowest: lp85 28 fps, dc22 29, m0r0 39, lf52 46, tn36 58 (vs ~100–160 elsewhere). Nothing DNF'd locally, but the hidden re-run has a shared ~8–9h wall-clock cap, so this could cost completed games on the real set. Fix = cheap early-outs in the new heads. To validate net effect (more coverage vs slower): submit and compare to the 0.22 baseline.
+
+---
+
+## Round 6 — speed hardening (2026-06-25, seed 0, STEPS=4000)
+
+Cheap early-outs added to 3 of 4 new heads (tu93/sb26/re86) so they skip
+non-target games before expensive detection. Capability unchanged, speed ~2x.
+
+| slow game | fps before | fps after |
+|-----------|:---------:|:--------:|
+| lp85 | 28 | 47 |
+| dc22 | 29 | 67 |
+| m0r0 | 39 | 82 |
+| lf52 | 46 | 97 |
+| tn36 | 58 | 101 |
+
+- all-25 scorecard unchanged: **9.09**; all 4 families intact; FIT floor intact.
+- su15/herd head early-out still pending (lp85 remains slowest at 47 fps).
+- Net: same capability as v8, ~2x faster on the games that dragged it — the
+  speed regression that sank v8 (0.22→0.20 on the hidden set) is largely undone.
+  This (v9) is the submission candidate for the next daily slot.

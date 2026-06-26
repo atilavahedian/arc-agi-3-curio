@@ -214,10 +214,18 @@ SL_MIN_NODES = 12       # lattice nodes a board must expose before the slide hea
                         # clears this easily; an incidental two-colour tiling on a
                         # hidden non-maze game does not — keeps the head dormant
                         # unless the maze structure is unambiguous)
-OV_MIN_ANCHORS = 2      # hollow goal-overlay boxes a frame needs before the
-                        # overlay-align head trusts the static-goal signature
-                        # (re86: a single box is too weak to distinguish from
-                        # an incidental ring; two fixed boxes are the family)
+OV_MIN_ANCHORS = 3      # hollow goal-overlay boxes the DOMINANT outline colour
+                        # needs before the overlay-align head trusts the static-
+                        # goal signature.  Round 6 tighten: raised 2->3 — two
+                        # fixed boxes proved too weak (a hidden non-re86 game can
+                        # incidentally show two rings); re86's dominant outline
+                        # reliably exposes 3-4 boxes, so 3 keeps the family while
+                        # rejecting the thin two-ring false positive.
+OV_MIN_TOTAL = 4        # total hollow-box anchor centres (summed across all
+                        # outline colours) the overlay head needs before it acts.
+                        # Round 6 tighten: re86's full static overlay spans 5-10
+                        # anchors; a near-certain match clears 4 with margin,
+                        # while an incidental ring pair never reaches it.
 OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
 SORT_MIN_TARGETS = 3    # equal-size hollow boxes in a horizontal run before the
@@ -2457,6 +2465,16 @@ class MyAgent(Agent):
         self._ov_outline_votes[outline] += 1
         anchors = overlay_anchors(grid, outline)
         if not anchors:
+            return None
+        # CONFIDENCE GATE (round 6 tighten): the genuine re86 static overlay is
+        # a RICH anchor structure — the dominant outline alone exposes 3-4
+        # boxes and the full overlay spans several anchor centres across one or
+        # more colours.  Two incidental hollow rings on a hidden non-re86 game
+        # sharing this action set is a plausible false positive that would send
+        # the head driving a piece toward phantom goals.  Require a substantial
+        # total anchor count so the head only fires on an unambiguous overlay.
+        total_anchors = sum(len(v) for v in anchors.values())
+        if total_anchors < OV_MIN_TOTAL:
             return None
         sel = self._ov_selected(grid, outline)
         if sel is None:

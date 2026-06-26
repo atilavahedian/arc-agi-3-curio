@@ -222,3 +222,22 @@ non-target games before expensive detection. Capability unchanged, speed ~2x.
 - Net: same capability as v8, ~2x faster on the games that dragged it — the
   speed regression that sank v8 (0.22→0.20 on the hidden set) is largely undone.
   This (v9) is the submission candidate for the next daily slot.
+
+---
+
+## Round 7 — confidence tightening (2026-06-25, v10)
+
+Diagnosis from 3 real submissions: the round-5 heads MISFIRE on hidden games
+(false-positive their family → wrong actions → lose levels baseline would win).
+Real scores: baseline v7=0.22, +families v8/v9=0.20. So additions are net-negative.
+
+Fix: each round-5 head now engages ONLY on near-certain matches, else defers to
+baseline exploration (which earned 0.22). Tightenings:
+- slide/tu93: SL_MIN_NODES=12, exit≠start, require concrete route
+- overlay/re86: min anchors 2→3, min total centres=4
+- sort/sb26: min targets 3→4
+- herd/su15: dead-board bench after 8 inert clicks (lighter — su15 L2 geometry forced backoff)
+
+Verified seed 0: families intact (tu93=1,re86=1,su15=2,sb26=1), floor intact,
+heads quiet on ka59/wa30. Goal: floor recovers toward 0.22, upside when heads
+are genuinely right. Only a submission can confirm hidden-set effect.

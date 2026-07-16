@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status verify-local clean _check-kaggle
+.PHONY: help setup play-local pull-sample notebook submit status submit-duck-v15 status-duck-v15 verify-duck-v15 verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -78,6 +78,18 @@ submit: notebook _check-kaggle ## Build notebook and push to Kaggle (one-line su
 
 status: _check-kaggle ## Show the status of your most recent Kaggle kernel run
 	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('notebooks/kernel-metadata.json'))['id'])"); \
+	$(KAGGLE) kernels status $$KERNEL_ID
+
+verify-duck-v15: ## Validate the high-score Duck v15 notebook and Kaggle metadata
+	$(VENV_PY) scripts/validate_submission.py submissions/duck-v15
+
+submit-duck-v15: verify-duck-v15 _check-kaggle ## Push the separate Duck v15 high-score candidate kernel
+	$(KAGGLE) kernels push -p submissions/duck-v15/
+	@echo ""
+	@echo "Pushed Duck v15 candidate. Track it with: make status-duck-v15"
+
+status-duck-v15: _check-kaggle ## Show the Duck v15 candidate kernel status
+	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/duck-v15/kernel-metadata.json'))['id'])"); \
 	$(KAGGLE) kernels status $$KERNEL_ID
 
 clean: ## Remove generated artefacts (venv, downloaded games, vendored repos)

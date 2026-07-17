@@ -78,6 +78,7 @@ class SlideLethalEdgeTests(unittest.TestCase):
     def test_route_will_not_replay_lethal_edge(self) -> None:
         agent = self.agent_class.__new__(self.agent_class)
         agent._sl_dirmap = {}
+        agent._sl_blocked_edges = set()
         agent._sl_lethal_edges = set()
         grid = [[0 for _x in range(64)] for _y in range(64)]
         grid[1][2] = 1
@@ -90,6 +91,25 @@ class SlideLethalEdgeTests(unittest.TestCase):
         self.assertEqual(agent._sl_route(grid, (1, 1), lattice, 1), ([4], (3, 1)))
 
         agent._sl_lethal_edges.add(((1, 1), 4))
+        self.assertIsNone(agent._sl_route(grid, (1, 1), lattice, 1))
+
+    def test_route_will_not_repeat_observed_blocked_edge(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_dirmap = {}
+        agent._sl_blocked_edges = set()
+        agent._sl_lethal_edges = set()
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[1][2] = 1
+        lattice = (2, 1, 1, {(1, 1), (3, 1)}, 1, 2)
+        agent._sl_avatar_cells = lambda _grid, _start, _lat: set()
+        agent._sl_body_center = lambda _grid, _start, _lat=None: (1, 1)
+        agent._sl_node = lambda _cell, _lat: (1, 1)
+        agent._sl_exit_node = lambda _grid, _lat, _cells: (3, 1)
+        agent._sl_edge_at = lambda _grid, action: ((1, 1), action)
+
+        agent._sl_note_blocked_edge(grid, 4)
+
+        self.assertEqual(agent._sl_blocked_edges, {((1, 1), 4)})
         self.assertIsNone(agent._sl_route(grid, (1, 1), lattice, 1))
 
 

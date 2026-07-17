@@ -743,6 +743,7 @@ class MyAgent(Agent):
         self._sl_probe: Counter[int] = Counter()  # directional probe spend
         self._sl_dirmap: dict[int, Cell] = {}     # act -> unit step (probed)
         self._sl_corridor: Optional[int] = None   # learned passable color
+        self._sl_blocked_edges: set[tuple[Cell, int]] = set()
         self._sl_lethal_edges: set[tuple[Cell, int]] = set()
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
@@ -1084,6 +1085,7 @@ class MyAgent(Agent):
             # (engaged flag and the learned direction map persist as physics)
             self._sl_probe.clear()
             self._sl_corridor = None
+            self._sl_blocked_edges.clear()
             self._sl_lethal_edges.clear()
             self._sl_strikes = 0
             self._sl_benched = None
@@ -1260,8 +1262,11 @@ class MyAgent(Agent):
             else:
                 pa = ca = None
             if pa is not None and ca is not None and pa[1] == ca[1]:
-                self._slide_votes[act][(ca[0][0] - pa[0][0],
-                                        ca[0][1] - pa[0][1])] += 1
+                slide_delta = (ca[0][0] - pa[0][0],
+                               ca[0][1] - pa[0][1])
+                self._slide_votes[act][slide_delta] += 1
+                if self._sl_engaged and slide_delta == (0, 0):
+                    self._sl_note_blocked_edge(self._prev_grid, act)
         if len(groups) == 1:
             # all movers share one delta → one rigid group: avatar candidate.
             # Multi-color sprites (ls20's 12-over-9 player, cn04's selected
@@ -4982,6 +4987,31 @@ class MyAgent(Agent):
         ys = [y for _x, y in cells]
         return ((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2)
 
+    def _sl_edge_at(
+        self, grid: Grid, action: int
+    ) -> Optional[tuple[Cell, int]]:
+        """Physical slide-maze edge at ``grid`` for one simple action."""
+        if action not in {1, 2, 3, 4}:
+            return None
+        accent = self._sl_avatar_anchor(grid)
+        if accent is None:
+            return None
+        av_center = self._sl_body_center(grid, accent[0])
+        lat = self._sl_lattice(grid, av_center)
+        if lat is None:
+            return None
+        snode = self._sl_node(
+            self._sl_body_center(grid, accent[0], lat), lat)
+        if snode is not None and snode in lat[3]:
+            return (snode, action)
+        return None
+
+    def _sl_note_blocked_edge(self, grid: Grid, action: int) -> None:
+        """Stop retrying a maze action observed to leave the avatar still."""
+        edge = self._sl_edge_at(grid, action)
+        if edge is not None:
+            self._sl_blocked_edges.add(edge)
+
     def _sl_note_lethal_edge(self) -> None:
         """Remember the slide-maze edge whose action caused GAME_OVER.
 
@@ -4992,17 +5022,9 @@ class MyAgent(Agent):
         if not self._sl_engaged or self._prev_grid is None \
                 or self._prev_action not in {"1", "2", "3", "4"}:
             return
-        accent = self._sl_avatar_anchor(self._prev_grid)
-        if accent is None:
-            return
-        av_center = self._sl_body_center(self._prev_grid, accent[0])
-        lat = self._sl_lattice(self._prev_grid, av_center)
-        if lat is None:
-            return
-        snode = self._sl_node(
-            self._sl_body_center(self._prev_grid, accent[0], lat), lat)
-        if snode is not None and snode in lat[3]:
-            self._sl_lethal_edges.add((snode, int(self._prev_action)))
+        edge = self._sl_edge_at(self._prev_grid, int(self._prev_action))
+        if edge is not None:
+            self._sl_lethal_edges.add(edge)
 
     def _sl_route(
         self, grid: Grid, start: Cell, lat: tuple, corridor: int
@@ -5045,7 +5067,8 @@ class MyAgent(Agent):
             for a, (dx, dy) in DIRS.items():
                 if dx == dy == 0:
                     continue
-                if (pos, a) in self._sl_lethal_edges:
+                if (pos, a) in self._sl_blocked_edges \
+                        or (pos, a) in self._sl_lethal_edges:
                     continue
                 if passable(pos[0], pos[1], dx, dy):
                     nxt = (pos[0] + dx * pitch, pos[1] + dy * pitch)

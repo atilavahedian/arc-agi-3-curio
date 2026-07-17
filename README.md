@@ -15,13 +15,15 @@ auditing tied that run to commit `29e278a`; it predates the current solver by
 seven capability commits. The current head has not yet received a leaderboard
 score.
 
-The current source has independently verified complete local wins on four
-official campaigns: `cn04` (328 actions), `ft09` (124), `tr87` (242), and
-`sc25` (147). These checks prove those implementations against the official
-local environments; they do not predict hidden-game generalization.
+The current source has independently verified complete local wins on five
+official campaigns: `re86` (8 levels, 552 actions), `cn04` (328 actions),
+`ft09` (124), `tr87` (242), and `sc25` (147). These checks prove those
+implementations against the official local environments; they do not predict
+hidden-game generalization.
 
-The scoring metric is `(baseline_actions / actions_taken)² × 100`, level-index
-weighted, so fast wins are worth much more than slow exploration.
+The scoring metric squares `human_baseline_actions / agent_actions`, caps the
+per-level value at 1.15, weights later levels more heavily, and averages across
+games. Fast wins are therefore worth much more than slow exploration.
 
 ## How it works
 

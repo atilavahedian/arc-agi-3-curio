@@ -805,6 +805,314 @@ def spell_program_setup(
     }
 
 
+def spell_campaign_setup(
+    grid: Grid, available_actions: set[int],
+) -> Optional[dict[str, Any]]:
+    """Read a blank spell board plus an exact scale/fire card pair.
+
+    Later spell levels stop preselecting one clue.  This detector stays
+    deliberately narrower than :func:`spell_program_setup`: the board must be
+    blank, exactly two framed cards must encode the known scale and fire
+    glyphs, and the world must also contain both a unique same-palette
+    actor/socket pair and a uniquely keyed fire ring.  All positions, colours
+    and click cells come from the pixels in the current frame.
+    """
+    if frozenset(available_actions) != PANEL_ACTIONS:
+        return None
+    comps = components(grid)
+    boards: list[dict[str, Any]] = []
+    for scaffold_raw, frame_cells in comps:
+        scaffold = int(scaffold_raw)
+        xs = [x for x, _y in frame_cells]
+        ys = [y for _x, y in frame_cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if width != height or not 13 <= width <= 23 \
+                or (width - 2) % 3:
+            continue
+        pitch = (width - 2) // 3
+        side = pitch - 2
+        if not 2 <= side <= 6:
+            continue
+        samples: list[tuple[Cell, int]] = []
+        interiors: set[Cell] = set()
+        ok = True
+        for row in range(3):
+            for col in range(3):
+                sx = x0 + 2 + col * pitch
+                sy = y0 + 2 + row * pitch
+                vals = {
+                    grid[y][x]
+                    for y in range(sy, sy + side)
+                    for x in range(sx, sx + side)
+                }
+                if len(vals) != 1 or scaffold in vals:
+                    ok = False
+                    break
+                samples.append(((sx + side // 2, sy + side // 2),
+                                next(iter(vals))))
+                interiors.update(
+                    (x, y)
+                    for y in range(sy, sy + side)
+                    for x in range(sx, sx + side)
+                )
+            if not ok:
+                break
+        full = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+        }
+        if not ok or set(frame_cells) != full - interiors:
+            continue
+        values = {value for _cell, value in samples}
+        if len(values) != 1:
+            continue
+        boards.append({
+            "scaffold": scaffold,
+            "base": next(iter(values)),
+            "centers": [cell for cell, _value in samples],
+            "frame": frame_cells,
+        })
+    if len(boards) != 1:
+        return None
+    board = boards[0]
+
+    cards: dict[str, dict[str, Any]] = {}
+    for color_raw, card_cells in comps:
+        if int(color_raw) != board["scaffold"] \
+                or card_cells == board["frame"]:
+            continue
+        xs = [x for x, _y in card_cells]
+        ys = [y for _x, y in card_cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if width != height or not 8 <= width <= 16 \
+                or (width - 4) % 3:
+            continue
+        perimeter = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+            if x in (x0, x1) or y in (y0, y1)
+        }
+        if set(card_cells) != perimeter:
+            continue
+        side = (width - 4) // 3
+        if side < 1:
+            continue
+        pitch = side + 1
+        samples: list[tuple[Cell, int]] = []
+        ok = True
+        for row in range(3):
+            for col in range(3):
+                sx = x0 + 1 + col * pitch
+                sy = y0 + 1 + row * pitch
+                vals = {
+                    grid[y][x]
+                    for y in range(sy, sy + side)
+                    for x in range(sx, sx + side)
+                }
+                if len(vals) != 1:
+                    ok = False
+                    break
+                samples.append(((sx + side // 2, sy + side // 2),
+                                next(iter(vals))))
+            if not ok:
+                break
+        counts = Counter(value for _cell, value in samples)
+        if not ok or counts.get(board["base"], 0) not in (5, 6) \
+                or len(counts) != 2:
+            continue
+        glyph = next((value for value in counts if value != board["base"]),
+                     None)
+        if glyph is None or counts[glyph] not in (3, 4):
+            continue
+        mask = frozenset(
+            (i // 3, i % 3)
+            for i, (_cell, value) in enumerate(samples)
+            if value == glyph
+        )
+        mode = PANEL_SPELL_MASKS.get(mask)
+        if mode not in {"scale", "fire"} or mode in cards:
+            return None
+        cards[mode] = {
+            "color": glyph,
+            "select": min(
+                (cell for cell, value in samples if value == glyph),
+                key=lambda p: (p[1], p[0]),
+            ),
+            "clicks": [
+                board["centers"][row * 3 + col]
+                for row, col in sorted(mask)
+            ],
+        }
+    if set(cards) != {"scale", "fire"}:
+        return None
+
+    actor = panel_actor(grid, require_lane=False)
+    if actor is None:
+        return None
+    mx0, my0, mx1, my1 = actor["mover"]["bbox"]
+    if mx1 - mx0 != my1 - my0 or mx1 - mx0 + 1 < 4:
+        return None
+
+    fire_color = cards["fire"]["color"]
+    keyed: list[dict[str, Any]] = []
+    for i, (c1_raw, cells1) in enumerate(comps):
+        for c2_raw, cells2 in comps[i + 1:]:
+            c1, c2 = int(c1_raw), int(c2_raw)
+            if c1 == c2 or fire_color not in (c1, c2):
+                continue
+            cells = set(cells1 | cells2)
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            tx0, tx1 = min(xs), max(xs)
+            ty0, ty1 = min(ys), max(ys)
+            width, height = tx1 - tx0 + 1, ty1 - ty0 + 1
+            if width != height or not 3 <= width <= 6 \
+                    or len(cells) != width * height:
+                continue
+            outer = cells1 if c1 == fire_color else cells2
+            inner = cells2 if c1 == fire_color else cells1
+            key_color = c2 if c1 == fire_color else c1
+            perimeter = {
+                (x, y) for y in range(ty0, ty1 + 1)
+                for x in range(tx0, tx1 + 1)
+                if x in (tx0, tx1) or y in (ty0, ty1)
+            }
+            if set(outer) != perimeter or set(inner) != cells - perimeter:
+                continue
+            gates: list[frozenset[Cell]] = []
+            for other_color, other_cells in comps:
+                if int(other_color) != key_color or set(other_cells) & cells:
+                    continue
+                ox = [x for x, _y in other_cells]
+                oy = [y for _x, y in other_cells]
+                ow, oh = max(ox) - min(ox) + 1, max(oy) - min(oy) + 1
+                if 2 <= min(ow, oh) and max(ow, oh) <= 8 \
+                        and len(other_cells) == ow * oh \
+                        and len(other_cells) >= len(inner):
+                    gates.append(other_cells)
+            if len(gates) == 1:
+                keyed.append({
+                    "bbox": (tx0, ty0, tx1, ty1),
+                    "signature": tuple(sorted(
+                        (x, y, grid[y][x]) for x, y in cells)),
+                    "gate_signature": tuple(sorted(
+                        (x, y, grid[y][x]) for x, y in gates[0])),
+                })
+    if len(keyed) != 1:
+        return None
+    target = keyed[0]
+    return {
+        "cards": cards,
+        "floor": board["base"],
+        "actor_colors": actor["colors"],
+        "actor_pixels": actor["mover"]["pixels"],
+        "actor_bbox": actor["mover"]["bbox"],
+        "goal_bbox": actor["socket"]["bbox"],
+        "goal_pixels": actor["socket"]["pixels"],
+        "goal_signature": tuple(sorted(
+            (x, y, grid[y][x]) for x, y in actor["socket"]["cells"])),
+        "fire_bbox": target["bbox"],
+        "fire_signature": target["signature"],
+        "gate_signature": target["gate_signature"],
+    }
+
+
+def spell_campaign_route(
+    grid: Grid, actor_bbox: tuple[int, int, int, int], floor: int,
+    target_bbox: tuple[int, int, int, int], *, fire: bool,
+) -> Optional[tuple[list[int], int, tuple[int, int, int, int]]]:
+    """BFS a floor component to one final fire/goal-facing move.
+
+    Cardinal displacement is inferred from the current actor footprint.  The
+    actor's old pixels are treated as floor while testing future placements;
+    all other non-floor pixels remain conservative obstacles.  For fire, the
+    final move must leave the projectile's leading row/column on a clear line
+    to the keyed ring.  For a goal, the final move must overlap the socket.
+    """
+    x0, y0, x1, y1 = actor_bbox
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if width <= 0 or height <= 0 or max(width, height) > 8:
+        return None
+    origin_cells = {
+        (x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
+    }
+
+    def bbox_at(pos: Cell) -> tuple[int, int, int, int]:
+        x, y = pos
+        return (x, y, x + width - 1, y + height - 1)
+
+    def floor_at(x: int, y: int) -> bool:
+        return (x, y) in origin_cells or grid[y][x] == floor
+
+    def open_at(pos: Cell) -> bool:
+        bx0, by0, bx1, by1 = bbox_at(pos)
+        return 0 <= bx0 <= bx1 < GRID and 0 <= by0 <= by1 < GRID \
+            and all(floor_at(x, y)
+                    for y in range(by0, by1 + 1)
+                    for x in range(bx0, bx1 + 1))
+
+    moves = (
+        (GameAction.ACTION1.value, (0, -height)),
+        (GameAction.ACTION2.value, (0, height)),
+        (GameAction.ACTION3.value, (-width, 0)),
+        (GameAction.ACTION4.value, (width, 0)),
+    )
+    tx0, ty0, tx1, ty1 = target_bbox
+
+    def final_from(pos: Cell) -> Optional[tuple[int, tuple[int, int, int, int]]]:
+        for action_id, (dx, dy) in moves:
+            dest = (pos[0] + dx, pos[1] + dy)
+            db = bbox_at(dest)
+            dx0, dy0, dx1, dy1 = db
+            if fire:
+                if not open_at(dest):
+                    continue
+                if action_id == GameAction.ACTION3.value and tx1 < dx0 \
+                        and ty0 <= dy0 <= ty1:
+                    clear = all(floor_at(x, dy0)
+                                for x in range(tx1 + 1, dx0))
+                elif action_id == GameAction.ACTION4.value and tx0 > dx1 \
+                        and ty0 <= dy0 <= ty1:
+                    clear = all(floor_at(x, dy0)
+                                for x in range(dx1 + 1, tx0))
+                elif action_id == GameAction.ACTION1.value and ty1 < dy0 \
+                        and tx0 <= dx0 <= tx1:
+                    clear = all(floor_at(dx0, y)
+                                for y in range(ty1 + 1, dy0))
+                elif action_id == GameAction.ACTION2.value and ty0 > dy1 \
+                        and tx0 <= dx0 <= tx1:
+                    clear = all(floor_at(dx0, y)
+                                for y in range(dy1 + 1, ty0))
+                else:
+                    clear = False
+                if clear:
+                    return action_id, db
+            elif not (dx1 < tx0 or tx1 < dx0 or dy1 < ty0 or ty1 < dy0):
+                return action_id, db
+        return None
+
+    start = (x0, y0)
+    queue: deque[tuple[Cell, list[int]]] = deque([(start, [])])
+    seen = {start}
+    while queue and len(seen) <= 4096:
+        pos, path = queue.popleft()
+        final = final_from(pos)
+        if final is not None:
+            action_id, expected = final
+            return path, action_id, expected
+        for action_id, (dx, dy) in moves:
+            nxt = (pos[0] + dx, pos[1] + dy)
+            if nxt in seen or not open_at(nxt):
+                continue
+            seen.add(nxt)
+            queue.append((nxt, path + [action_id]))
+    return None
+
+
 def panel_macro_setup(
     grid: Grid, available_actions: set[int],
 ) -> Optional[dict[str, Any]]:
@@ -2708,6 +3016,38 @@ class MyAgent(Agent):
         self._spell_steps = 0
         self._spell_engaged = False
         self._spell_benched: Optional[int] = None
+        # Blank-board multi-card spell campaign.  This is separate from the
+        # preselected three-cell tutorial above: it earns control only from a
+        # stronger scale+fire+keyed-gate conjunction and plans every movement
+        # from current pixels.
+        self._spell_campaign_level = -1
+        self._spell_campaign_phase = ""
+        self._spell_campaign_clicks: deque[Cell] = deque()
+        self._spell_campaign_cards: dict[str, dict[str, Any]] = {}
+        self._spell_campaign_colors: Optional[tuple[int, int]] = None
+        self._spell_campaign_floor: Optional[int] = None
+        self._spell_campaign_initial_pixels = 0
+        self._spell_campaign_goal_bbox: Optional[
+            tuple[int, int, int, int]
+        ] = None
+        self._spell_campaign_goal_signature: tuple[
+            tuple[int, int, int], ...
+        ] = tuple()
+        self._spell_campaign_fire_bbox: Optional[
+            tuple[int, int, int, int]
+        ] = None
+        self._spell_campaign_fire_signature: tuple[
+            tuple[int, int, int], ...
+        ] = tuple()
+        self._spell_campaign_gate_signature: tuple[
+            tuple[int, int, int], ...
+        ] = tuple()
+        self._spell_campaign_expected: Optional[
+            tuple[int, int, int, int]
+        ] = None
+        self._spell_campaign_steps = 0
+        self._spell_campaign_engaged = False
+        self._spell_campaign_benched: Optional[int] = None
         # ── editor model (tr87 family): cursor + in-place glyph cycling ──
         # verb classifications, marker votes, step deltas and probe spend
         # are physics (what an action DOES looks the same on every level);
@@ -2969,6 +3309,9 @@ class MyAgent(Agent):
             if self._spell_engaged:
                 self._spell_benched = latest_frame.levels_completed
             self._spell_clear(level=latest_frame.levels_completed)
+            if self._spell_campaign_engaged:
+                self._spell_campaign_benched = latest_frame.levels_completed
+            self._spell_campaign_clear(level=latest_frame.levels_completed)
             # the editor's level replays deterministically too: keep the
             # mutate boxes and goal candidates, give a benched run a fresh
             # life (strikes die with the budget that earned them)
@@ -3145,6 +3488,8 @@ class MyAgent(Agent):
             self._panel_benched = None
             self._spell_clear(level=latest_frame.levels_completed)
             self._spell_benched = None
+            self._spell_campaign_clear(level=latest_frame.levels_completed)
+            self._spell_campaign_benched = None
             # switch geography: masks, phase patches, fall bans and probe
             # spend are positional level data (footprint passability — the
             # _stepped/_block signature stores — is appearance physics)
@@ -3249,6 +3594,7 @@ class MyAgent(Agent):
             self._wp_pending_start = True
             self._panel_clear(level=latest_frame.levels_completed)
             self._spell_clear(level=latest_frame.levels_completed)
+            self._spell_campaign_clear(level=latest_frame.levels_completed)
         elif self._prev_action is not None:
             self._wp_log.append((key, self._prev_action))
         self._prev_grid = grid
@@ -4759,6 +5105,187 @@ class MyAgent(Agent):
         return None
 
     # ── three-cell spell macro: clue -> cast -> actor route ──────────
+    def _spell_campaign_clear(self, *, level: Optional[int] = None) -> None:
+        """Clear the blank-board scale/fire campaign's per-level state."""
+        if level is not None:
+            self._spell_campaign_level = level
+        self._spell_campaign_phase = ""
+        self._spell_campaign_clicks.clear()
+        self._spell_campaign_cards = {}
+        self._spell_campaign_colors = None
+        self._spell_campaign_floor = None
+        self._spell_campaign_initial_pixels = 0
+        self._spell_campaign_goal_bbox = None
+        self._spell_campaign_goal_signature = tuple()
+        self._spell_campaign_fire_bbox = None
+        self._spell_campaign_fire_signature = tuple()
+        self._spell_campaign_gate_signature = tuple()
+        self._spell_campaign_expected = None
+        self._spell_campaign_steps = 0
+        self._spell_campaign_engaged = False
+
+    def _spell_campaign_fail(self, level: int) -> None:
+        self._spell_campaign_clear(level=level)
+        self._spell_campaign_benched = level
+
+    def _spell_campaign_click(self, cell: Cell, why: str) -> GameAction:
+        x, y = cell
+        action = GameAction.ACTION6
+        action.set_data({"x": x, "y": y})
+        action.reasoning = {"why": why}
+        self._prev_action = f"6:{x},{y}"
+        self._spell_campaign_steps += 1
+        return action
+
+    def _spell_campaign_actor(self, grid: Grid) -> Optional[dict[str, Any]]:
+        if self._spell_campaign_colors is None:
+            return None
+        actor = panel_actor(
+            grid, self._spell_campaign_colors, require_lane=False)
+        if actor is None or self._spell_campaign_goal_bbox is None:
+            return None
+        if actor["socket"]["bbox"] != self._spell_campaign_goal_bbox:
+            return None
+        return actor
+
+    def _spell_campaign_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData,
+    ) -> Optional[GameAction]:
+        """Shrink through a bottleneck, burn its keyed gate, then route.
+
+        The action sequence is not recorded here: every click comes from the
+        detected card/program geometry and every move is replanned by a
+        bounded BFS over the current floor component.
+        """
+        if grid is None:
+            return None
+        level = latest_frame.levels_completed
+        if self._spell_campaign_level != level:
+            self._spell_campaign_clear(level=level)
+            if self._spell_campaign_benched != level:
+                self._spell_campaign_benched = None
+        if self._spell_campaign_benched == level:
+            return None
+        avail = set(latest_frame.available_actions or [])
+        if frozenset(avail) != PANEL_ACTIONS:
+            if self._spell_campaign_engaged:
+                self._spell_campaign_fail(level)
+            return None
+
+        if not self._spell_campaign_engaged:
+            setup = spell_campaign_setup(grid, avail)
+            if setup is None:
+                return None
+            self._spell_campaign_engaged = True
+            self._spell_campaign_cards = setup["cards"]
+            self._spell_campaign_colors = setup["actor_colors"]
+            self._spell_campaign_floor = setup["floor"]
+            self._spell_campaign_initial_pixels = setup["actor_pixels"]
+            self._spell_campaign_goal_bbox = setup["goal_bbox"]
+            self._spell_campaign_goal_signature = setup["goal_signature"]
+            self._spell_campaign_fire_bbox = setup["fire_bbox"]
+            self._spell_campaign_fire_signature = setup["fire_signature"]
+            self._spell_campaign_gate_signature = setup["gate_signature"]
+            scale = self._spell_campaign_cards["scale"]
+            self._spell_campaign_clicks = deque(
+                [scale["select"], *scale["clicks"]])
+            self._spell_campaign_phase = "scale_cast"
+
+        if self._spell_campaign_steps >= 64:
+            self._spell_campaign_fail(level)
+            return None
+
+        # A small transition loop lets one completed animation advance to its
+        # next plan without burning a no-op action.
+        for _transition in range(5):
+            phase = self._spell_campaign_phase
+            if phase in {"scale_cast", "fire_cast"} \
+                    and self._spell_campaign_clicks:
+                cell = self._spell_campaign_clicks.popleft()
+                return self._spell_campaign_click(
+                    cell, f"spell campaign {phase.replace('_cast', '')}")
+
+            actor = self._spell_campaign_actor(grid)
+            if actor is None:
+                self._spell_campaign_fail(level)
+                return None
+            mover = actor["mover"]
+
+            if phase == "scale_cast":
+                # A scale-down preserves the palette and reduces a square
+                # footprint to one quarter of its pixels.
+                if mover["pixels"] * 4 != self._spell_campaign_initial_pixels:
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_phase = "route_fire"
+                continue
+
+            if phase == "route_fire":
+                if self._spell_campaign_floor is None \
+                        or self._spell_campaign_fire_bbox is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                route = spell_campaign_route(
+                    grid, mover["bbox"], self._spell_campaign_floor,
+                    self._spell_campaign_fire_bbox, fire=True)
+                if route is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                path, final_action, expected = route
+                if path:
+                    self._spell_campaign_steps += 1
+                    return self._step(GameAction.from_id(path[0]))
+                self._spell_campaign_expected = expected
+                self._spell_campaign_phase = "fire_select"
+                self._spell_campaign_steps += 1
+                return self._step(GameAction.from_id(final_action))
+
+            if phase == "fire_select":
+                if mover["bbox"] != self._spell_campaign_expected:
+                    self._spell_campaign_fail(level)
+                    return None
+                fire = self._spell_campaign_cards["fire"]
+                self._spell_campaign_clicks = deque(
+                    [fire["select"], *fire["clicks"]])
+                self._spell_campaign_phase = "fire_cast"
+                continue
+
+            if phase == "fire_cast":
+                fire_changed = any(
+                    grid[y][x] != value
+                    for x, y, value in self._spell_campaign_fire_signature)
+                gate_changed = any(
+                    grid[y][x] != value
+                    for x, y, value in self._spell_campaign_gate_signature)
+                if not fire_changed or not gate_changed:
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_phase = "route_goal"
+                continue
+
+            if phase == "route_goal":
+                if self._spell_campaign_floor is None \
+                        or self._spell_campaign_goal_bbox is None \
+                        or not all(grid[y][x] == value for x, y, value
+                                   in self._spell_campaign_goal_signature):
+                    self._spell_campaign_fail(level)
+                    return None
+                route = spell_campaign_route(
+                    grid, mover["bbox"], self._spell_campaign_floor,
+                    self._spell_campaign_goal_bbox, fire=False)
+                if route is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                path, final_action, _expected = route
+                self._spell_campaign_steps += 1
+                action_id = path[0] if path else final_action
+                return self._step(GameAction.from_id(action_id))
+
+            self._spell_campaign_fail(level)
+            return None
+        self._spell_campaign_fail(level)
+        return None
+
     def _spell_clear(self, *, level: Optional[int] = None) -> None:
         """Clear per-level spell runtime state without changing its bench."""
         if level is not None:
@@ -7535,6 +8062,12 @@ class MyAgent(Agent):
             panel = self._panel_policy(grid, latest_frame)
             if panel is not None:
                 return panel
+            # A blank program plus exactly two scale/fire cards is the next
+            # tutorial stage: shrink through a pixel-proved bottleneck, cast
+            # at its uniquely keyed ring, and route through the vanished gate.
+            campaign = self._spell_campaign_policy(grid, latest_frame)
+            if campaign is not None:
+                return campaign
             # Three-cell spell programs share the exact panel/clue grammar,
             # but prove either a footprint-preserving teleport or removal of
             # a uniquely keyed directional lock before routing the actor.

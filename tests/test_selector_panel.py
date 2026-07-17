@@ -123,6 +123,28 @@ class SelectorPanelTests(unittest.TestCase):
                         grid[y][x] = 13
         return grid
 
+    @classmethod
+    def _campaign_grid(cls, *, linked_key: bool = True):
+        grid = cls._spell_grid("fire", linked_key=linked_key)
+
+        # The shared program board is blank until one of two cards is chosen.
+        for row in range(3):
+            for col in range(3):
+                for y in range(44 + 5 * row, 47 + 5 * row):
+                    for x in range(24 + 5 * col, 27 + 5 * col):
+                        grid[y][x] = 2
+
+        # A second framed card carries the four-cell scale/plus glyph.  The
+        # existing lower card carries the three-cell fire/line glyph.
+        for y in range(17, 27):
+            for x in range(5, 15):
+                grid[y][x] = 3 if x in (5, 14) or y in (17, 26) else 2
+        for row, col in {(0, 1), (1, 0), (1, 2), (2, 1)}:
+            for y in range(18 + 3 * row, 20 + 3 * row):
+                for x in range(6 + 3 * col, 8 + 3 * col):
+                    grid[y][x] = 15
+        return grid
+
     @staticmethod
     def _frame(grid, *, level: int = 0, state=GameState.NOT_FINISHED):
         return FrameData(
@@ -230,6 +252,58 @@ class SelectorPanelTests(unittest.TestCase):
         self.assertIsNone(self.module.spell_program_setup(
             self._spell_grid("fire", linked_key=False), {1, 2, 3, 4, 6}
         ))
+
+    def test_blank_spell_campaign_reads_scale_and_fire_cards(self) -> None:
+        setup = self.module.spell_campaign_setup(
+            self._campaign_grid(), {1, 2, 3, 4, 6})
+
+        self.assertIsNotNone(setup)
+        self.assertEqual(set(setup["cards"]), {"scale", "fire"})
+        self.assertEqual(
+            setup["cards"]["scale"]["clicks"],
+            [(30, 45), (25, 50), (35, 50), (30, 55)],
+        )
+        self.assertEqual(
+            setup["cards"]["fire"]["clicks"],
+            [(30, 45), (30, 50), (30, 55)],
+        )
+
+    def test_blank_spell_campaign_requires_linked_gate(self) -> None:
+        self.assertIsNone(self.module.spell_campaign_setup(
+            self._campaign_grid(linked_key=False), {1, 2, 3, 4, 6}
+        ))
+
+    def test_campaign_route_infers_bottleneck_and_fire_facing(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        # Two-cell vertical shaft bending into a two-cell horizontal firing
+        # lane.  The actor advances by its inferred 2x2 footprint.
+        for y in range(5, 11):
+            for x in range(10, 12):
+                grid[y][x] = 2
+        for y in range(9, 11):
+            for x in range(6, 12):
+                grid[y][x] = 2
+        route = self.module.spell_campaign_route(
+            grid, (10, 5, 11, 6), 2, (2, 8, 5, 11), fire=True)
+
+        self.assertIsNotNone(route)
+        path, final_action, expected = route
+        self.assertEqual(path, [GameAction.ACTION2.value] * 2)
+        self.assertEqual(final_action, GameAction.ACTION3.value)
+        self.assertEqual(expected, (8, 9, 9, 10))
+
+    def test_public_dispatch_claims_blank_spell_campaign(self) -> None:
+        agent = self._agent()
+        grid = self._campaign_grid()
+
+        action = agent.choose_action([], self._frame(grid, level=3))
+
+        self.assertIs(action, GameAction.ACTION6)
+        self.assertEqual(
+            (action.action_data.x, action.action_data.y),
+            agent._spell_campaign_cards["scale"]["select"],
+        )
+        self.assertTrue(agent._spell_campaign_engaged)
 
     def test_spell_policy_casts_then_routes(self) -> None:
         agent = self._agent()

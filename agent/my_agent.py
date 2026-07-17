@@ -230,6 +230,8 @@ OV_MIN_TOTAL = 4        # total hollow-box anchor centres (summed across all
                         # while an incidental ring pair never reaches it.
 OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
+OV_ARM_RADIUS = 9       # concentric selected-arm search/fallback cap for
+                        # sparse or hollow pieces separated from their centre
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
@@ -779,7 +781,47 @@ def piece_footprint(
                         and grid[ny][nx] in (0, arm_color):
                     seen.add((nx, ny))
                     dq.append((nx, ny))
-    return frozenset(fp)
+    connected = frozenset(fp)
+    if len(connected) > 1:
+        return connected
+
+    # Hollow pieces can leave transparent space between their selection hole
+    # and their visible arms.  Preserve the ordinary centre flood above, then
+    # (only for a singleton result) attach the nearest 8-connected arm-colour
+    # component.  The radius cap prevents remote same-colour goal markers
+    # from being mistaken for the selected body.
+    remaining = {
+        (x, y) for y, row in enumerate(grid) for x, value in enumerate(row)
+        if value == arm_color
+    }
+    candidates: list[tuple[tuple[int, int, int, int], frozenset[Cell]]] = []
+    while remaining:
+        seed = min(remaining, key=lambda p: (p[1], p[0]))
+        remaining.remove(seed)
+        comp = {seed}
+        stack = [seed]
+        while stack:
+            x, y = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nxt = (x + dx, y + dy)
+                    if nxt in remaining:
+                        remaining.remove(nxt)
+                        comp.add(nxt)
+                        stack.append(nxt)
+        distance = min(max(abs(x - cx), abs(y - cy)) for x, y in comp)
+        if distance <= OV_ARM_RADIUS:
+            min_x = min(x for x, _y in comp)
+            min_y = min(y for _x, y in comp)
+            candidates.append(
+                ((distance, -len(comp), min_y, min_x), frozenset(comp))
+            )
+    if not candidates:
+        return connected
+    _rank, nearest = min(candidates, key=lambda item: item[0])
+    return connected | nearest
 
 
 def cover_centers(
@@ -2934,12 +2976,16 @@ class MyAgent(Agent):
     def _ov_selected(
         self, grid: Grid, outline: int
     ) -> Optional[tuple[Cell, int]]:
-        """The selected piece: (centre cell, arm colour).  The centre is the
-        unique colour-0 selection hole; the arm colour is the most common
-        colour among the cells NEAR the hole, excluding the background, the
-        outline ring and 0 itself (the arms radiate from the centre, so the
-        nearest non-background non-outline colour is the piece).  None when no
-        single 0 hole is present (a transient animation frame)."""
+        """Return the selected piece's unique hole and symmetric arm colour.
+
+        Compact/linear pieces expose an opposite pair next to the hole.  For
+        sparse hollow pieces, scan exact concentric Chebyshev shells and
+        require two opposite pairs.  Central symmetry rejects a nearby old
+        piece crossing the search window on only one side; stopping at the
+        first qualifying shell avoids swallowing remote pieces or anchors.
+        None is returned for an ambiguous colour or a transient frame without
+        exactly one clean selection hole.
+        """
         holes = [(x, y) for y in range(GRID) for x in range(GRID)
                  if grid[y][x] == 0]
         if len(holes) != 1:
@@ -2949,18 +2995,34 @@ class MyAgent(Agent):
         for row in grid:
             counts.update(row)
         bg = counts.most_common(1)[0][0]
-        cnt: Counter[int] = Counter()
-        for dy in range(-4, 5):
-            for dx in range(-4, 5):
-                x, y = cx + dx, cy + dy
-                if 0 <= x < GRID and 0 <= y < GRID:
-                    v = grid[y][x]
-                    if v >= 0 and v not in (0, bg, outline):
-                        cnt[v] += 1
-        if not cnt:
-            return None
-        arm = cnt.most_common(1)[0][0]
-        return ((cx, cy), arm)
+        for radius in range(1, OV_ARM_RADIUS + 1):
+            offsets: dict[int, set[Cell]] = defaultdict(set)
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    x, y = cx + dx, cy + dy
+                    if not (0 <= x < GRID and 0 <= y < GRID):
+                        continue
+                    value = grid[y][x]
+                    if value >= 0 and value not in (0, bg, outline):
+                        offsets[value].add((dx, dy))
+            minimum = 2 if radius == 1 else 4
+            scored: list[tuple[int, int, int]] = []
+            for color, cells in offsets.items():
+                symmetric = sum(
+                    1 for dx, dy in cells if (-dx, -dy) in cells
+                )
+                if symmetric >= minimum:
+                    scored.append((symmetric, len(cells), color))
+            if not scored:
+                continue
+            scored.sort(reverse=True)
+            best = scored[0]
+            if len(scored) > 1 and scored[1][0] == best[0]:
+                return None
+            return ((cx, cy), best[2])
+        return None
 
     def _overlay_policy(
         self, grid: Optional[Grid], latest_frame: FrameData
@@ -3399,6 +3461,12 @@ class MyAgent(Agent):
         and edits slot by slot; persistent failure benches the level, two
         benched levels with zero wins kill the branch for the game."""
         if grid is None or self._ed_dead:
+            return None
+        # A rich, clean overlay confirmation is sticky physics evidence for
+        # this game.  Its fill animation can resemble an in-place editor
+        # mutation after the selection hole temporarily disappears; never let
+        # the looser editor gate steal control once the overlay family won.
+        if self._ov_outline_votes:
             return None
         avail = set(latest_frame.available_actions or [])
         if GameAction.ACTION6.value in avail:

@@ -1096,6 +1096,166 @@ def overlay_recolor_plan(
     return None
 
 
+def overlay_recolor_options(
+    origin: Cell, current_color: int, rel_mask: frozenset[Cell],
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+    goal_bit: dict[tuple[int, Cell], int],
+) -> list[
+    tuple[int, int, int, Cell, frozenset[Cell], tuple[int, ...]]
+]:
+    """Cheapest reachable coloured placement for each anchor-coverage mask.
+
+    One BFS supplies every candidate for a piece.  This is materially cheaper
+    than solving a fresh route for every anchor/pixel alignment: the complete
+    centre-colour product graph is explored once, then equivalent coverage
+    masks are compressed deterministically.
+    """
+    if not rel_mask or not deltas or not pads:
+        return []
+    start = (origin[0], origin[1], current_color)
+    queue = deque([start])
+    parent: dict[tuple[int, int, int], Optional[tuple[int, int, int]]] = {
+        start: None
+    }
+    via: dict[tuple[int, int, int], int] = {}
+    distance = {start: 0}
+    # mask -> (rank, goal colour, target, hits, action tuple)
+    best: dict[int, tuple[tuple, int, Cell, frozenset[Cell], tuple[int, ...]]] = {
+        0: ((0, 0, 0, current_color, tuple()), current_color, origin,
+            frozenset(), tuple())
+    }
+
+    def route(state: tuple[int, int, int]) -> tuple[int, ...]:
+        actions: list[int] = []
+        cur = state
+        while parent[cur] is not None:
+            actions.append(via[cur])
+            cur = parent[cur]  # type: ignore[assignment]
+        actions.reverse()
+        return tuple(actions)
+
+    while queue:
+        state = queue.popleft()
+        x, y, color = state
+        same = anchors.get(color, tuple())
+        if same:
+            hits = frozenset(
+                cell for cell in same
+                if (cell[0] - x, cell[1] - y) in rel_mask
+            )
+            if hits:
+                mask = 0
+                for cell in hits:
+                    mask |= goal_bit[(color, cell)]
+                actions = route(state)
+                dy, dx = y - origin[1], x - origin[0]
+                rank = (distance[state], dy, dx, color, actions)
+                old = best.get(mask)
+                if old is None or rank < old[0]:
+                    best[mask] = (rank, color, (x, y), hits, actions)
+
+        for action, (dx, dy) in sorted(deltas.items()):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < GRID and 0 <= ny < GRID):
+                continue
+            touched: set[int] = set()
+            for fill, (x0, y0, x1, y1) in pads:
+                if any(x0 <= nx + rx <= x1 and y0 <= ny + ry <= y1
+                       for rx, ry in rel_mask):
+                    touched.add(fill)
+            if len(touched) > 1:
+                continue
+            ncolor = next(iter(touched)) if touched else color
+            nxt = (nx, ny, ncolor)
+            if nxt in parent:
+                continue
+            if len(parent) >= OV_RECOLOR_STATE_CAP:
+                return []
+            parent[nxt] = state
+            via[nxt] = action
+            distance[nxt] = distance[state] + 1
+            queue.append(nxt)
+
+    return [
+        (mask, item[0][0], item[1], item[2], item[3], item[4])
+        for mask, item in sorted(best.items())
+    ]
+
+
+def assign_overlay_recolor_pieces(
+    pieces: list[tuple[Cell, int, frozenset[Cell]]],
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+) -> Optional[list[
+    tuple[
+        int, frozenset[Cell], Cell, int, Cell, frozenset[Cell],
+        tuple[int, ...],
+    ]
+]]:
+    """Jointly colour and place one full SELECT-cycle piece inventory.
+
+    Each piece gets every reachable final centre/colour option from one
+    bounded product-graph BFS.  A bitmask DP then chooses one option per
+    ordinal whose same-colour arm pixels cover every observed anchor.  The
+    assignment is anchor-level, so two pieces may safely divide one colour's
+    goals without either being mistaken for a complete colour solution.
+    """
+    if not (2 <= len(pieces) <= OV_CATALOG_CAP) or not anchors:
+        return None
+    goals = sorted(
+        (color, cell) for color, cells in anchors.items() for cell in cells
+    )
+    if not goals or len(goals) > OV_ASSIGN_GOAL_CAP:
+        return None
+    goal_bit = {goal: 1 << index for index, goal in enumerate(goals)}
+    full_mask = (1 << len(goals)) - 1
+    rows = [
+        overlay_recolor_options(
+            origin, color, rel_mask, anchors, deltas, pads, goal_bit
+        ) for origin, color, rel_mask in pieces
+    ]
+    if any(not row for row in rows):
+        return None
+
+    # covered -> (moves, overlap, max-piece-moves, deterministic tie key,
+    #             ordered placements)
+    dp: dict[int, tuple[int, int, int, tuple, tuple]] = {
+        0: (0, 0, 0, tuple(), tuple())
+    }
+    for (origin, source, rel_mask), options in zip(pieces, rows):
+        nxt: dict[int, tuple[int, int, int, tuple, tuple]] = {}
+        for covered, state in dp.items():
+            total, overlap, max_moves, ties, placements = state
+            for mask, moves, goal_color, target, hits, actions in options:
+                merged = covered | mask
+                redundant = mask.bit_count() - (mask & ~covered).bit_count()
+                disp = (target[1] - origin[1], target[0] - origin[0])
+                tie = (goal_color, disp, actions)
+                placement = (
+                    source, rel_mask, origin, goal_color, target, hits, actions
+                )
+                candidate = (
+                    total + moves,
+                    overlap + redundant,
+                    max(max_moves, moves),
+                    ties + (tie,),
+                    placements + (placement,),
+                )
+                old = nxt.get(merged)
+                if old is None or candidate[:4] < old[:4]:
+                    if old is None and len(nxt) >= OV_ASSIGN_STATE_CAP:
+                        return None
+                    nxt[merged] = candidate
+        dp = nxt
+        if not dp:
+            return None
+    solved = dp.get(full_mask)
+    if solved is None:
+        return None
+    return list(solved[4])
+
+
 def assign_overlay_pieces(
     pieces: list[tuple[Cell, int, frozenset[Cell]]],
     anchors: dict[int, tuple[Cell, ...]],
@@ -1380,9 +1540,18 @@ class MyAgent(Agent):
         self._ov_catalog_first: Optional[
             tuple[Cell, int, frozenset[Cell]]
         ] = None
+        self._ov_catalog_recolor = False
+        self._ov_recolor_cataloged = False
         self._ov_assignment: deque[
             tuple[int, frozenset[Cell], Cell, frozenset[Cell]]
         ] = deque()
+        self._ov_recolor_assignment: deque[
+            tuple[
+                int, frozenset[Cell], Cell, int, Cell, frozenset[Cell],
+                tuple[int, ...],
+            ]
+        ] = deque()
+        self._ov_recolor_required: frozenset[tuple[int, Cell]] = frozenset()
         self._ov_assigned_anchors: set[tuple[int, Cell]] = set()
         self._ov_strikes = 0
         self._ov_benched: Optional[int] = None
@@ -1628,7 +1797,11 @@ class MyAgent(Agent):
             self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
+            self._ov_catalog_recolor = False
+            self._ov_recolor_cataloged = False
             self._ov_assignment.clear()
+            self._ov_recolor_assignment.clear()
+            self._ov_recolor_required = frozenset()
             self._ov_assigned_anchors.clear()
             self._ov_strikes = 0
             self._ov_benched = None
@@ -1790,7 +1963,11 @@ class MyAgent(Agent):
             self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
+            self._ov_catalog_recolor = False
+            self._ov_recolor_cataloged = False
             self._ov_assignment.clear()
+            self._ov_recolor_assignment.clear()
+            self._ov_recolor_required = frozenset()
             self._ov_assigned_anchors.clear()
             self._ov_strikes = 0
             self._ov_benched = None
@@ -3444,7 +3621,11 @@ class MyAgent(Agent):
             self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
+            self._ov_catalog_recolor = False
+            self._ov_recolor_cataloged = False
             self._ov_assignment.clear()
+            self._ov_recolor_assignment.clear()
+            self._ov_recolor_required = frozenset()
             self._ov_assigned_anchors.clear()
             self._ov_idprobe = 0
         # CONFIDENCE GATE (round 6 tighten): the genuine re86 static overlay is
@@ -3468,7 +3649,8 @@ class MyAgent(Agent):
             # ignores an input, the target-relative planner restores the
             # missing step from the next readable centre.
             if self._ov_target is not None \
-                    or self._ov_catalog or self._ov_assignment:
+                    or self._ov_catalog or self._ov_assignment \
+                    or self._ov_recolor_assignment:
                 if self._ov_target is not None and self._ov_plan:
                     action = self._ov_plan.popleft()
                     self._ov_last_center = None
@@ -3480,7 +3662,31 @@ class MyAgent(Agent):
                 if self._ov_target is not None \
                         and self._ov_expected_arm is not None \
                         and self._ov_select is not None:
-                    self._ov_solved.add(self._ov_expected_arm)
+                    if self._ov_recolor_assignment:
+                        _source, _mask, _origin, goal_color, _tgt, hits, \
+                            _actions = \
+                            self._ov_recolor_assignment.popleft()
+                        if goal_color != self._ov_expected_arm:
+                            self._ov_recolor_assignment.clear()
+                            self._ov_recolor_required = frozenset()
+                            self._ov_benched = level
+                            return None
+                        self._ov_assigned_anchors.update(
+                            (goal_color, cell) for cell in hits
+                        )
+                        if not self._ov_recolor_assignment:
+                            if not self._ov_recolor_required \
+                                    <= self._ov_assigned_anchors:
+                                self._ov_recolor_required = frozenset()
+                                self._ov_benched = level
+                                return None
+                            self._ov_solved.update(
+                                color for color, _cell
+                                in self._ov_recolor_required
+                            )
+                            self._ov_recolor_required = frozenset()
+                    else:
+                        self._ov_solved.add(self._ov_expected_arm)
                     self._ov_expected_arm = None
                     self._ov_target = None
                     self._ov_last_center = None
@@ -3559,28 +3765,56 @@ class MyAgent(Agent):
         # relative mask, so identical shapes at different sites remain
         # distinct instances and an intermediate duplicate is ambiguous.
         if self._ov_catalog:
-            rel_mask = symmetric_piece_mask(grid, center, arm)
+            rel_mask = clipped_symmetric_piece_mask(grid, center, arm) \
+                if self._ov_catalog_recolor \
+                else symmetric_piece_mask(grid, center, arm)
             if rel_mask is None:
                 self._ov_catalog.clear()
                 self._ov_catalog_first = None
+                self._ov_catalog_recolor = False
                 self._ov_benched = level
                 return None
             key = (center, arm, rel_mask)
             if key == self._ov_catalog_first:
-                assignment = assign_overlay_pieces(
-                    self._ov_catalog, anchors, step
-                ) if len(self._ov_catalog) >= 2 else None
+                catalog = list(self._ov_catalog)
+                recolor_mode = self._ov_catalog_recolor
                 self._ov_catalog.clear()
                 self._ov_catalog_first = None
-                if assignment is None:
+                self._ov_catalog_recolor = False
+                if recolor_mode:
+                    self._ov_recolor_cataloged = True
+                    pending = {
+                        color: cells for color, cells in anchors.items()
+                        if color not in self._ov_solved
+                    }
+                    assignment = assign_overlay_recolor_pieces(
+                        catalog, pending, axis, self._ov_pads
+                    ) if len(catalog) >= 2 else None
+                    if assignment is not None:
+                        self._ov_recolor_assignment = deque(assignment)
+                        self._ov_recolor_required = frozenset(
+                            (color, cell) for color, cells in pending.items()
+                            for cell in cells
+                        )
+                        self._ov_assigned_anchors.clear()
+                    elif len(catalog) >= 2:
+                        self._ov_benched = level
+                        return None
+                else:
+                    assignment = assign_overlay_pieces(
+                        catalog, anchors, step
+                    ) if len(catalog) >= 2 else None
+                    if assignment is not None:
+                        self._ov_assignment = deque(assignment)
+                        self._ov_assigned_anchors.clear()
+                if assignment is None and (not recolor_mode or len(catalog) >= 2):
                     self._ov_benched = level
                     return None
-                self._ov_assignment = deque(assignment)
-                self._ov_assigned_anchors.clear()
             elif key in self._ov_catalog \
                     or len(self._ov_catalog) >= OV_CATALOG_CAP:
                 self._ov_catalog.clear()
                 self._ov_catalog_first = None
+                self._ov_catalog_recolor = False
                 self._ov_benched = level
                 return None
             else:
@@ -3596,12 +3830,18 @@ class MyAgent(Agent):
             self._ov_target = None
             self._ov_expected_arm = None
             self._ov_strikes += 1
+            if self._ov_recolor_assignment:
+                self._ov_recolor_assignment.clear()
+                self._ov_recolor_required = frozenset()
+                self._ov_benched = level
+                return None
             if self._ov_strikes >= OV_STRIKES:
                 self._ov_benched = level
                 return None
         # drive an in-flight plan toward the current target
         if self._ov_plan and self._ov_target is not None \
-                and center != self._ov_target:
+                and (self._ov_recolor_assignment
+                     or center != self._ov_target):
             act = self._ov_plan.popleft()
             self._ov_last_center = center
             return self._step(GameAction.from_id(act))
@@ -3630,6 +3870,31 @@ class MyAgent(Agent):
                         self._ov_benched = level
                         return None
                     self._ov_solved.update(anchors)
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
+            if self._ov_recolor_assignment:
+                _source, _mask, _origin, goal_color, _target, hits, _actions = \
+                    self._ov_recolor_assignment.popleft()
+                expected_arm = self._ov_expected_arm
+                self._ov_expected_arm = None
+                if arm != goal_color or expected_arm != goal_color:
+                    self._ov_recolor_assignment.clear()
+                    self._ov_recolor_required = frozenset()
+                    self._ov_benched = level
+                    return None
+                self._ov_assigned_anchors.update(
+                    (goal_color, cell) for cell in hits
+                )
+                if not self._ov_recolor_assignment:
+                    if not self._ov_recolor_required \
+                            <= self._ov_assigned_anchors:
+                        self._ov_recolor_required = frozenset()
+                        self._ov_benched = level
+                        return None
+                    self._ov_solved.update(
+                        color for color, _cell in self._ov_recolor_required
+                    )
+                    self._ov_recolor_required = frozenset()
                 self._ov_last_center = None
                 return self._step(GameAction.from_id(select))
             if self._ov_expected_arm is not None:
@@ -3697,6 +3962,52 @@ class MyAgent(Agent):
             self._ov_last_center = center
             return self._step(GameAction.from_id(act))
 
+        # Execute a globally proved pad-aware placement for the current SELECT
+        # ordinal.  The stored route was produced by the same bounded product
+        # graph used during assignment; the queue head remains active until
+        # its target is visibly (or deterministically, under a hidden hole)
+        # completed, so anchor-level progress cannot advance out of order.
+        if self._ov_recolor_assignment:
+            source, expected_mask, origin, goal_color, tgt, hits, actions = \
+                self._ov_recolor_assignment[0]
+            observed_mask = clipped_symmetric_piece_mask(grid, center, arm)
+            visible_match = observed_mask is not None \
+                and observed_mask <= expected_mask \
+                and len(observed_mask) >= 4
+            if center != origin or arm != source or not visible_match:
+                self._ov_recolor_assignment.clear()
+                self._ov_recolor_required = frozenset()
+                self._ov_benched = level
+                return None
+            if not actions:
+                if center != tgt or arm != goal_color:
+                    self._ov_recolor_assignment.clear()
+                    self._ov_recolor_required = frozenset()
+                    self._ov_benched = level
+                    return None
+                self._ov_recolor_assignment.popleft()
+                self._ov_assigned_anchors.update(
+                    (goal_color, cell) for cell in hits
+                )
+                if not self._ov_recolor_assignment:
+                    if not self._ov_recolor_required \
+                            <= self._ov_assigned_anchors:
+                        self._ov_recolor_required = frozenset()
+                        self._ov_benched = level
+                        return None
+                    self._ov_solved.update(
+                        color for color, _cell in self._ov_recolor_required
+                    )
+                    self._ov_recolor_required = frozenset()
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
+            self._ov_target = tgt
+            self._ov_expected_arm = goal_color
+            self._ov_plan = deque(actions)
+            act = self._ov_plan.popleft()
+            self._ov_last_center = center
+            return self._step(GameAction.from_id(act))
+
         # Framed paint pads change a whole piece's colour when any arm pixel
         # overlaps them.  On this strongly gated board, infer the destination
         # colour solely from which unsolved anchor set the observed shape can
@@ -3710,6 +4021,23 @@ class MyAgent(Agent):
                 if color not in self._ov_solved
             }
             pad_colors = {color for color, _bbox in self._ov_pads}
+            # Inventory the whole SELECT cycle before accepting a tempting
+            # one-piece placement.  A shape may be the only full-cover match
+            # for a small colour while also being essential to a larger colour
+            # that must be split across pieces; only the global DP can resolve
+            # that allocation without greedily consuming the wrong shape.
+            if pending and set(pending) <= pad_colors \
+                    and not self._ov_recolor_cataloged:
+                rel_mask = clipped_symmetric_piece_mask(grid, center, arm)
+                if rel_mask is None:
+                    self._ov_benched = level
+                    return None
+                first = (center, arm, rel_mask)
+                self._ov_catalog = [first]
+                self._ov_catalog_first = first
+                self._ov_catalog_recolor = True
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
             targets = tuple(
                 target for target in overlay_shape_targets(
                     rel_mask or frozenset(), pending, center, step

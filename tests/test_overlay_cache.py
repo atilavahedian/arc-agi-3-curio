@@ -171,6 +171,13 @@ class OverlayGoalCacheTests(unittest.TestCase):
             )
         agent._ov_cached_outline = 3
         agent._ov_cached_anchors = {9: ((12, 12),)}
+        agent._ov_catalog_recolor = True
+        agent._ov_recolor_cataloged = True
+        agent._ov_recolor_required = frozenset({(9, (12, 12))})
+        agent._ov_recolor_assignment.append(
+            (11, frozenset({(-1, 0), (1, 0)}), (20, 20), 9,
+             (12, 12), frozenset({(12, 12)}), (1,))
+        )
         agent._policy = lambda _grid, _frame: GameAction.ACTION1
         grid = [[8 for _x in range(64)] for _y in range(64)]
         frame = FrameData(
@@ -184,6 +191,10 @@ class OverlayGoalCacheTests(unittest.TestCase):
 
         self.assertIsNone(agent._ov_cached_outline)
         self.assertEqual(agent._ov_cached_anchors, {})
+        self.assertFalse(agent._ov_catalog_recolor)
+        self.assertFalse(agent._ov_recolor_cataloged)
+        self.assertEqual(len(agent._ov_recolor_assignment), 0)
+        self.assertEqual(agent._ov_recolor_required, frozenset())
 
     @staticmethod
     def _hollow_piece_grid(missing_tip: bool = True) -> list[list[int]]:
@@ -420,6 +431,95 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertEqual(len(plan), 21)
         self.assertEqual(plan, [1] * 5 + [3] * 7 + [2] * 3 + [3] * 6)
 
+    def test_joint_recolor_assignment_splits_same_color_anchors(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_recolor_pieces"
+        ]
+        x_mask = frozenset(
+            (sx * distance, sy * distance)
+            for distance in range(1, 12)
+            for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1))
+        )
+        diamond = frozenset(
+            (dx, dy) for dy in range(-9, 10) for dx in range(-9, 10)
+            if abs(dx) + abs(dy) == 9
+        )
+        plus = frozenset(
+            (dx, dy) for distance in range(1, 15)
+            for dx, dy in ((distance, 0), (-distance, 0),
+                           (0, distance), (0, -distance))
+        )
+        pieces = [
+            ((24, 42), 11, x_mask),
+            ((30, 18), 14, diamond),
+            ((54, 33), 12, plus),
+        ]
+        anchors = {
+            9: ((21, 6), (39, 6), (33, 45),
+                (24, 51), (45, 51), (33, 60)),
+            8: ((51, 27), (42, 36)),
+        }
+        pads = tuple(
+            (color, bbox) for color, bbox in (
+                (11, (3, 3, 8, 8)),
+                (10, (54, 3, 59, 8)),
+                (14, (3, 27, 8, 32)),
+                (9, (3, 52, 8, 57)),
+                (8, (54, 52, 59, 57)),
+            )
+        )
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+
+        first = func(pieces, anchors, deltas, pads)
+        second = func(
+            pieces,
+            {color: tuple(reversed(cells))
+             for color, cells in reversed(tuple(anchors.items()))},
+            deltas,
+            tuple(reversed(pads)),
+        )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [(item[3], item[4]) for item in first],
+            [(9, (30, 15)), (8, (51, 36)), (9, (33, 51))],
+        )
+        self.assertEqual(sum(len(item[6]) for item in first), 61)
+        covered = {
+            (item[3], cell) for item in first for cell in item[5]
+        }
+        required = {
+            (color, cell) for color, cells in anchors.items() for cell in cells
+        }
+        self.assertEqual(covered, required)
+
+    def test_joint_recolor_accepts_pad_aware_translation(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_recolor_pieces"
+        ]
+        mask = frozenset({(-1, 0), (1, 0)})
+        pieces = [((10, 10), 9, mask), ((20, 20), 9, mask)]
+        deltas = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}
+        pads = ((9, (30, 30, 35, 35)),)
+
+        # Even without a colour change, this path remains useful on a
+        # pad-bearing board: its routes prove that no wrong pad is crossed.
+        assignment = func(
+            pieces, {9: ((9, 10), (11, 10))}, deltas, pads
+        )
+        self.assertIsNotNone(assignment)
+        self.assertEqual(
+            {(item[3], cell) for item in assignment for cell in item[5]},
+            {(9, (9, 10)), (9, (11, 10))},
+        )
+        # Full coverage is mandatory, and the hard goal-width cap is shared
+        # with the ordinary overlay assignment.
+        impossible = {8: ((5, 5),)}
+        self.assertIsNone(func(pieces, impossible, deltas, pads))
+        too_many = {8: tuple((x + 10, 10) for x in range(17))}
+        self.assertIsNone(func(pieces, too_many, deltas, pads))
+
     def test_joint_assignment_covers_all_same_color_anchors(self) -> None:
         func = self.agent_class._ov_selected.__globals__["assign_overlay_pieces"]
         horizontal = frozenset({(-2, 0), (-1, 0), (1, 0), (2, 0)})
@@ -479,6 +579,50 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertIs(action, GameAction.ACTION1)
         self.assertIsNot(action, GameAction.ACTION5)
         self.assertEqual(list(agent._ov_plan), [1])
+
+    def test_recolor_route_can_cross_target_before_final_color(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        for action, delta in {
+            1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)
+        }.items():
+            agent._ov_deltas[action][delta] = 3
+        mask = frozenset({(-1, 0), (1, 0)})
+        agent._ov_level = 0
+        agent._ov_select = GameAction.ACTION5.value
+        # The first leg has already reached the final coordinate, but the
+        # proved route must still touch a paint pad and return before success.
+        agent._ov_target = (40, 40)
+        agent._ov_expected_arm = 9
+        agent._ov_plan = deque([GameAction.ACTION4.value,
+                                GameAction.ACTION3.value])
+        agent._ov_recolor_assignment = deque([
+            (13, mask, (37, 40), 9, (40, 40),
+             frozenset({(12, 12)}),
+             (GameAction.ACTION4.value, GameAction.ACTION4.value,
+              GameAction.ACTION3.value)),
+        ])
+        agent._ov_recolor_required = frozenset({(9, (12, 12))})
+        frame = FrameData(
+            frame=[self._overlay_grid()],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(self._overlay_grid(), frame)
+
+        self.assertIs(action, GameAction.ACTION4)
+        self.assertEqual(list(agent._ov_plan), [GameAction.ACTION3.value])
+        self.assertEqual(len(agent._ov_recolor_assignment), 1)
+        self.assertIsNone(agent._ov_benched)
 
     def test_hidden_hole_during_select_cycle_keeps_ordinal(self) -> None:
         mask = frozenset({(-1, 0), (1, 0)})
@@ -552,6 +696,53 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertIn(12, agent._ov_solved)
         self.assertIsNone(agent._ov_target)
         self.assertIsNone(agent._ov_expected_arm)
+
+    def test_hidden_joint_recolor_records_only_completed_anchors(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        mask = frozenset({(-1, 0), (1, 0), (0, -1), (0, 1)})
+        first_hits = frozenset({(10, 10), (20, 10)})
+        second_hits = frozenset({(10, 20), (20, 20)})
+        agent._ov_level = 0
+        agent._ov_cached_outline = 4
+        agent._ov_cached_anchors = {
+            9: tuple(first_hits | second_hits)
+        }
+        agent._ov_select = GameAction.ACTION5.value
+        agent._ov_target = (15, 10)
+        agent._ov_expected_arm = 9
+        agent._ov_recolor_required = frozenset(
+            (9, cell) for cell in first_hits | second_hits
+        )
+        agent._ov_recolor_assignment = deque([
+            (11, mask, (15, 30), 9, (15, 10), first_hits, (1,)),
+            (12, mask, (15, 40), 9, (15, 20), second_hits, (2,)),
+        ])
+        grid = [[8 for _x in range(64)] for _y in range(64)]
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(grid, frame)
+
+        self.assertIs(action, GameAction.ACTION5)
+        self.assertEqual(len(agent._ov_recolor_assignment), 1)
+        self.assertEqual(
+            agent._ov_assigned_anchors,
+            {(9, cell) for cell in first_hits},
+        )
+        self.assertNotIn(9, agent._ov_solved)
+        self.assertEqual(len(agent._ov_recolor_required), 4)
 
 
 if __name__ == "__main__":

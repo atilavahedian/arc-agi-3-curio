@@ -180,6 +180,8 @@ ED_CYCLE_CAP = 9        # cycle presses chasing one slot's goal signature
 ED_MISS_CAP = 4         # consecutive cursor/slot losses before a strike
 ED_STRIKES = 10         # model failures before the editor benches a level
 ED_GOALS = 6            # goal candidates (rule segmentations) kept
+ED_META_NODES = 20000   # altered-rule constraint-search node budget
+ED_META_SOLS = 1024     # complete altered-rule assignments retained
 CLICK_WARM_TRIES = 5    # tries a click signature needs before it may end
                         # novelty warmup early — the affordance library
                         # knowing a productive class is the click-game
@@ -2725,6 +2727,24 @@ class MyAgent(Agent):
         self._ed_full_seen = False  # candidate fully matched once already
         self._ed_spent = 0          # cycle presses at the current slot
         self._ed_miss = 0           # consecutive cursor/slot read failures
+        # Later editor levels make the RULES themselves mutable.  Canonical
+        # glyph cycles and the chosen cycle verb are physics and survive a
+        # level-up; selector order, calibration progress and the action plan
+        # are geography and are cleared below with the ordinary editor state.
+        self._ed_meta_cycles: dict[
+            tuple[int, int], dict[tuple, tuple]
+        ] = {}
+        self._ed_meta_cyc_act: Optional[int] = None
+        self._ed_meta_mode = False
+        self._ed_meta_phase = ""
+        self._ed_meta_order: list[tuple[int, int, int]] = []
+        self._ed_meta_sel_act: Optional[int] = None
+        self._ed_meta_calib_ring: Optional[int] = None
+        self._ed_meta_calib_start: tuple = tuple()
+        self._ed_meta_calib_prev: tuple = tuple()
+        self._ed_meta_calib_map: dict[tuple, tuple] = {}
+        self._ed_meta_calib_steps = 0
+        self._ed_meta_plan: deque[int] = deque()
         # ── switch model (dc22 family): remote cyclic toggles ──
         # footprint passability (_stepped_sigs / _block_sigs) is appearance-
         # keyed physics; a switch's mask and phase patches are positional —
@@ -2955,6 +2975,16 @@ class MyAgent(Agent):
             self._ed_benched = None
             self._ed_spent = 0
             self._ed_miss = 0
+            self._ed_meta_mode = False
+            self._ed_meta_phase = ""
+            self._ed_meta_order.clear()
+            self._ed_meta_sel_act = None
+            self._ed_meta_calib_ring = None
+            self._ed_meta_calib_start = tuple()
+            self._ed_meta_calib_prev = tuple()
+            self._ed_meta_calib_map.clear()
+            self._ed_meta_calib_steps = 0
+            self._ed_meta_plan.clear()
             self._ed_full_seen = False
             # the switch level replays deterministically: keep the toggle
             # records (masks repeat), void the plan and the phase beliefs
@@ -3136,6 +3166,16 @@ class MyAgent(Agent):
             self._ed_benched = None
             self._ed_spent = 0
             self._ed_miss = 0
+            self._ed_meta_mode = False
+            self._ed_meta_phase = ""
+            self._ed_meta_order.clear()
+            self._ed_meta_sel_act = None
+            self._ed_meta_calib_ring = None
+            self._ed_meta_calib_start = tuple()
+            self._ed_meta_calib_prev = tuple()
+            self._ed_meta_calib_map.clear()
+            self._ed_meta_calib_steps = 0
+            self._ed_meta_plan.clear()
             # slide-maze geography: the board and exit are new; the probe
             # spend, corridor colour, strikes and bench are level data
             # (engaged flag and the learned direction map persist as physics)
@@ -5522,7 +5562,13 @@ class MyAgent(Agent):
         in-place MUTATE — a glyph slot cycling under the cursor), a no-op,
         or unmodelled noise.  Border-band cells are exempt (budget bars
         tick there); click-capable games never feed this."""
-        if GameAction.ACTION6.value in self._avail:
+        if GameAction.ACTION6.value in self._avail or self._ed_meta_mode:
+            # Once the altered-rule controller is proved, its variable-width
+            # bracket jumps are not fresh verb evidence: moving between a
+            # one-card and two-card side is not a rigid translation and can
+            # resemble a compact mutation.  Freezing the already-trusted
+            # physics prevents selector votes from contaminating the next
+            # level's cycle verb.
             return
         cls = self._ed_class[act]
         changed: set[Cell] = set()
@@ -5683,6 +5729,296 @@ class MyAgent(Agent):
                 rows.append((y, run))
         return rows
 
+    @staticmethod
+    def _ed_meta_layout(
+        grid: Grid, pitch: int, rows: list[tuple[int, list]],
+    ) -> Optional[dict[str, Any]]:
+        """Parse a board whose rewrite rules, rather than its answer, move.
+
+        The gate is intentionally much stronger than ordinary editor parsing:
+        at least three separator-linked rule pairs, uniform backing-card type
+        on every side, a unique one- or two-edge type DAG, and exactly one
+        immutable root-type input plus sink-type target below the rules.  The
+        caller additionally requires the latest mutation and the live bracket
+        cursor to hit a paired side before this mode may engage.
+        """
+        by_y: dict[int, list[list]] = defaultdict(list)
+        for y, run in rows:
+            by_y[y].append(run)
+        pairs: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        sides: dict[tuple[int, int, int], list] = {}
+        unpaired: list[tuple[tuple[int, int, int], list]] = []
+        for y, runs in sorted(by_y.items()):
+            runs.sort(key=lambda r: r[0][0])
+            used: set[int] = set()
+            i = 0
+            while i < len(runs) - 1:
+                lhs, rhs = runs[i], runs[i + 1]
+                gx0 = lhs[-1][0] + pitch
+                gx1 = rhs[0][0]
+                gap = {
+                    grid[y + dy][x]
+                    for dy in range(pitch) for x in range(gx0, gx1)
+                }
+                if 0 < gx1 - gx0 <= 3 * pitch and len(gap) > 1:
+                    lk = (y, lhs[0][0], len(lhs))
+                    rk = (y, rhs[0][0], len(rhs))
+                    pairs.append((lk, rk))
+                    sides[lk], sides[rk] = lhs, rhs
+                    used.update((i, i + 1))
+                    i += 2
+                else:
+                    i += 1
+            for j, run in enumerate(runs):
+                if j not in used:
+                    unpaired.append(((y, run[0][0], len(run)), run))
+        if not (3 <= len(pairs) <= 8):
+            return None
+
+        def run_type(run: list) -> Optional[int]:
+            rings = {ring for _x, ring, _sig in run}
+            return next(iter(rings)) if len(rings) == 1 else None
+
+        edges: set[tuple[int, int]] = set()
+        for lk, rk in pairs:
+            lt, rt = run_type(sides[lk]), run_type(sides[rk])
+            if lt is None or rt is None or lt == rt:
+                return None
+            edges.add((lt, rt))
+        lhs_types = {a for a, _b in edges}
+        rhs_types = {b for _a, b in edges}
+        roots, sinks = lhs_types - rhs_types, rhs_types - lhs_types
+        if len(roots) != 1 or len(sinks) != 1:
+            return None
+        root, sink = next(iter(roots)), next(iter(sinks))
+        path = [root]
+        while path[-1] != sink and len(path) <= 3:
+            nxt = {b for a, b in edges if a == path[-1]}
+            if len(nxt) != 1 or next(iter(nxt)) in path:
+                return None
+            path.append(next(iter(nxt)))
+        if path[-1] != sink or len(path) not in (2, 3) \
+                or edges != set(zip(path, path[1:])):
+            return None
+        max_rule_y = max(k[0] for pair in pairs for k in pair)
+        source = [
+            (key, run) for key, run in unpaired
+            if key[0] > max_rule_y and run_type(run) == root
+        ]
+        target = [
+            (key, run) for key, run in unpaired
+            if key[0] > max_rule_y and run_type(run) == sink
+        ]
+        # Source and target are the only rows outside the paired rule table.
+        # Extra unpaired card runs make the apparent type DAG ambiguous and
+        # are a strong signal that this is an ordinary editor board instead.
+        if len(unpaired) != 2 or len(source) != 1 or len(target) != 1:
+            return None
+        rules = [
+            (lk, rk, sides[lk], sides[rk]) for lk, rk in pairs
+        ]
+        return {
+            "rules": rules,
+            "sides": sides,
+            "source": source[0][1],
+            "target": target[0][1],
+            "path": tuple(path),
+        }
+
+    @staticmethod
+    def _ed_meta_marker(
+        grid: Grid, pitch: int,
+        sides: dict[tuple[int, int, int], list],
+    ) -> Optional[tuple[int, int, int]]:
+        """Locate the live two-bracket cursor without baking its colour.
+
+        A rule side of ``n`` cards is bracketed by two hollow 2-pixel-high
+        bars spanning its glyph interiors.  Checking the complete geometry
+        handles both one- and multi-card sides, unlike the ordinary editor's
+        fixed marker template learned on answer-row slots.
+        """
+        hits: list[tuple[int, int, int]] = []
+        for key, run in sides.items():
+            y, x, n = key
+            x0, x1 = x + 1, x + n * pitch - 2
+            yt, yb = y - 3, y + pitch + 2
+            if yt < 0 or yb >= GRID or x0 < 0 or x1 >= GRID:
+                continue
+            color = grid[yt][x0]
+            if color == run[0][1]:
+                continue
+            full = all(grid[yt][xx] == color for xx in range(x0, x1 + 1)) \
+                and all(grid[yb][xx] == color for xx in range(x0, x1 + 1))
+            ends = grid[yt + 1][x0] == color \
+                and grid[yt + 1][x1] == color \
+                and grid[yb - 1][x0] == color \
+                and grid[yb - 1][x1] == color
+            hollow = all(grid[yt + 1][xx] != color
+                         for xx in range(x0 + 1, x1)) \
+                and all(grid[yb - 1][xx] != color
+                        for xx in range(x0 + 1, x1))
+            if full and ends and hollow:
+                hits.append(key)
+        return hits[0] if len(hits) == 1 else None
+
+    @staticmethod
+    def _ed_meta_rule_hit(
+        box: tuple[int, int, int, int],
+        side: tuple[int, int, int], pitch: int,
+    ) -> bool:
+        """Whether a compact mutation's centre lies on the bracketed side."""
+        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+        y, x, n = side
+        return y <= cy < y + pitch and x <= cx < x + n * pitch
+
+    @staticmethod
+    def _ed_meta_tokens(run: list) -> tuple:
+        return tuple((ring, sig) for _x, ring, sig in run)
+
+    @staticmethod
+    def _ed_meta_cycle_ready(cycle: dict[tuple, tuple]) -> bool:
+        """True only for one closed, collision-free observed orbit."""
+        if len(cycle) < 2 or set(cycle) != set(cycle.values()):
+            return False
+        start = next(iter(cycle))
+        seen: set[tuple] = set()
+        cur = start
+        while cur not in seen:
+            seen.add(cur)
+            cur = cycle[cur]
+        return cur == start and len(seen) == len(cycle)
+
+    @staticmethod
+    def _ed_meta_solutions(
+        layout: dict[str, Any], cycles: dict[int, dict[tuple, tuple]],
+    ) -> list[dict[tuple[int, int, int], int]]:
+        """Synthesize uniform cyclic offsets for mutable rule sides.
+
+        A side's offset changes every glyph on it together, preserving the
+        relative phase of multi-card RHS runs.  DFS binds offsets only when a
+        concrete LHS slice or output slice demands them.  A two-edge type DAG
+        nests the second rewrite while its intermediate sequence is still
+        known, avoiding an exponential enumeration of all rule settings.
+        """
+        rules = layout["rules"]
+        path = layout["path"]
+        source = MyAgent._ed_meta_tokens(layout["source"])
+        target = MyAgent._ed_meta_tokens(layout["target"])
+        stages: list[list[tuple]] = []
+        for src_type, dst_type in zip(path, path[1:]):
+            stage = [
+                rule for rule in rules
+                if rule[2][0][1] == src_type and rule[3][0][1] == dst_type
+            ]
+            if not stage:
+                return []
+            stages.append(stage)
+
+        def shifted(run: list, offset: int) -> Optional[tuple]:
+            out = []
+            for _x, ring, sig in run:
+                cycle = cycles.get(ring)
+                if cycle is None or sig not in cycle:
+                    return None
+                cur = sig
+                for _ in range(offset):
+                    cur = cycle[cur]
+                out.append((ring, cur))
+            return tuple(out)
+
+        def period(run: list) -> int:
+            ring = run[0][1]
+            cycle = cycles.get(ring, {})
+            return len(cycle) if MyAgent._ed_meta_cycle_ready(cycle) else 0
+
+        def bind(assign: dict, side: tuple, value: int) -> Optional[dict]:
+            if side in assign and assign[side] != value:
+                return None
+            nxt = dict(assign)
+            nxt[side] = value
+            return nxt
+
+        def matching(
+            run: list, seq: tuple, pos: int, assign: dict, side: tuple,
+        ) -> list[int]:
+            n = period(run)
+            if not n:
+                return []
+            choices = [assign[side]] if side in assign else range(n)
+            return [
+                k for k in choices
+                if shifted(run, k) == seq[pos:pos + len(run)]
+            ]
+
+        nodes = 0
+        solutions: list[dict] = []
+
+        def lower(
+            mid: tuple, mi: int, ti: int, assign: dict,
+        ):
+            nonlocal nodes
+            nodes += 1
+            if nodes > ED_META_NODES:
+                return
+            if mi == len(mid):
+                yield ti, assign
+                return
+            for lk, rk, lhs, rhs in stages[1]:
+                for loff in matching(lhs, mid, mi, assign, lk):
+                    a1 = bind(assign, lk, loff)
+                    if a1 is None:
+                        continue
+                    n = period(rhs)
+                    choices = [a1[rk]] if rk in a1 else range(n)
+                    for roff in choices:
+                        out = shifted(rhs, roff)
+                        if out is None or target[ti:ti + len(out)] != out:
+                            continue
+                        a2 = bind(a1, rk, roff)
+                        if a2 is not None:
+                            yield from lower(
+                                mid, mi + len(lhs), ti + len(out), a2)
+
+        def outer(si: int, ti: int, assign: dict) -> None:
+            nonlocal nodes
+            nodes += 1
+            if nodes > ED_META_NODES or len(solutions) >= ED_META_SOLS:
+                return
+            if si == len(source):
+                if ti == len(target):
+                    solutions.append(assign)
+                return
+            for lk, rk, lhs, rhs in stages[0]:
+                for loff in matching(lhs, source, si, assign, lk):
+                    a1 = bind(assign, lk, loff)
+                    if a1 is None:
+                        continue
+                    n = period(rhs)
+                    choices = [a1[rk]] if rk in a1 else range(n)
+                    for roff in choices:
+                        mid = shifted(rhs, roff)
+                        if mid is None:
+                            continue
+                        a2 = bind(a1, rk, roff)
+                        if a2 is None:
+                            continue
+                        if len(stages) == 1:
+                            if target[ti:ti + len(mid)] == mid:
+                                outer(si + len(lhs), ti + len(mid), a2)
+                        else:
+                            for end, a3 in lower(mid, 0, ti, a2):
+                                outer(si + len(lhs), end, a3)
+
+        outer(0, 0, {})
+        unique: dict[tuple, dict] = {}
+        for solution in solutions:
+            key = tuple(sorted(solution.items()))
+            unique.setdefault(key, solution)
+        return sorted(
+            unique.values(),
+            key=lambda a: (sum(a.values()), len(a), tuple(sorted(a.items()))),
+        )
+
     def _ed_infer_goals(
         self, grid: Grid, pitch: int,
         rows: list[tuple[int, list]], mut_y: int, mut_run: list,
@@ -5765,6 +6101,163 @@ class MyAgent(Agent):
                 seen.add(g)
                 out.append(g)
         return out[:ED_GOALS]
+
+    def _ed_meta_fail(self, level: int) -> None:
+        """Bench a contradicted altered-rule model without poisoning physics."""
+        self._ed_meta_mode = False
+        self._ed_meta_phase = ""
+        self._ed_meta_order.clear()
+        self._ed_meta_plan.clear()
+        self._ed_bench(level)
+
+    def _ed_meta_policy(
+        self, grid: Grid, pitch: int, layout: dict[str, Any], level: int,
+    ) -> Optional[GameAction]:
+        """Enumerate, calibrate, solve and execute a mutable-rule board.
+
+        Every control relationship is observed from the live board.  One full
+        selector cycle records the rule-side order; one closed glyph cycle per
+        backing-card type learns how a uniform side offset changes canonical
+        signatures.  Calibration always returns the rules to their starting
+        state before constraint synthesis.
+        """
+        if self._ed_meta_sel_act is None or self._ed_meta_cyc_act is None:
+            self._ed_meta_fail(level)
+            return None
+        sides = layout["sides"]
+        marker = self._ed_meta_marker(grid, pitch, sides)
+        if marker is None:
+            self._ed_meta_fail(level)
+            return None
+        sel_act, cyc_act = self._ed_meta_sel_act, self._ed_meta_cyc_act
+
+        while True:
+            if self._ed_meta_phase == "order":
+                first = self._ed_meta_order[0]
+                if marker == first:
+                    if len(self._ed_meta_order) != len(sides):
+                        self._ed_meta_fail(level)
+                        return None
+                    self._ed_meta_phase = "calib_nav"
+                else:
+                    if marker in self._ed_meta_order \
+                            or len(self._ed_meta_order) >= len(sides):
+                        self._ed_meta_fail(level)
+                        return None
+                    self._ed_meta_order.append(marker)
+                    return self._step(GameAction.from_id(sel_act))
+
+            if self._ed_meta_phase == "calib":
+                run = sides.get(marker)
+                now = self._ed_meta_tokens(run) if run is not None else tuple()
+                if not now or any(r != self._ed_meta_calib_ring
+                                  for r, _sig in now) \
+                        or len(now) != len(self._ed_meta_calib_prev):
+                    self._ed_meta_fail(level)
+                    return None
+                for (old_ring, old), (new_ring, new) in zip(
+                        self._ed_meta_calib_prev, now):
+                    if old_ring != new_ring:
+                        self._ed_meta_fail(level)
+                        return None
+                    prior = self._ed_meta_calib_map.get(old)
+                    if prior is not None and prior != new:
+                        self._ed_meta_fail(level)
+                        return None
+                    self._ed_meta_calib_map[old] = new
+                self._ed_meta_calib_steps += 1
+                if now == self._ed_meta_calib_start:
+                    if self._ed_meta_calib_steps < 2 \
+                            or not self._ed_meta_cycle_ready(
+                                self._ed_meta_calib_map):
+                        self._ed_meta_fail(level)
+                        return None
+                    ring = self._ed_meta_calib_ring
+                    assert ring is not None
+                    self._ed_meta_cycles[(cyc_act, ring)] = dict(
+                        self._ed_meta_calib_map)
+                    self._ed_meta_calib_ring = None
+                    self._ed_meta_calib_start = tuple()
+                    self._ed_meta_calib_prev = tuple()
+                    self._ed_meta_calib_map.clear()
+                    self._ed_meta_calib_steps = 0
+                    self._ed_meta_phase = "calib_nav"
+                elif self._ed_meta_calib_steps >= ED_CYCLE_CAP:
+                    self._ed_meta_fail(level)
+                    return None
+                else:
+                    self._ed_meta_calib_prev = now
+                    return self._step(GameAction.from_id(cyc_act))
+
+            if self._ed_meta_phase == "calib_nav":
+                rings = sorted({run[0][1] for run in sides.values()})
+                missing = [
+                    ring for ring in rings
+                    if not self._ed_meta_cycle_ready(
+                        self._ed_meta_cycles.get((cyc_act, ring), {}))
+                    or any(
+                        sig not in self._ed_meta_cycles.get(
+                            (cyc_act, ring), {})
+                        for run in sides.values()
+                        for token_ring, sig in self._ed_meta_tokens(run)
+                        if token_ring == ring
+                    )
+                ]
+                if not missing:
+                    self._ed_meta_phase = "solve"
+                    continue
+                wanted = missing[0]
+                run = sides[marker]
+                if run[0][1] != wanted:
+                    return self._step(GameAction.from_id(sel_act))
+                start = self._ed_meta_tokens(run)
+                if not start or any(ring != wanted for ring, _sig in start):
+                    self._ed_meta_fail(level)
+                    return None
+                self._ed_meta_calib_ring = wanted
+                self._ed_meta_calib_start = start
+                self._ed_meta_calib_prev = start
+                self._ed_meta_calib_map.clear()
+                self._ed_meta_calib_steps = 0
+                self._ed_meta_phase = "calib"
+                return self._step(GameAction.from_id(cyc_act))
+
+            if self._ed_meta_phase == "solve":
+                cycles = {
+                    ring: self._ed_meta_cycles[(cyc_act, ring)]
+                    for ring in {run[0][1] for run in sides.values()}
+                    if (cyc_act, ring) in self._ed_meta_cycles
+                }
+                solutions = self._ed_meta_solutions(layout, cycles)
+                if not solutions or marker not in self._ed_meta_order:
+                    self._ed_meta_fail(level)
+                    return None
+                best = solutions[0]
+                if not any(best.values()):
+                    self._ed_meta_fail(level)
+                    return None
+                start = self._ed_meta_order.index(marker)
+                plan: deque[int] = deque()
+                for step in range(len(self._ed_meta_order)):
+                    side = self._ed_meta_order[
+                        (start + step) % len(self._ed_meta_order)]
+                    plan.extend([cyc_act] * best.get(side, 0))
+                    if step + 1 < len(self._ed_meta_order):
+                        plan.append(sel_act)
+                self._ed_meta_plan = plan
+                self._ed_meta_phase = "exec"
+
+            if self._ed_meta_phase == "exec":
+                if not self._ed_meta_plan:
+                    # A semantically valid assignment wins on its final
+                    # mutation.  Reaching another policy call falsifies it.
+                    self._ed_meta_fail(level)
+                    return None
+                return self._step(
+                    GameAction.from_id(self._ed_meta_plan.popleft()))
+
+            self._ed_meta_fail(level)
+            return None
 
     def _ed_bench(self, level: int) -> None:
         self._ed_benched = level
@@ -5861,6 +6354,32 @@ class MyAgent(Agent):
         cards = self._ed_cards(grid, pitch)
         rows = self._ed_rows(cards, pitch)
         cyc_act = max(cyc, key=lambda a: self._ed_class[a]["mut"])
+        meta_layout = self._ed_meta_layout(grid, pitch, rows)
+        if self._ed_meta_mode:
+            if meta_layout is None:
+                self._ed_meta_fail(level)
+                return None
+            return self._ed_meta_policy(grid, pitch, meta_layout, level)
+        # ALTERED-RULE GATE: normal levels mutate one card in the unpaired
+        # answer row.  Enter the stronger meta-editor only when both the live
+        # bracket cursor and the newest compact mutation hit the SAME paired
+        # rule side on a structurally complete root->...->sink board.
+        if meta_layout is not None and self._ed_boxes \
+                and self._prev_action == str(cyc_act):
+            meta_marker = self._ed_meta_marker(
+                grid, pitch, meta_layout["sides"])
+            box = self._ed_boxes[-1]
+            if meta_marker is not None:
+                if self._ed_meta_rule_hit(box, meta_marker, pitch):
+                    if self._ed_meta_cyc_act not in cyc:
+                        self._ed_meta_cyc_act = cyc_act
+                    self._ed_meta_sel_act = int(
+                        self._ed_sel_step(sel, 1).value)
+                    self._ed_meta_mode = True
+                    self._ed_meta_phase = "order"
+                    self._ed_meta_order = [meta_marker]
+                    return self._step(GameAction.from_id(
+                        self._ed_meta_sel_act))
         mut_y, mut_run = -1, None
         for box in reversed(self._ed_boxes):
             cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2

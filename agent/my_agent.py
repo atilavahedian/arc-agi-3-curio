@@ -241,6 +241,13 @@ OV_TRANSFORM_STATE_CAP = 100000  # joint shape x position x colour BFS
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
+PANEL_SPELL_MASKS = {
+    frozenset({(0, 1), (1, 0), (1, 2), (2, 1)}): "scale",
+    frozenset({(0, 0), (0, 1), (1, 1)}): "teleport",
+    frozenset({(0, 1), (1, 1), (2, 1)}): "fire",
+}
+                        # normalized program glyphs proved by a matching
+                        # framed clue card; positions are (row, column)
 SORT_MIN_TARGETS = 4    # equal-size hollow boxes in a horizontal run before the
                         # sequence-match head trusts a target row.  Round 6
                         # tighten: raised 3->4 — a 3-box row is a plausible
@@ -407,6 +414,7 @@ def background_of(grid: Grid) -> int:
 
 def panel_actor(
     grid: Grid, expected_colors: Optional[tuple[int, int]] = None,
+    require_lane: bool = True,
 ) -> Optional[dict[str, Any]]:
     """Find a compact two-colour body and a larger same-palette socket.
 
@@ -458,7 +466,8 @@ def panel_actor(
                 sx0, sy0, sx1, sy1 = socket["bbox"]
                 same_lane = not (mx1 < sx0 or sx1 < mx0) \
                     or not (my1 < sy0 or sy1 < my0)
-                if not same_lane or mover["cells"] & socket["cells"]:
+                if (require_lane and not same_lane) \
+                        or mover["cells"] & socket["cells"]:
                     continue
                 separation = abs(mx - sx) + abs(my - sy)
                 if separation <= 0:
@@ -474,6 +483,323 @@ def panel_actor(
     if len(candidates) != 1:
         return None
     return candidates[0][1]
+
+
+def panel_drive(
+    mover_bbox: tuple[int, int, int, int],
+    goal_bbox: tuple[int, int, int, int],
+) -> Optional[tuple[int, Cell]]:
+    """Choose one cardinal step that closes a rectangle-to-rectangle gap.
+
+    Horizontal separation is closed first, then vertical separation.  This
+    agrees with the original straight-lane selector macro and also gives a
+    deterministic L-shaped route when a spell removes the corner blocker.
+    """
+    mx0, my0, mx1, my1 = mover_bbox
+    gx0, gy0, gx1, gy1 = goal_bbox
+    if gx1 < mx0:
+        return GameAction.ACTION3.value, (-1, 0)
+    if gx0 > mx1:
+        return GameAction.ACTION4.value, (1, 0)
+    if gy1 < my0:
+        return GameAction.ACTION1.value, (0, -1)
+    if gy0 > my1:
+        return GameAction.ACTION2.value, (0, 1)
+    return None
+
+
+def spell_drive(
+    mover: dict[str, Any], goal: dict[str, Any],
+) -> Optional[tuple[int, Cell]]:
+    """Choose the next leg of a monotonic L-shaped spell route.
+
+    Once one axis overlaps, close the other.  While both are separated,
+    close the larger center gap (horizontal on a tie).  This naturally bends
+    around a just-removed corner gate instead of walking into its old wall.
+    """
+    mx0, my0, mx1, my1 = mover["bbox"]
+    gx0, gy0, gx1, gy1 = goal["bbox"]
+    x_overlap = not (mx1 < gx0 or gx1 < mx0)
+    y_overlap = not (my1 < gy0 or gy1 < my0)
+    if x_overlap and y_overlap:
+        return None
+    mcx, mcy = mover["center"]
+    gcx, gcy = goal["center"]
+    horizontal = y_overlap or (
+        not x_overlap and abs(mcx - gcx) >= abs(mcy - gcy)
+    )
+    if horizontal:
+        return ((GameAction.ACTION3.value, (-1, 0))
+                if gcx < mcx else (GameAction.ACTION4.value, (1, 0)))
+    return ((GameAction.ACTION1.value, (0, -1))
+            if gcy < mcy else (GameAction.ACTION2.value, (0, 1)))
+
+
+def spell_program_setup(
+    grid: Grid, available_actions: set[int],
+) -> Optional[dict[str, Any]]:
+    """Read a framed 3x3 spell program and its matching clue card.
+
+    This is deliberately separate from ``panel_macro_setup``: the established
+    four-cell scale tutorial keeps its exact old path, while three-cell
+    teleport/fire programs get a narrow extension.  Geometry and palette are
+    inferred from pixels; no game id, absolute coordinate or fixed color is
+    part of the detector.
+    """
+    if frozenset(available_actions) != PANEL_ACTIONS:
+        return None
+    comps = components(grid)
+    programs: list[dict[str, Any]] = []
+
+    # The program board is one square scaffold component.  Its two-pixel
+    # border/separators surround nine equal solid cells on a single pitch:
+    # frame_side = 3 * pitch + 2, cell_side = pitch - 2.
+    for scaffold_raw, frame_cells in comps:
+        scaffold = int(scaffold_raw)
+        xs = [x for x, _y in frame_cells]
+        ys = [y for _x, y in frame_cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if width != height or not 13 <= width <= 23 \
+                or (width - 2) % 3:
+            continue
+        pitch = (width - 2) // 3
+        side = pitch - 2
+        if not 2 <= side <= 6:
+            continue
+        cells: list[tuple[Cell, int]] = []
+        cell_pixels: set[Cell] = set()
+        ok = True
+        for row in range(3):
+            for col in range(3):
+                cx0 = x0 + 2 + col * pitch
+                cy0 = y0 + 2 + row * pitch
+                vals = {
+                    grid[y][x]
+                    for y in range(cy0, cy0 + side)
+                    for x in range(cx0, cx0 + side)
+                }
+                if len(vals) != 1 or scaffold in vals:
+                    ok = False
+                    break
+                value = next(iter(vals))
+                center = (cx0 + side // 2, cy0 + side // 2)
+                cells.append((center, value))
+                cell_pixels.update(
+                    (x, y)
+                    for y in range(cy0, cy0 + side)
+                    for x in range(cx0, cx0 + side)
+                )
+            if not ok:
+                break
+        if not ok:
+            continue
+        full = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+        }
+        if set(frame_cells) != full - cell_pixels:
+            continue
+        values = Counter(value for _center, value in cells)
+        if sorted(values.values()) != [3, 6]:
+            continue
+        active = next(value for value, n in values.items() if n == 3)
+        base = next(value for value, n in values.items() if n == 6)
+        mask = frozenset(
+            (i // 3, i % 3)
+            for i, (_center, value) in enumerate(cells)
+            if value == active
+        )
+        mode = PANEL_SPELL_MASKS.get(mask)
+        if mode not in {"teleport", "fire"}:
+            continue
+        programs.append({
+            "mode": mode,
+            "mask": mask,
+            "base": base,
+            "active": active,
+            "scaffold": scaffold,
+            "centers": [center for center, _value in cells],
+            "clicks": [
+                cells[row * 3 + col][0]
+                for row, col in sorted(mask)
+            ],
+            "frame": frame_cells,
+        })
+    if len(programs) != 1:
+        return None
+    program = programs[0]
+
+    # The clue is an exact monochrome perimeter in the same scaffold color.
+    # Its 3x3 interior uses one-pixel gutters and a single non-base glyph
+    # color whose normalized mask must equal the program mask.
+    clues: list[tuple[int, Cell]] = []
+    for color_raw, card_cells in comps:
+        if int(color_raw) != program["scaffold"] \
+                or card_cells == program["frame"]:
+            continue
+        xs = [x for x, _y in card_cells]
+        ys = [y for _x, y in card_cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if width != height or not 8 <= width <= 16:
+            continue
+        perimeter = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+            if x in (x0, x1) or y in (y0, y1)
+        }
+        if set(card_cells) != perimeter or (width - 4) % 3:
+            continue
+        side = (width - 4) // 3
+        if side < 1:
+            continue
+        pitch = side + 1
+        samples: list[tuple[Cell, int]] = []
+        ok = True
+        for row in range(3):
+            for col in range(3):
+                sx0 = x0 + 1 + col * pitch
+                sy0 = y0 + 1 + row * pitch
+                vals = {
+                    grid[y][x]
+                    for y in range(sy0, sy0 + side)
+                    for x in range(sx0, sx0 + side)
+                }
+                if len(vals) != 1:
+                    ok = False
+                    break
+                samples.append(((sx0 + side // 2, sy0 + side // 2),
+                                next(iter(vals))))
+            if not ok:
+                break
+        if not ok:
+            continue
+        clue_values = Counter(value for _cell, value in samples)
+        if clue_values.get(program["base"]) != 6 \
+                or sorted(clue_values.values()) != [3, 6]:
+            continue
+        spell_colors = [
+            value for value, n in clue_values.items()
+            if value != program["base"] and n == 3
+        ]
+        if len(spell_colors) != 1:
+            continue
+        spell_color = spell_colors[0]
+        clue_mask = frozenset(
+            (i // 3, i % 3)
+            for i, (_cell, value) in enumerate(samples)
+            if value == spell_color
+        )
+        if clue_mask == program["mask"]:
+            clue_click = min(
+                (cell for cell, value in samples if value == spell_color),
+                key=lambda p: (p[1], p[0]),
+            )
+            clues.append((spell_color, clue_click))
+    if len(clues) != 1:
+        return None
+
+    actor = panel_actor(grid, require_lane=False)
+    if actor is None:
+        return None
+    drive = panel_drive(actor["mover"]["bbox"], actor["socket"]["bbox"])
+    if drive is None:
+        return None
+    spell_color, clue_click = clues[0]
+    orient: Optional[int] = None
+    effect_pixels: tuple[tuple[int, int, int], ...] = tuple()
+    if program["mode"] == "fire":
+        # The fire target is a compact solid two-color rectangle whose outer
+        # component uses the clue color and which is cardinally aligned with
+        # the actor.  Preserve its exact pixels to prove the cast took effect.
+        targets: list[tuple[int, int, tuple]] = []
+        mx0, my0, mx1, my1 = actor["mover"]["bbox"]
+        for i, (c1_raw, cells1) in enumerate(comps):
+            for c2_raw, cells2 in comps[i + 1:]:
+                c1, c2 = int(c1_raw), int(c2_raw)
+                if c1 == c2 or spell_color not in (c1, c2):
+                    continue
+                cells = set(cells1 | cells2)
+                xs = [x for x, _y in cells]
+                ys = [y for _x, y in cells]
+                tx0, tx1 = min(xs), max(xs)
+                ty0, ty1 = min(ys), max(ys)
+                width, height = tx1 - tx0 + 1, ty1 - ty0 + 1
+                if width != height or not 3 <= width <= 6 \
+                        or len(cells) != width * height:
+                    continue
+                spell_cells = cells1 if c1 == spell_color else cells2
+                key_cells = cells2 if c1 == spell_color else cells1
+                key_color = c2 if c1 == spell_color else c1
+                perimeter = {
+                    (x, y) for y in range(ty0, ty1 + 1)
+                    for x in range(tx0, tx1 + 1)
+                    if x in (tx0, tx1) or y in (ty0, ty1)
+                }
+                if set(spell_cells) != perimeter \
+                        or set(key_cells) != cells - perimeter:
+                    continue
+                # A separate object of the interior key color is the linked
+                # gate: ring + remote matching key is much stronger evidence
+                # than an incidental two-color decoration.
+                linked = False
+                for other_color, other_cells in comps:
+                    if int(other_color) != key_color \
+                            or set(other_cells) & cells \
+                            or len(other_cells) < len(key_cells):
+                        continue
+                    ox = [x for x, _y in other_cells]
+                    oy = [y for _x, y in other_cells]
+                    ow = max(ox) - min(ox) + 1
+                    oh = max(oy) - min(oy) + 1
+                    if 2 <= min(ow, oh) and max(ow, oh) <= 8 \
+                            and len(other_cells) == ow * oh:
+                        linked = True
+                        break
+                if not linked:
+                    continue
+                action = None
+                distance = 0
+                if not (my1 < ty0 or ty1 < my0):
+                    if tx1 < mx0:
+                        action, distance = GameAction.ACTION3.value, mx0 - tx1
+                    elif tx0 > mx1:
+                        action, distance = GameAction.ACTION4.value, tx0 - mx1
+                elif not (mx1 < tx0 or tx1 < mx0):
+                    if ty1 < my0:
+                        action, distance = GameAction.ACTION1.value, my0 - ty1
+                    elif ty0 > my1:
+                        action, distance = GameAction.ACTION2.value, ty0 - my1
+                if action is not None:
+                    pixels = tuple(sorted(
+                        (x, y, grid[y][x]) for x, y in cells
+                    ))
+                    targets.append((distance, action, pixels))
+        if len(targets) != 1:
+            return None
+        _distance, orient, effect_pixels = targets[0]
+
+    return {
+        "mode": program["mode"],
+        "clicks": program["clicks"],
+        "clue_click": clue_click,
+        "actor_colors": actor["colors"],
+        "actor_pixels": actor["mover"]["pixels"],
+        "actor_center": actor["mover"]["center"],
+        "goal_center": actor["socket"]["center"],
+        "goal_pixels": actor["socket"]["pixels"],
+        "goal_bbox": actor["socket"]["bbox"],
+        "goal_signature": tuple(sorted(
+            (x, y, grid[y][x]) for x, y in actor["socket"]["cells"]
+        )),
+        "drive": drive[0],
+        "direction": drive[1],
+        "orient": orient,
+        "effect_pixels": effect_pixels,
+    }
 
 
 def panel_macro_setup(
@@ -2357,6 +2683,28 @@ class MyAgent(Agent):
         self._panel_steps = 0
         self._panel_engaged = False
         self._panel_benched: Optional[int] = None
+        # ── three-cell spell programs: same exact visual grammar as the
+        # selector tutorial, but teleport/fire have distinct cast proofs.
+        # Kept separate so the already-proven four-cell L1 path is unchanged.
+        self._spell_level = -1
+        self._spell_mode: Optional[str] = None
+        self._spell_clicks: deque[Cell] = deque()
+        self._spell_colors: Optional[tuple[int, int]] = None
+        self._spell_initial_pixels = 0
+        self._spell_initial_center: Optional[tuple[float, float]] = None
+        self._spell_mover_pixels = 0
+        self._spell_goal: Optional[tuple[float, float]] = None
+        self._spell_goal_pixels = 0
+        self._spell_goal_bbox: Optional[tuple[int, int, int, int]] = None
+        self._spell_goal_signature: tuple[tuple[int, int, int], ...] = tuple()
+        self._spell_orient: Optional[int] = None
+        self._spell_effect_pixels: tuple[tuple[int, int, int], ...] = tuple()
+        self._spell_last_dist: Optional[float] = None
+        self._spell_last_center: Optional[tuple[float, float]] = None
+        self._spell_direction: Optional[Cell] = None
+        self._spell_steps = 0
+        self._spell_engaged = False
+        self._spell_benched: Optional[int] = None
         # ── editor model (tr87 family): cursor + in-place glyph cycling ──
         # verb classifications, marker votes, step deltas and probe spend
         # are physics (what an action DOES looks the same on every level);
@@ -2597,6 +2945,9 @@ class MyAgent(Agent):
             if self._panel_engaged:
                 self._panel_benched = latest_frame.levels_completed
             self._panel_clear(level=latest_frame.levels_completed)
+            if self._spell_engaged:
+                self._spell_benched = latest_frame.levels_completed
+            self._spell_clear(level=latest_frame.levels_completed)
             # the editor's level replays deterministically too: keep the
             # mutate boxes and goal candidates, give a benched run a fresh
             # life (strikes die with the budget that earned them)
@@ -2761,6 +3112,8 @@ class MyAgent(Agent):
             self._ov_idprobe = 0
             self._panel_clear(level=latest_frame.levels_completed)
             self._panel_benched = None
+            self._spell_clear(level=latest_frame.levels_completed)
+            self._spell_benched = None
             # switch geography: masks, phase patches, fall bans and probe
             # spend are positional level data (footprint passability — the
             # _stepped/_block signature stores — is appearance physics)
@@ -2854,6 +3207,7 @@ class MyAgent(Agent):
             self._wp_replay = None
             self._wp_pending_start = True
             self._panel_clear(level=latest_frame.levels_completed)
+            self._spell_clear(level=latest_frame.levels_completed)
         elif self._prev_action is not None:
             self._wp_log.append((key, self._prev_action))
         self._prev_grid = grid
@@ -4238,6 +4592,200 @@ class MyAgent(Agent):
 
         self._panel_fail(level)
         return None
+
+    # ── three-cell spell macro: clue -> cast -> actor route ──────────
+    def _spell_clear(self, *, level: Optional[int] = None) -> None:
+        """Clear per-level spell runtime state without changing its bench."""
+        if level is not None:
+            self._spell_level = level
+        self._spell_mode = None
+        self._spell_clicks.clear()
+        self._spell_colors = None
+        self._spell_initial_pixels = 0
+        self._spell_initial_center = None
+        self._spell_mover_pixels = 0
+        self._spell_goal = None
+        self._spell_goal_pixels = 0
+        self._spell_goal_bbox = None
+        self._spell_goal_signature = tuple()
+        self._spell_orient = None
+        self._spell_effect_pixels = tuple()
+        self._spell_last_dist = None
+        self._spell_last_center = None
+        self._spell_direction = None
+        self._spell_steps = 0
+        self._spell_engaged = False
+
+    def _spell_fail(self, level: int) -> None:
+        self._spell_clear(level=level)
+        self._spell_benched = level
+
+    def _spell_contact_actor(self, grid: Grid) -> Optional[dict[str, Any]]:
+        """Recover an actor touching its same-palette immutable goal.
+
+        Color-wise connected-component pairing merges the two rectangles at
+        contact.  The goal was captured before acting, so after proving every
+        one of its pixels unchanged we subtract that footprint and require one
+        residual solid actor rectangle of the original size.
+        """
+        if self._spell_colors is None or not self._spell_goal_signature:
+            return None
+        if not all(grid[y][x] == value
+                   for x, y, value in self._spell_goal_signature):
+            return None
+        goal_cells = {(x, y) for x, y, _value in self._spell_goal_signature}
+        pixels = {
+            (x, y)
+            for y, row in enumerate(grid)
+            for x, value in enumerate(row)
+            if value in self._spell_colors and (x, y) not in goal_cells
+        }
+        blobs = pixel_blobs(frozenset(pixels))
+        candidates: list[dict[str, Any]] = []
+        for blob in blobs:
+            cells = set(blob)
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            width, height = x1 - x0 + 1, y1 - y0 + 1
+            if len(cells) != width * height \
+                    or len(cells) != self._spell_initial_pixels \
+                    or max(width, height) > 12:
+                continue
+            candidates.append({
+                "cells": frozenset(cells),
+                "pixels": len(cells),
+                "bbox": (x0, y0, x1, y1),
+                "center": ((x0 + x1) / 2, (y0 + y1) / 2),
+            })
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _spell_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData,
+    ) -> Optional[GameAction]:
+        """Execute a visually proved teleport or directional-fire program."""
+        if grid is None:
+            return None
+        level = latest_frame.levels_completed
+        if self._spell_level != level:
+            self._spell_clear(level=level)
+            if self._spell_benched != level:
+                self._spell_benched = None
+        if self._spell_benched == level:
+            return None
+        avail = set(latest_frame.available_actions or [])
+        if frozenset(avail) != PANEL_ACTIONS:
+            if self._spell_engaged:
+                self._spell_fail(level)
+            return None
+
+        if not self._spell_engaged:
+            setup = spell_program_setup(grid, avail)
+            if setup is None:
+                return None
+            self._spell_engaged = True
+            self._spell_mode = setup["mode"]
+            # The live program already displays exactly the clue mask, which
+            # proves that card is selected; click only the program cells.
+            self._spell_clicks = deque(setup["clicks"])
+            self._spell_colors = setup["actor_colors"]
+            self._spell_initial_pixels = setup["actor_pixels"]
+            self._spell_initial_center = setup["actor_center"]
+            self._spell_goal = setup["goal_center"]
+            self._spell_goal_pixels = setup["goal_pixels"]
+            self._spell_goal_bbox = setup["goal_bbox"]
+            self._spell_goal_signature = setup["goal_signature"]
+            self._spell_orient = setup["orient"]
+            self._spell_effect_pixels = setup["effect_pixels"]
+            self._spell_direction = setup["direction"]
+
+        # A directional spell uses an ordinary move as its facing control.
+        if self._spell_orient is not None:
+            action_id = self._spell_orient
+            self._spell_orient = None
+            return self._step(GameAction.from_id(action_id))
+
+        if self._spell_clicks:
+            x, y = self._spell_clicks.popleft()
+            action = GameAction.ACTION6
+            action.set_data({"x": x, "y": y})
+            action.reasoning = {"why": f"spell-program cell {(x, y)}"}
+            self._prev_action = f"6:{x},{y}"
+            return action
+
+        if self._spell_colors is None or self._spell_goal is None \
+                or self._spell_goal_bbox is None:
+            self._spell_fail(level)
+            return None
+        actor = panel_actor(grid, self._spell_colors, require_lane=False)
+        if actor is not None \
+                and (actor["socket"]["center"] != self._spell_goal
+                     or actor["socket"]["pixels"] != self._spell_goal_pixels):
+            actor = None
+        if actor is None:
+            mover = self._spell_contact_actor(grid)
+            if mover is None:
+                self._spell_fail(level)
+                return None
+            goal_cells = frozenset(
+                (x, y) for x, y, _value in self._spell_goal_signature)
+            actor = {
+                "mover": mover,
+                "socket": {
+                    "cells": goal_cells,
+                    "pixels": self._spell_goal_pixels,
+                    "bbox": self._spell_goal_bbox,
+                    "center": self._spell_goal,
+                },
+            }
+        mover = actor["mover"]
+        pixels = mover["pixels"]
+        center = mover["center"]
+        if self._spell_mover_pixels == 0:
+            if pixels != self._spell_initial_pixels:
+                self._spell_fail(level)
+                return None
+            if self._spell_mode == "teleport" \
+                    and center == self._spell_initial_center:
+                self._spell_fail(level)
+                return None
+            if self._spell_mode == "fire" \
+                    and self._spell_effect_pixels \
+                    and all(grid[y][x] == value
+                            for x, y, value in self._spell_effect_pixels):
+                self._spell_fail(level)
+                return None
+            self._spell_mover_pixels = pixels
+        elif pixels != self._spell_mover_pixels:
+            self._spell_fail(level)
+            return None
+
+        gx, gy = self._spell_goal
+        dist = abs(center[0] - gx) + abs(center[1] - gy)
+        if self._spell_last_center is not None \
+                and self._spell_last_dist is not None:
+            dx = center[0] - self._spell_last_center[0]
+            dy = center[1] - self._spell_last_center[1]
+            direction = (
+                0 if dx == 0 else (1 if dx > 0 else -1),
+                0 if dy == 0 else (1 if dy > 0 else -1),
+            )
+            if (dx == 0) == (dy == 0) \
+                    or direction != self._spell_direction \
+                    or dist >= self._spell_last_dist:
+                self._spell_fail(level)
+                return None
+
+        drive = spell_drive(mover, actor["socket"])
+        if drive is None or drive[0] not in avail or self._spell_steps >= 32:
+            self._spell_fail(level)
+            return None
+        self._spell_direction = drive[1]
+        self._spell_last_center = center
+        self._spell_last_dist = dist
+        self._spell_steps += 1
+        return self._step(GameAction.from_id(drive[0]))
 
     # ── overlay-align head (re86 family): cover static goal anchors ────────
     def _ov_outline(self, grid: Grid) -> Optional[int]:
@@ -6343,6 +6891,14 @@ class MyAgent(Agent):
             panel = self._panel_policy(grid, latest_frame)
             if panel is not None:
                 return panel
+            # Three-cell spell programs share the exact panel/clue grammar,
+            # but prove either a footprint-preserving teleport or removal of
+            # a uniquely keyed directional lock before routing the actor.
+            # The four-cell selector tutorial above remains byte-for-byte on
+            # its established runtime path.
+            spell = self._spell_policy(grid, latest_frame)
+            if spell is not None:
+                return spell
             # Rich selected-piece overlays must claim their first clean frame
             # before generic slide/editor probes can mistake a transform or a
             # dense pad layout for their own mechanics.  The compound gate is

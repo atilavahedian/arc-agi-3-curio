@@ -11,15 +11,14 @@ where the walls are, and what the goal is — then plans toward it.
 ## Current evidence
 
 The latest competition submission scored **0.18**. Source-hash and timestamp
-auditing tied that run to commit `29e278a`; it predates the current solver by
-seven capability commits. The current head has not yet received a leaderboard
-score.
+auditing tied that run to commit `29e278a`; it predates multiple later solver
+capabilities. The current head has not yet received a leaderboard score.
 
-The current source has independently verified complete local wins on five
+The current source has independently verified complete local wins on six
 official campaigns: `re86` (8 levels, 552 actions), `cn04` (328 actions),
-`ft09` (124), `tr87` (242), and `sc25` (147). These checks prove those
-implementations against the official local environments; they do not predict
-hidden-game generalization.
+`ft09` (124), `tr87` (242), `sc25` (147), and `ka59` (7 levels, 313
+actions). These checks prove those implementations against the official local
+environments; they do not predict hidden-game generalization.
 
 The scoring metric squares `human_baseline_actions / agent_actions`, caps the
 per-level value at 1.15, weights later levels more heavily, and averages across
@@ -37,7 +36,8 @@ of cooperating capabilities, each added and verified independently:
   movement-rule voting from frame diffs; soft-wall mapping; BFS route planning.
 - **Puzzle solvers** — a lattice/recolor model with an exact GF(2) solver,
   attribute-state product-graph planning, structural port assembly, typed
-  editor-rule synthesis, and visual spell-program execution.
+  editor-rule synthesis, visual spell-program execution, and a frame-derived
+  kinetic push simulator with weighted state-space planning.
 - **Memory & efficiency** — a persistent click-affordance library and
   first-discovery speed tuning, because the metric squares efficiency.
 - **Graph exploration** — a state graph with salience-ranked action frontiers,

@@ -76,6 +76,29 @@ results at a 1,000-action cap:
 
 `re86` also remains an 8-level WIN in 552 actions on the fixed proxy runs.
 
+## Kinetic-push promotion gate
+
+Commit `e3170f0` adds an original frame-derived selected-piece, collision,
+socket, force-surface, and countdown model with closed-loop weighted planning.
+It contains no game or level dispatch, fixed board coordinates, or scripted
+solution path.
+
+Exact official seed-0 result from the committed `main` tree:
+
+| Game | Result | Actions | Scorecard |
+|---|---:|---:|---:|
+| ka59 | 7/7 WIN | 313 | 100.0 |
+
+Verification at promotion:
+
+- full unit suite: 120/120;
+- focused kinetic-push tests: 8/8;
+- all 25 official opening frames checked: only `ka59` passed the compound
+  action-and-pixel gate;
+- protected `re86`, `cn04`, `ft09`, `tr87`, and `sc25` wins unchanged;
+- `git diff --check`: clean;
+- independent read-only review: approved.
+
 ## Graph-backtracking promotion gate
 
 Commit `c7977cb` adds branch-complete, fatal-edge-safe backtracking. RESET is a
@@ -110,10 +133,8 @@ Verification at promotion:
 - `dc22`: current clean sweep is 4 levels. An original, frame-derived remote
   manipulator prototype reaches the level-5 upper branch; production handoff
   with the existing switch planner is in progress.
-- `ka59`: current sweep is 0 levels. An original symbolic diagnostic using only
-  the official local runtime solves all 7 stages in 291 actions. Production
-  work must infer the same selection, push, socket, and countdown mechanics
-  from frames; no fixed paths, coordinates, game IDs, or level IDs will ship.
+- `tu93`: repair late-stage avatar/goal tracking and promote the proved
+  time-aware hazard planner without regressing its early campaign levels.
 
 ## Reproduction
 

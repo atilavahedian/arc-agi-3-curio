@@ -2,7 +2,7 @@
 
 The current original candidate is **Curio Graph v16**. It is packaged separately
 at `submissions/curio-graph-v16/` so it cannot overwrite the historical default
-Curio kernel or the separately audited Duck candidate.
+Curio kernel.
 
 ## What Curio Graph v16 contains
 
@@ -10,7 +10,7 @@ Curio kernel or the separately audited Duck candidate.
 - `CURIO_EXPLORER=graph` baked into the Kaggle run command;
 - the official ARC-AGI-3 competition framework and wheels at runtime;
 - no external dataset, model, or kernel sources;
-- no Duck, TAAF, Qwen, vLLM, or other lab solver code.
+- no external solver, model, dataset, or kernel source.
 
 The kernel is private and has internet disabled. The validator compares the
 embedded agent byte-for-byte with the repository source before any push.

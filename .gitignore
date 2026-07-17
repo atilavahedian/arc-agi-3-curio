@@ -3,9 +3,6 @@ vendor/
 environment_files/
 .kaggle/
 
-# Locally downloaded public competition references used for submission research.
-reference/community/
-reference/milestone1/tufa-source/
 __pycache__/
 *.pyc
 recordings/

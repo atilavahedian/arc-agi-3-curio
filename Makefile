@@ -1,9 +1,8 @@
 # ARC Prize 2026 — ARC-AGI-3 local dev workflow.
 #
-# Five commands cover the whole loop:
+# Four commands cover the whole loop:
 #   make setup        # one-time: venv + arc-agi + clone framework
 #   make play-local   # fast inner loop: run agent/my_agent.py on a real game
-#   make pull-sample  # fetch the official Stochastic Goose sample for reference
 #   make submit       # build notebook from agent/my_agent.py + push to Kaggle
 #   make status       # tail the latest Kaggle run
 
@@ -20,7 +19,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 submit-duck-v15 status-duck-v15 verify-duck-v15 verify-local clean _check-kaggle
+.PHONY: help setup play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -59,12 +58,6 @@ verify-local: ## Quick smoke test: 50 steps on ls20 + vc33 only
 list-games: ## Show all available games
 	$(VENV_PY) scripts/play_local.py --list
 
-pull-sample: _check-kaggle ## Download the official Stochastic Goose sample notebook for reference
-	mkdir -p reference/stochastic-goose
-	$(KAGGLE) kernels pull inversion/arc3-sample-submission-stochastic-goose \
-	    -p reference/stochastic-goose -m
-	@echo "Open reference/stochastic-goose/*.ipynb for the canonical pattern."
-
 notebook: ## Splice agent/my_agent.py into notebooks/submission.ipynb
 	$(VENV_PY) scripts/build_notebook.py
 
@@ -95,18 +88,6 @@ status-curio-graph-v16: _check-kaggle ## Show the Curio graph v16 kernel status
 	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/curio-graph-v16/kernel-metadata.json'))['id'])"); \
 	$(KAGGLE) kernels status $$KERNEL_ID
 
-verify-duck-v15: ## Validate the high-score Duck v15 notebook and Kaggle metadata
-	$(VENV_PY) scripts/validate_submission.py submissions/duck-v15
-
-submit-duck-v15: verify-duck-v15 _check-kaggle ## Push the separate Duck v15 high-score candidate kernel
-	$(KAGGLE) kernels push -p submissions/duck-v15/
-	@echo ""
-	@echo "Pushed Duck v15 candidate. Track it with: make status-duck-v15"
-
-status-duck-v15: _check-kaggle ## Show the Duck v15 candidate kernel status
-	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/duck-v15/kernel-metadata.json'))['id'])"); \
-	$(KAGGLE) kernels status $$KERNEL_ID
-
 clean: ## Remove generated artefacts (venv, downloaded games, vendored repos)
 	rm -rf $(VENV) vendor environment_files recordings notebooks/submission.ipynb \
-	       reference logs.log __pycache__ .pytest_cache
+	       logs.log __pycache__ .pytest_cache

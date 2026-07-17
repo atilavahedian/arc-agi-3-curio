@@ -226,6 +226,9 @@ SL_MIN_NODES = 12       # lattice nodes a board must expose before the slide hea
                         # clears this easily; an incidental two-colour tiling on a
                         # hidden non-maze game does not — keeps the head dormant
                         # unless the maze structure is unambiguous)
+SL_DYNAMIC_BFS_CAP = 20000  # joint (avatar, oriented-actor) states explored
+                             # by the time-aware maze planner before it yields
+SL_DYNAMIC_DEPTH = 96       # bounded horizon; official maze budgets are shorter
 OV_MIN_ANCHORS = 3      # hollow goal-overlay boxes the DOMINANT outline colour
                         # needs before the overlay-align head trusts the static-
                         # goal signature.  Round 6 tighten: raised 2->3 — two
@@ -4118,6 +4121,26 @@ class MyAgent(Agent):
         self._sl_corridor: Optional[int] = None   # learned passable color
         self._sl_blocked_edges: set[tuple[Cell, int]] = set()
         self._sl_lethal_edges: set[tuple[Cell, int]] = set()
+        # Stable frame-derived identities.  The first clean maze exposes one
+        # controlled 3x3 ``8 body + 1 accent`` glyph and one solid compact
+        # target.  Their appearances are physics and survive level changes;
+        # positions are per-level geography.  This prevents later hazard
+        # accents from stealing either identity merely because they occur
+        # earlier in scan order.
+        self._sl_player_sig: Optional[tuple[int, int]] = None
+        self._sl_player_center: Optional[Cell] = None
+        self._sl_goal_sig: Optional[tuple[int, int, int]] = None
+        self._sl_goal_node: Optional[Cell] = None
+        # Oriented non-player glyphs are learned causally from settled-frame
+        # transitions.  A body class that translates after a successful
+        # player move is autonomous; unseen classes are conservatively treated
+        # as stationary forward-trigger hazards until motion proves otherwise.
+        self._sl_actor_auto: set[int] = set()
+        self._sl_actor_base_accent: dict[int, int] = {}
+        self._sl_actor_trigger_range: dict[int, int] = {}
+        self._sl_actor_queues: dict[
+            tuple[int, Cell], tuple[Cell, ...]
+        ] = {}
         self._sl_level = -1
         self._sl_deaths_at_engage = 0
         self._sl_strikes = 0
@@ -4383,6 +4406,8 @@ class MyAgent(Agent):
             # void.
             self._sl_strikes = 0
             self._sl_benched = None
+            self._sl_player_center = None
+            self._sl_actor_queues.clear()
             # the sort level replays deterministically: void the in-flight
             # placement plan (the board rewinds to its empty start), refresh
             # the strikes/bench so a dead life's strikes don't carry over.
@@ -4585,6 +4610,9 @@ class MyAgent(Agent):
             self._sl_corridor = None
             self._sl_blocked_edges.clear()
             self._sl_lethal_edges.clear()
+            self._sl_player_center = None
+            self._sl_goal_node = None
+            self._sl_actor_queues.clear()
             self._sl_level = -1
             self._sl_deaths_at_engage = 0
             self._sl_strikes = 0
@@ -4651,6 +4679,7 @@ class MyAgent(Agent):
             self._panel_clear(level=latest_frame.levels_completed)
             self._spell_clear(level=latest_frame.levels_completed)
             self._spell_campaign_clear(level=latest_frame.levels_completed)
+            self._sl_actor_queues.clear()
         elif self._prev_action is not None:
             self._wp_log.append((key, self._prev_action))
         self._prev_grid = grid
@@ -8832,6 +8861,49 @@ class MyAgent(Agent):
         sig, n = self._avatar_sigs.most_common(1)[0]
         return sig if n >= VOTE_THRESHOLD else None
 
+    def _sl_glyphs(
+        self, grid: Grid
+    ) -> list[tuple[tuple[int, int], Cell, Cell, Cell]]:
+        """Return compact oriented ``8 body + 1 accent`` glyphs.
+
+        Each item is ``((body_color, accent_color), center, facing,
+        accent_cell)``.  The detector is purely geometric: no game, level,
+        color or coordinate is privileged.  Requiring an exact 3x3 body with
+        one cardinal-edge hole keeps ordinary maze blocks and HUD specks out.
+        """
+        out: list[tuple[tuple[int, int], Cell, Cell, Cell]] = []
+        cardinal = {(0, -1), (0, 1), (-1, 0), (1, 0)}
+        for body, cells0 in components(grid):
+            cells = set(cells0)
+            if len(cells) != 8:
+                continue
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            if x1 - x0 != 2 or y1 - y0 != 2:
+                continue
+            holes = [
+                (x, y)
+                for y in range(y0, y1 + 1)
+                for x in range(x0, x1 + 1)
+                if (x, y) not in cells
+            ]
+            if len(holes) != 1:
+                continue
+            accent_cell = holes[0]
+            center = (x0 + 1, y0 + 1)
+            facing = (accent_cell[0] - center[0],
+                      accent_cell[1] - center[1])
+            if facing not in cardinal:
+                continue
+            accent = grid[accent_cell[1]][accent_cell[0]]
+            if accent == body:
+                continue
+            out.append(((body, accent), center, facing, accent_cell))
+        out.sort(key=lambda item: (item[1], item[0], item[2]))
+        return out
+
     def _sl_avatar_anchor(
         self, grid: Grid
     ) -> Optional[tuple[Cell, int]]:
@@ -8840,6 +8912,23 @@ class MyAgent(Agent):
         a handful).  Returns (anchor cell, color), or None when no unique
         rare accent exists (most games — this keeps the slide observer inert).
         Pure read; never mutates state."""
+        # Once a controlled glyph has been confirmed, appearance is a much
+        # stronger identity than global rarity.  If another glyph shares the
+        # appearance, continuity selects the closest hypothesis; this matters
+        # when a same-looking hazard emerges later in a campaign.
+        player_sig = getattr(self, "_sl_player_sig", None)
+        if player_sig is not None:
+            matches = [item for item in self._sl_glyphs(grid)
+                       if item[0] == player_sig]
+            if matches:
+                previous = getattr(self, "_sl_player_center", None)
+                if previous is not None:
+                    matches.sort(key=lambda item: (
+                        abs(item[1][0] - previous[0])
+                        + abs(item[1][1] - previous[1]), item[1]))
+                _sig, _center, _facing, accent_cell = matches[0]
+                return (accent_cell, player_sig[1])
+
         counts: Counter[int] = Counter()
         for row in grid:
             counts.update(row)
@@ -10584,36 +10673,57 @@ class MyAgent(Agent):
     def _sl_exit_node(
         self, grid: Grid, lat: tuple, av_cells: set
     ) -> Optional[Cell]:
-        """The rare-colour goal component (smallest non-board, non-avatar,
-        non-budget-bar blob), snapped to its lattice node."""
+        """Return the stable solid compact target on the maze lattice.
+
+        Oriented actors deliberately contain a one-pixel accent, so selecting
+        the globally smallest rare component mistakes that accent for the
+        exit as soon as hazards appear.  A target is instead a filled compact
+        square on a node.  Its appearance is learned on the first unambiguous
+        maze and reused across levels.
+        """
         pitch, ox, oy, nodes, cA, cB = lat
         counts: Counter[int] = Counter()
         for row in grid:
             counts.update(row)
         bg = counts.most_common(1)[0][0]
-        best: Optional[tuple[int, Cell]] = None
+        candidates: list[tuple[tuple[int, int, int], Cell]] = []
         for color, cells in components(grid):
             if color in (bg, cA, cB):
                 continue
             cs = set(cells)
             if cs & av_cells:
                 continue
-            ys = {y for _x, y in cs}
-            xs = {x for x, _y in cs}
-            # skip wide thin border strips (budget / status bars)
-            if len(cs) >= 20 and (len(ys) <= 2 or len(xs) <= 2):
+            xs = [x for x, _y in cs]
+            ys = [y for _x, y in cs]
+            w = max(xs) - min(xs) + 1
+            h = max(ys) - min(ys) + 1
+            if w != h or not 2 <= w <= 4 or len(cs) != w * h:
                 continue
-            if best is None or len(cs) < best[0]:
-                best = (len(cs), min(cs), cs)
-        if best is None:
+            center = ((min(xs) + max(xs)) // 2,
+                      (min(ys) + max(ys)) // 2)
+            node = self._sl_node(center, lat)
+            if node is not None and node in nodes:
+                candidates.append(((color, w, h), node))
+        goal_sig = getattr(self, "_sl_goal_sig", None)
+        if goal_sig is not None:
+            matches = [node for sig, node in candidates if sig == goal_sig]
+            if len(matches) == 1:
+                self._sl_goal_node = matches[0]
+                return matches[0]
+            # A mover can overlap and temporarily split/occlude the solid
+            # target.  Its per-level lattice node is immutable geography, so
+            # retain that frame-derived location while the appearance is
+            # hidden.  Requiring membership in the freshly parsed lattice
+            # prevents stale coordinates leaking across levels.
+            cached = getattr(self, "_sl_goal_node", None)
+            return cached if cached in nodes else None
+        # Do not guess among multiple decorations.  The clean opening maze is
+        # intentionally the identity calibration step.
+        if len(candidates) != 1:
             return None
-        # snap the exit blob's CENTRE (its min-corner can sit a half-block
-        # off a node when the goal sprite isn't block-aligned)
-        cs2 = best[2]
-        cx = (min(x for x, _y in cs2) + max(x for x, _y in cs2)) // 2
-        cy = (min(y for _x, y in cs2) + max(y for _x, y in cs2)) // 2
-        node = self._sl_node((cx, cy), lat)
-        return node if node is not None and node in nodes else None
+        self._sl_goal_sig = candidates[0][0]
+        self._sl_goal_node = candidates[0][1]
+        return candidates[0][1]
 
     def _sl_avatar_cells(
         self, grid: Grid, anchor: Cell, lat: Optional[tuple] = None
@@ -10645,6 +10755,9 @@ class MyAgent(Agent):
     ) -> Cell:
         """Bounding-box centre of the avatar body — a jitter-proof anchor for
         snapping (the accent's sub-offset varies, the body centre doesn't)."""
+        for _sig, center, _facing, accent_cell in self._sl_glyphs(grid):
+            if accent_cell == anchor:
+                return center
         cells = self._sl_avatar_cells(grid, anchor, lat)
         if not cells:
             return anchor
@@ -10685,13 +10798,326 @@ class MyAgent(Agent):
     def _sl_note_outcome(
         self, before: Grid, after: Grid, action: int
     ) -> None:
-        """Learn a blocked edge by comparing physical, HUD-free maze nodes."""
+        """Learn player and actor motion from settled, HUD-free maze nodes."""
         src = self._sl_node_at(before)
         dest = self._sl_node_at(after)
         if src is None or dest is None:
             return
         if src == dest:
             self._sl_blocked_edges.add((src, action))
+            # A blocked player action completes immediately; the maze actors
+            # do not advance.  It therefore carries no actor-motion evidence.
+            return
+        if not hasattr(self, "_sl_actor_auto"):
+            return
+        before_actors = self._sl_actor_states(before, src)
+        after_actors = self._sl_actor_states(after, dest)
+        by_body_before: dict[
+            int, list[tuple[int, Cell, Cell]]
+        ] = defaultdict(list)
+        by_body_after: dict[
+            int, list[tuple[int, Cell, Cell]]
+        ] = defaultdict(list)
+        for body, accent, center, facing in before_actors:
+            by_body_before[body].append((accent, center, facing))
+        for body, accent, center, facing in after_actors:
+            by_body_after[body].append((accent, center, facing))
+        pitch = max(abs(dest[0] - src[0]), abs(dest[1] - src[1]))
+        for body, old_states in by_body_before.items():
+            base = self._sl_actor_base_accent.setdefault(
+                body, old_states[0][0])
+            # A base->changed accent transition is explicit activation.  Its
+            # distance from the just-settled player along the actor's facing
+            # direction reveals the trigger range without any color, level or
+            # coordinate prior.  This distinguishes immediate one-node traps
+            # from delayed pursuers that visibly wake farther away.
+            old_active = sum(accent != base
+                             for accent, _center, _facing in old_states)
+            new_states = by_body_after.get(body, [])
+            new_active = sum(accent != base
+                             for accent, _center, _facing in new_states)
+            trigger_range = getattr(self, "_sl_actor_trigger_range", None)
+            if trigger_range is not None and new_active > old_active \
+                    and pitch > 0:
+                ranges: list[int] = []
+                for accent, center, facing in old_states:
+                    if accent != base:
+                        continue
+                    dx = dest[0] - center[0]
+                    dy = dest[1] - center[1]
+                    along = dx * facing[0] + dy * facing[1]
+                    cross = dx * facing[1] - dy * facing[0]
+                    if cross == 0 and along > 0 and along % pitch == 0:
+                        ranges.append(along // pitch)
+                if ranges:
+                    trigger_range[body] = min(ranges)
+            # Accent changes are visible activation evidence.  Those actors
+            # may translate after being triggered, but that must not promote
+            # every future base-accent instance of the same appearance to an
+            # always-moving actor.  Only unchanged base-accent translation is
+            # causal evidence for autonomous motion.
+            old_base = [(center, facing)
+                        for accent, center, facing in old_states
+                        if accent == base]
+            new_centers = [center for accent, center, _facing
+                           in by_body_after.get(body, [])
+                           if accent == base]
+            # Count changes mean activation, destruction or occlusion.  Even
+            # with equal counts, an actor hidden behind another sprite can
+            # reappear while a same-looking actor is destroyed.  Demand the
+            # stronger causal signature: every visible instance advances
+            # exactly one lattice step in its displayed direction.
+            expected = Counter(
+                (center[0] + facing[0] * pitch,
+                 center[1] + facing[1] * pitch)
+                for center, facing in old_base)
+            if pitch > 0 and old_base \
+                    and len(old_base) == len(new_centers) \
+                    and expected == Counter(new_centers):
+                self._sl_actor_auto.add(body)
+
+        # Delayed activated actors visibly follow a short direction queue.
+        # Track that queue only from matched settled-frame translations.  The
+        # key includes the current center so multiple identical pursuers are
+        # independent; destruction or occlusion simply drops an unmatched
+        # hypothesis.  A successful player direction enters the back of the
+        # queue while the actor consumes its displayed front direction.
+        actor_queues = getattr(self, "_sl_actor_queues", None)
+        trigger_ranges = getattr(self, "_sl_actor_trigger_range", {})
+        if actor_queues is not None and pitch > 0:
+            player_direction = (
+                (dest[0] - src[0]) // pitch,
+                (dest[1] - src[1]) // pitch,
+            )
+            next_queues: dict[tuple[int, Cell], tuple[Cell, ...]] = {}
+            used_after: set[tuple[int, int]] = set()
+            for body, old_states in by_body_before.items():
+                base = self._sl_actor_base_accent.get(
+                    body, old_states[0][0])
+                new_active = [
+                    (i, center, facing)
+                    for i, (accent, center, facing)
+                    in enumerate(by_body_after.get(body, []))
+                    if accent != base
+                ]
+                for accent, center, facing in old_states:
+                    if accent == base:
+                        continue
+                    expected_center = (
+                        center[0] + facing[0] * pitch,
+                        center[1] + facing[1] * pitch,
+                    )
+                    match = next((item for item in new_active
+                                  if (body, item[0]) not in used_after
+                                  and item[1] == expected_center), None)
+                    if match is None:
+                        continue
+                    idx, new_center, new_facing = match
+                    used_after.add((body, idx))
+                    queued = actor_queues.get((body, center))
+                    delay = trigger_ranges.get(body, 1)
+                    if queued is None and delay > 1:
+                        queued = (facing,) * delay
+                    if not queued:
+                        continue
+                    advanced = queued[1:] + (player_direction,)
+                    # The visible facing is ground truth for the next move;
+                    # correct only the exposed front if an occluded frame
+                    # made the hidden-tail inference stale.
+                    if advanced and advanced[0] != new_facing:
+                        advanced = (new_facing,) + advanced[1:]
+                    next_queues[(body, new_center)] = advanced
+
+            # Any unmatched active instance whose appearance has a learned
+            # multi-node activation range has just activated (or reappeared).
+            # At activation its visible direction fills the delay queue; later
+            # settled transitions replace this bootstrap with causal history.
+            for body, new_states in by_body_after.items():
+                delay = trigger_ranges.get(body, 1)
+                if delay <= 1:
+                    continue
+                base = self._sl_actor_base_accent.get(
+                    body, new_states[0][0])
+                for idx, (accent, center, facing) in enumerate(new_states):
+                    if accent == base or (body, idx) in used_after:
+                        continue
+                    next_queues[(body, center)] = (facing,) * delay
+            self._sl_actor_queues = next_queues
+
+    def _sl_actor_states(
+        self, grid: Grid, player_center: Optional[Cell]
+    ) -> list[tuple[int, int, Cell, Cell]]:
+        """Non-player oriented glyphs as body/accent/center/facing tuples."""
+        out: list[tuple[int, int, Cell, Cell]] = []
+        player_sig = getattr(self, "_sl_player_sig", None)
+        glyphs = self._sl_glyphs(grid)
+        # When appearances collide, the controlled glyph is the matching
+        # instance nearest the causally tracked player position.
+        player_idx: Optional[int] = None
+        if player_sig is not None:
+            matches = [i for i, item in enumerate(glyphs)
+                       if item[0] == player_sig]
+            if matches:
+                if player_center is None:
+                    player_idx = matches[0]
+                else:
+                    player_idx = min(matches, key=lambda i: (
+                        abs(glyphs[i][1][0] - player_center[0])
+                        + abs(glyphs[i][1][1] - player_center[1]),
+                        glyphs[i][1]))
+        for i, (sig, center, facing, _accent_cell) in enumerate(glyphs):
+            if i == player_idx:
+                continue
+            body, accent = sig
+            out.append((body, accent, center, facing))
+        return out
+
+    def _sl_passable(
+        self, grid: Grid, pos: Cell, direction: Cell,
+        pitch: int, corridor: int
+    ) -> bool:
+        """Whether the binary straddle in ``direction`` is a corridor."""
+        dx, dy = direction
+        half = pitch // 2
+        for ddx in (0, 1):
+            for ddy in (0, 1):
+                x = pos[0] + dx * half + ddx
+                y = pos[1] + dy * half + ddy
+                if 0 <= x < GRID and 0 <= y < GRID \
+                        and grid[y][x] == corridor:
+                    return True
+        return False
+
+    def _sl_dynamic_route(
+        self, grid: Grid, start: Cell, lat: tuple, corridor: int,
+        actors: list[tuple[int, int, Cell, Cell]], exit_node: Cell
+    ) -> Optional[list[int]]:
+        """Time-expanded BFS over avatar plus oriented actor state.
+
+        Unknown actor appearances use the conservative stationary-trigger
+        model.  Translation observed in a settled frame promotes that body
+        class to an autonomous bouncing mover.  An accent-state change means
+        the instance has activated.  A causally observed multi-node trigger
+        range supplies its short direction queue; otherwise only its immediate
+        displayed step is trusted.  Only the first real action is executed
+        before the model is rebuilt from the next settled frame.
+        """
+        pitch, _ox, _oy, nodes, _cA, _cB = lat
+        dirs = {1: (0, -1), 2: (0, 1), 3: (-1, 0), 4: (1, 0)}
+        dirs.update(self._sl_dirmap)
+
+        stationary: list[tuple[int, Cell, Cell]] = []
+        # Moving-state mode: 0 = one observed step only, 1 = autonomous
+        # corridor bounce, 2 = delayed follower with a learned FIFO of player
+        # directions.  A fixed tuple shape keeps BFS states hashable/sortable.
+        moving: list[
+            tuple[int, Cell, Cell, int, tuple[Cell, ...]]
+        ] = []
+        for body, accent, center, facing in actors:
+            base = self._sl_actor_base_accent.setdefault(body, accent)
+            if body in self._sl_actor_auto:
+                moving.append((body, center, facing, 1, tuple()))
+            elif accent != base:
+                delay = getattr(self, "_sl_actor_trigger_range", {}).get(
+                    body, 1)
+                queued = getattr(self, "_sl_actor_queues", {}).get(
+                    (body, center))
+                if delay > 1:
+                    queued = queued or (facing,) * delay
+                    if queued[0] != facing:
+                        queued = (facing,) + queued[1:]
+                    moving.append((body, center, facing, 2, queued))
+                else:
+                    moving.append((body, center, facing, 0, tuple()))
+            elif getattr(self, "_sl_actor_trigger_range", {}).get(
+                    body, 1) <= 1:
+                stationary.append((body, center, facing))
+
+        def translated(pos: Cell, direction: Cell) -> Cell:
+            if not self._sl_passable(
+                    grid, pos, direction, pitch, corridor):
+                return pos
+            candidate = (pos[0] + direction[0] * pitch,
+                         pos[1] + direction[1] * pitch)
+            return candidate if candidate in nodes else pos
+
+        start_state = (
+            start,
+            tuple(sorted(stationary)),
+            tuple(sorted(moving)),
+        )
+        seen = {start_state}
+        queue: deque[tuple[tuple, list[int]]] = deque([(start_state, [])])
+        while queue and len(seen) <= SL_DYNAMIC_BFS_CAP:
+            (pos, still, moving), path = queue.popleft()
+            if pos == exit_node:
+                return path
+            if len(path) >= SL_DYNAMIC_DEPTH:
+                continue
+            for action, direction in sorted(dirs.items()):
+                if action not in {1, 2, 3, 4} \
+                        or direction == (0, 0):
+                    continue
+                if (pos, action) in self._sl_blocked_edges \
+                        or (pos, action) in self._sl_lethal_edges:
+                    continue
+                dest = translated(pos, direction)
+                player_moved = dest != pos
+                next_still: list[tuple[int, Cell, Cell]] = []
+                lethal = False
+                for body, actor_pos, facing in still:
+                    # Player phase happens first: entering an occupied actor
+                    # node removes that actor before it can advance.
+                    if dest == actor_pos:
+                        continue
+                    forward = translated(actor_pos, facing)
+                    if player_moved and forward != actor_pos \
+                            and forward == dest:
+                        lethal = True
+                        break
+                    next_still.append((body, actor_pos, facing))
+                if lethal:
+                    continue
+                next_moving: list[
+                    tuple[int, Cell, Cell, int, tuple[Cell, ...]]
+                ] = []
+                for body, actor_pos, facing, mode, queued in moving:
+                    if dest == actor_pos:
+                        continue
+                    next_pos, next_facing = actor_pos, facing
+                    next_queued = queued
+                    if player_moved:
+                        if mode == 1 \
+                                and translated(actor_pos, facing) == actor_pos:
+                            next_facing = (-facing[0], -facing[1])
+                        next_pos = translated(actor_pos, next_facing)
+                        if next_pos == dest:
+                            lethal = True
+                            break
+                        if mode == 0:
+                            # Its next orientation/mode is deliberately not
+                            # guessed.  This search only chooses the current
+                            # action; the settled next frame observes it.
+                            continue
+                        if mode == 1:
+                            # Autonomous movers display their next direction
+                            # after settling; reverse at a corridor end.
+                            if translated(next_pos, next_facing) == next_pos:
+                                next_facing = (-next_facing[0],
+                                               -next_facing[1])
+                        elif mode == 2:
+                            next_queued = queued[1:] + (direction,)
+                            next_facing = next_queued[0]
+                    next_moving.append((body, next_pos, next_facing,
+                                        mode, next_queued))
+                if lethal:
+                    continue
+                state = (dest, tuple(sorted(next_still)),
+                         tuple(sorted(next_moving)))
+                if state not in seen:
+                    seen.add(state)
+                    queue.append((state, path + [action]))
+        return None
 
     def _sl_note_lethal_edge(self) -> None:
         """Remember the slide-maze edge whose action caused GAME_OVER.
@@ -10815,6 +11241,18 @@ class MyAgent(Agent):
         if exit_node == snode:
             return None
 
+        # The full structural gate has now passed.  Lock the controlled glyph
+        # appearance from the accent selected on this clean maze; later actor
+        # accents can no longer win by scan order.  Position remains a
+        # per-frame hypothesis and is refreshed below.
+        if self._sl_player_sig is None:
+            matches = [item for item in self._sl_glyphs(grid)
+                       if item[3] == av_anchor]
+            if len(matches) != 1:
+                return None
+            self._sl_player_sig = matches[0][0]
+        self._sl_player_center = snode
+
         # learn the corridor colour: the board colour that, as a straddle,
         # the avatar has been observed to cross.  Bootstrap: the colour whose
         # straddles immediately surround the avatar's node is the corridor (a
@@ -10838,12 +11276,23 @@ class MyAgent(Agent):
         # desyncs the instant any edge reading is off, so route fresh from
         # the avatar's current node and take only the first action.  This is
         # self-correcting across jitter and mis-classified corridors.
-        route = self._sl_route(grid, av_anchor, lat, corridor)
+        actors = self._sl_actor_states(grid, snode)
+        dynamic_path = self._sl_dynamic_route(
+            grid, snode, lat, corridor, actors, exit_node) if actors else None
+        route = ((dynamic_path, exit_node)
+                 if dynamic_path is not None else
+                 (None if actors else
+                  self._sl_route(grid, av_anchor, lat, corridor)))
         if route is None:
             # the corridor-colour hypothesis may be inverted on this board:
             # try the alternate once and adopt it if it routes
             alt = cB if corridor == cA else cA
-            route = self._sl_route(grid, av_anchor, lat, alt)
+            dynamic_path = self._sl_dynamic_route(
+                grid, snode, lat, alt, actors, exit_node) if actors else None
+            route = ((dynamic_path, exit_node)
+                     if dynamic_path is not None else
+                     (None if actors else
+                      self._sl_route(grid, av_anchor, lat, alt)))
             if route is not None:
                 self._sl_corridor = alt
         if route is None or not route[0]:

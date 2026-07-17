@@ -351,6 +351,180 @@ class SlideLethalEdgeTests(unittest.TestCase):
         self.assertEqual(agent._sl_benched, 2)
 
 
+class SlideIdentityAndHazardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.agent_class = load_agent_class()
+
+    @staticmethod
+    def _grid() -> list[list[int]]:
+        return [[0 for _x in range(64)] for _y in range(64)]
+
+    @staticmethod
+    def _draw_glyph(
+        grid: list[list[int]], center: tuple[int, int], body: int,
+        accent: int, facing: tuple[int, int]
+    ) -> tuple[int, int]:
+        cx, cy = center
+        for y in range(cy - 1, cy + 2):
+            for x in range(cx - 1, cx + 2):
+                grid[y][x] = body
+        accent_cell = (cx + facing[0], cy + facing[1])
+        grid[accent_cell[1]][accent_cell[0]] = accent
+        return accent_cell
+
+    def _outcome_agent(
+        self, before, after, src, dest, before_actors, after_actors
+    ):
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_blocked_edges = set()
+        agent._sl_actor_auto = set()
+        agent._sl_actor_base_accent = {}
+        agent._sl_actor_trigger_range = {}
+        agent._sl_actor_queues = {}
+        agent._sl_node_at = lambda grid: src if grid is before else dest
+        agent._sl_actor_states = (
+            lambda grid, _player: before_actors
+            if grid is before else after_actors
+        )
+        return agent
+
+    def test_locked_player_identity_uses_nearest_matching_glyph(self) -> None:
+        grid = self._grid()
+        self._draw_glyph(grid, (5, 5), 3, 1, (0, -1))
+        self._draw_glyph(grid, (20, 20), 7, 9, (-1, 0))
+        expected = self._draw_glyph(grid, (40, 40), 7, 9, (1, 0))
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_player_sig = (7, 9)
+        agent._sl_player_center = (39, 40)
+
+        self.assertEqual(agent._sl_avatar_anchor(grid), (expected, 9))
+
+    def test_solid_goal_ignores_actor_accent_and_survives_occlusion(self) -> None:
+        grid = self._grid()
+        self._draw_glyph(grid, (10, 10), 3, 6, (0, -1))
+        for y in range(9, 12):
+            for x in range(29, 32):
+                grid[y][x] = 7
+        nodes = {(10, 10), (20, 10), (30, 10)}
+        lattice = (10, 0, 0, nodes, 1, 2)
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_goal_sig = None
+        agent._sl_goal_node = None
+
+        self.assertEqual(
+            agent._sl_exit_node(grid, lattice, set()), (30, 10))
+        self.assertEqual(agent._sl_goal_sig, (7, 3, 3))
+
+        for y in range(9, 12):
+            for x in range(29, 32):
+                grid[y][x] = 0
+        self.assertEqual(
+            agent._sl_exit_node(grid, lattice, set()), (30, 10))
+
+    def test_coherent_displayed_motion_promotes_actor_body(self) -> None:
+        before, after = [[0]], [[1]]
+        old = [
+            (3, 5, (20, 20), (1, 0)),
+            (3, 5, (20, 40), (0, -1)),
+        ]
+        new = [
+            (3, 5, (30, 20), (1, 0)),
+            (3, 5, (20, 30), (0, -1)),
+        ]
+        agent = self._outcome_agent(
+            before, after, (0, 0), (10, 0), old, new)
+
+        agent._sl_note_outcome(before, after, 4)
+
+        self.assertEqual(agent._sl_actor_auto, {3})
+
+    def test_occlusion_swap_does_not_promote_actor_body(self) -> None:
+        before, after = [[0]], [[1]]
+        old = [
+            (3, 5, (20, 20), (1, 0)),
+            (3, 5, (40, 20), (1, 0)),
+        ]
+        # Equal counts alone could look like translation: one instance stayed
+        # while another disappeared/reappeared at the expected destination.
+        new = [
+            (3, 5, (20, 20), (1, 0)),
+            (3, 5, (50, 20), (1, 0)),
+        ]
+        agent = self._outcome_agent(
+            before, after, (0, 0), (10, 0), old, new)
+
+        agent._sl_note_outcome(before, after, 4)
+
+        self.assertEqual(agent._sl_actor_auto, set())
+
+    def test_activation_learns_trigger_range_and_bootstraps_fifo(self) -> None:
+        before, after = [[0]], [[1]]
+        old = [(3, 5, (30, 0), (-1, 0))]
+        new = [(3, 6, (30, 0), (-1, 0))]
+        agent = self._outcome_agent(
+            before, after, (0, 0), (10, 0), old, new)
+
+        agent._sl_note_outcome(before, after, 4)
+
+        self.assertEqual(agent._sl_actor_trigger_range, {3: 2})
+        self.assertEqual(
+            agent._sl_actor_queues,
+            {(3, (30, 0)): ((-1, 0), (-1, 0))},
+        )
+
+    def test_dynamic_route_avoids_delayed_actor_collision(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        nodes = {
+            (0, 0), (1, 0), (2, 0),
+            (0, 1), (1, 1), (2, 1),
+        }
+        agent._sl_dirmap = {}
+        agent._sl_blocked_edges = set()
+        agent._sl_lethal_edges = set()
+        agent._sl_actor_auto = set()
+        agent._sl_actor_base_accent = {3: 5}
+        agent._sl_actor_trigger_range = {3: 2}
+        agent._sl_actor_queues = {
+            (3, (1, 1)): ((0, -1), (1, 0)),
+        }
+        agent._sl_passable = (
+            lambda _grid, pos, direction, _pitch, _corridor:
+            (pos[0] + direction[0], pos[1] + direction[1]) in nodes
+        )
+        lattice = (1, 0, 0, nodes, 1, 2)
+        actors = [(3, 6, (1, 1), (0, -1))]
+
+        route = agent._sl_dynamic_route(
+            [[0]], (0, 0), lattice, 1, actors, (2, 0))
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route[0], 2)
+        self.assertNotEqual(route[:2], [4, 4])
+
+    def test_dynamic_route_never_leaves_parsed_node_domain(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        nodes = {(0, 0), (0, 1), (2, 0)}
+        agent._sl_dirmap = {}
+        agent._sl_blocked_edges = set()
+        agent._sl_lethal_edges = set()
+        agent._sl_actor_auto = set()
+        agent._sl_actor_base_accent = {}
+        agent._sl_actor_trigger_range = {}
+        agent._sl_actor_queues = {}
+        # A corridor-colour sample can look passable even when its destination
+        # lies outside the parsed board.  The state graph must stay on nodes.
+        agent._sl_passable = (
+            lambda _grid, _pos, _direction, _pitch, _corridor: True
+        )
+        lattice = (1, 0, 0, nodes, 1, 2)
+
+        route = agent._sl_dynamic_route(
+            [[0]], (0, 0), lattice, 1, [], (2, 0))
+
+        self.assertIsNone(route)
+
+
 class HudIdentityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

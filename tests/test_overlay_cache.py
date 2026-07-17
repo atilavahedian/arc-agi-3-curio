@@ -387,6 +387,27 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertLess(len(ordinary), len(expected))
         self.assertEqual(restored, frozenset(expected))
 
+    def test_clipped_mask_restores_hud_occluded_cross_endpoint(self) -> None:
+        funcs = self.agent_class._ov_selected.__globals__
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        center = (24, 54)
+        for x in range(6, 43):
+            grid[54][x] = 7
+        for y in range(45, 63):
+            grid[y][24] = 7
+        grid[54][24] = 0
+
+        restored = funcs["clipped_symmetric_piece_mask"](grid, center, 7)
+        expected = {
+            (x - center[0], 0) for x in range(6, 43)
+            if x != center[0]
+        } | {
+            (0, y - center[1]) for y in range(45, 64)
+            if y != center[1]
+        }
+
+        self.assertEqual(restored, frozenset(expected))
+
     def test_paint_pad_reader_requires_exact_framed_components(self) -> None:
         func = self.agent_class._ov_selected.__globals__["overlay_paint_pads"]
         grid = [[5 for _x in range(64)] for _y in range(64)]

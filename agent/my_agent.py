@@ -934,25 +934,33 @@ def symmetric_piece_mask(
 def clipped_symmetric_piece_mask(
     grid: Grid, center: Cell, arm_color: int
 ) -> Optional[frozenset[Cell]]:
-    """A selected piece mask with only edge-clipped reflections restored.
+    """A selected piece mask with only edge/HUD-clipped reflections restored.
 
     ``symmetric_piece_mask`` deliberately requires every visible arm pixel to
     have a visible point-reflected partner.  That isolates touching pieces,
     but a genuine arm clipped by the 64x64 viewport loses its off-screen half.
     Starting from the already-trusted symmetric core, extend only through
-    adjacent arm pixels whose reflected coordinate is outside the frame, and
-    add that virtual reflection.  Remote same-colour pads/noise cannot join the
-    core, while the restored mask describes the piece once it moves on-screen.
+    adjacent arm pixels whose reflected coordinate is outside the frame or in
+    the narrow edge HUD band, and add that virtual reflection.  Remote
+    same-colour pads/noise cannot join the core, while the restored mask
+    describes the piece once it moves away from the occluding edge chrome.
     """
     base = symmetric_piece_mask(grid, center, arm_color)
     if base is None:
         return None
     cx, cy = center
     visible = {(cx + dx, cy + dy) for dx, dy in base}
+
+    def clipped(x: int, y: int) -> bool:
+        return not (0 <= x < GRID and 0 <= y < GRID) or (
+            x < HUD_BAND or y < HUD_BAND
+            or x >= GRID - HUD_BAND or y >= GRID - HUD_BAND
+        )
+
     candidates = {
         (x, y) for y, row in enumerate(grid) for x, value in enumerate(row)
         if value == arm_color
-        and not (0 <= 2 * cx - x < GRID and 0 <= 2 * cy - y < GRID)
+        and clipped(2 * cx - x, 2 * cy - y)
     }
     changed = True
     while changed:
@@ -968,7 +976,7 @@ def clipped_symmetric_piece_mask(
     rel = {(x - cx, y - cy) for x, y in visible}
     for dx, dy in tuple(rel):
         rx, ry = cx - dx, cy - dy
-        if not (0 <= rx < GRID and 0 <= ry < GRID):
+        if clipped(rx, ry):
             rel.add((-dx, -dy))
     return frozenset(rel)
 

@@ -145,6 +145,42 @@ class SelectorPanelTests(unittest.TestCase):
                     grid[y][x] = 15
         return grid
 
+    @classmethod
+    def _three_card_campaign_grid(cls):
+        grid = cls._campaign_grid()
+
+        # Third exact framed card: the bent three-cell teleport glyph.
+        for y in range(29, 39):
+            for x in range(5, 15):
+                grid[y][x] = 3 if x in (5, 14) or y in (29, 38) else 2
+        for row, col in {(0, 0), (0, 1), (1, 1)}:
+            for y in range(30 + 3 * row, 32 + 3 * row):
+                for x in range(6 + 3 * col, 8 + 3 * col):
+                    grid[y][x] = 11
+
+        # A second fire-colour perimeter has a distinct solid core and one
+        # remote solid gate in that same core colour.
+        for y in range(36, 40):
+            for x in range(45, 49):
+                grid[y][x] = (
+                    6 if x in (45, 48) or y in (36, 39) else 12
+                )
+        for y in range(23, 26):
+            for x in range(40, 44):
+                grid[y][x] = 12
+
+        # Current-size portal: an outer corner square encloses a centred
+        # actor-sized hollow marker on program-base floor.
+        for y in range(18, 28):
+            for x in range(18, 28):
+                grid[y][x] = 2
+        for x, y in {
+            (20, 20), (25, 20), (20, 25), (25, 25),
+            (21, 21), (24, 21), (21, 24), (24, 24),
+        }:
+            grid[y][x] = 11
+        return grid
+
     @staticmethod
     def _frame(grid, *, level: int = 0, state=GameState.NOT_FINISHED):
         return FrameData(
@@ -273,6 +309,144 @@ class SelectorPanelTests(unittest.TestCase):
             self._campaign_grid(linked_key=False), {1, 2, 3, 4, 6}
         ))
 
+    def test_three_card_campaign_reads_two_keys_and_active_portal(self) -> None:
+        setup = self.module.spell_campaign_setup(
+            self._three_card_campaign_grid(), {1, 2, 3, 4, 6})
+
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup["campaign"], "three_card")
+        self.assertEqual(
+            set(setup["cards"]), {"scale", "teleport", "fire"})
+        self.assertEqual(len(setup["keyed"]), 2)
+        self.assertEqual(
+            {target["key_color"] for target in setup["keyed"]}, {12, 13})
+        self.assertEqual(setup["portal"]["bbox"], (21, 21, 24, 24))
+
+    def test_two_card_campaign_rejects_a_visible_teleport_portal(self) -> None:
+        grid = self._campaign_grid()
+        for y in range(18, 28):
+            for x in range(18, 28):
+                grid[y][x] = 2
+        for x, y in {
+            (20, 20), (25, 20), (20, 25), (25, 25),
+            (21, 21), (24, 21), (21, 24), (24, 24),
+        }:
+            grid[y][x] = 11
+
+        self.assertIsNone(self.module.spell_campaign_setup(
+            grid, {1, 2, 3, 4, 6}))
+
+    def test_campaign_counts_an_extra_blank_card_frame(self) -> None:
+        grid = self._campaign_grid()
+        for y in range(5, 15):
+            for x in range(20, 30):
+                grid[y][x] = (
+                    3 if x in (20, 29) or y in (5, 14) else 2
+                )
+
+        self.assertIsNone(self.module.spell_campaign_setup(
+            grid, {1, 2, 3, 4, 6}))
+
+    def test_three_card_campaign_rejects_a_gate_shared_by_two_rings(self) -> None:
+        grid = self._three_card_campaign_grid()
+        # Remove both original ring/gate pairs.
+        for x0, y0, x1, y1 in (
+            (45, 30, 48, 33), (40, 18, 43, 20),
+            (45, 36, 48, 39), (40, 23, 43, 25),
+        ):
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    grid[y][x] = 5
+        # Two three-square rings use the same one-pixel core colour.  Their
+        # other cores are too small to qualify as gates, leaving one remote
+        # 2x2 component that both would otherwise claim.
+        for y0 in (30, 36):
+            for y in range(y0, y0 + 3):
+                for x in range(45, 48):
+                    grid[y][x] = (
+                        6 if x in (45, 47) or y in (y0, y0 + 2) else 12
+                    )
+        for y in range(23, 25):
+            for x in range(40, 42):
+                grid[y][x] = 12
+
+        self.assertIsNone(self.module.spell_campaign_setup(
+            grid, {1, 2, 3, 4, 6}))
+
+    def test_portal_finder_is_size_sensitive(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(18, 28):
+            for x in range(18, 28):
+                grid[y][x] = 2
+        for y in range(38, 48):
+            for x in range(38, 48):
+                grid[y][x] = 2
+        # Large target: outer six-square plus hollow four-square centre.
+        for x, y in {
+            (20, 20), (25, 20), (20, 25), (25, 25),
+        }:
+            grid[y][x] = 11
+        for x, y in {
+            (21, 21), (24, 21), (21, 24), (24, 24),
+        }:
+            grid[y][x] = 11
+        # Small target: a four-square marker around a solid two-square core.
+        for x, y in {
+            (40, 40), (43, 40), (40, 43), (43, 43),
+        }:
+            grid[y][x] = 4
+        for y in range(41, 43):
+            for x in range(41, 43):
+                grid[y][x] = 15
+
+        large = self.module.spell_campaign_portals(
+            grid, (8, 8, 11, 11), 2)
+        small = self.module.spell_campaign_portals(
+            grid, (8, 8, 9, 9), 2)
+
+        self.assertEqual([portal["bbox"] for portal in large],
+                         [(21, 21, 24, 24)])
+        self.assertEqual([portal["bbox"] for portal in small],
+                         [(41, 41, 42, 42)])
+
+    def test_fire_plan_allows_only_detected_decorations(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(6, 18):
+            for x in range(10, 12):
+                grid[y][x] = 2
+        for y in range(16, 18):
+            for x in range(6, 12):
+                grid[y][x] = 2
+        # A small symmetric hollow marker is an explicit fire-transparent
+        # decoration.  Its left corners cross the vertical ray.
+        for x, y in {(10, 6), (13, 6), (10, 9), (13, 9)}:
+            grid[y][x] = 4
+        near = {
+            "bbox": (10, 2, 13, 5),
+            "signature": ((10, 2, 6),),
+            "gate_signature": ((30, 30, 13),),
+        }
+        farther = {
+            "bbox": (2, 16, 5, 19),
+            "signature": ((2, 16, 6),),
+            "gate_signature": ((31, 30, 12),),
+        }
+
+        plan = self.module.spell_campaign_fire_plan(
+            grid, (10, 12, 11, 13), 2, [farther, near])
+        self.assertIsNotNone(plan)
+        self.assertIs(plan[0], near)
+
+        # An arbitrary coloured pixel on that ray is not part of the detected
+        # marker and must remain opaque rather than inheriting transparency
+        # merely because it is not the dominant wall colour.
+        obstructed = [row[:] for row in grid]
+        obstructed[8][10] = 7
+        blocked_plan = self.module.spell_campaign_fire_plan(
+            obstructed, (10, 12, 11, 13), 2, [farther, near])
+        self.assertIsNotNone(blocked_plan)
+        self.assertIs(blocked_plan[0], farther)
+
     def test_campaign_route_infers_bottleneck_and_fire_facing(self) -> None:
         grid = [[5 for _x in range(64)] for _y in range(64)]
         # Two-cell vertical shaft bending into a two-cell horizontal firing
@@ -291,6 +465,23 @@ class SelectorPanelTests(unittest.TestCase):
         self.assertEqual(path, [GameAction.ACTION2.value] * 2)
         self.assertEqual(final_action, GameAction.ACTION3.value)
         self.assertEqual(expected, (8, 9, 9, 10))
+
+    def test_goal_final_step_rejects_a_non_goal_blocker(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        grid[10][8] = 9
+        grid[10][9] = 2
+        grid[11][8] = 2
+        grid[11][9] = 4
+
+        blocked = self.module.spell_campaign_route(
+            grid, (10, 10, 11, 11), 2, (8, 10, 8, 10), fire=False)
+        grid[11][9] = 2
+        clear = self.module.spell_campaign_route(
+            grid, (10, 10, 11, 11), 2, (8, 10, 8, 10), fire=False)
+
+        self.assertIsNone(blocked)
+        self.assertIsNotNone(clear)
+        self.assertEqual(clear[1], GameAction.ACTION3.value)
 
     def test_public_dispatch_claims_blank_spell_campaign(self) -> None:
         agent = self._agent()

@@ -805,17 +805,92 @@ def spell_program_setup(
     }
 
 
+def spell_campaign_portals(
+    grid: Grid, actor_bbox: tuple[int, int, int, int], floor: int,
+) -> list[dict[str, Any]]:
+    """Find visible, size-matched teleport targets from nested markers.
+
+    An active teleport target is drawn as four isolated equal-colour corner
+    pixels around a centred marker the actor can replace.  The outer marker is
+    only visible for the actor's current scale.  Inactive targets retain their
+    inner decoration, but not a marker which both encloses a non-floor centre
+    and is larger than the current footprint.  This gives a scale-sensitive
+    target without naming a colour, coordinate, or sprite.
+    """
+    ax0, ay0, ax1, ay1 = actor_bbox
+    width, height = ax1 - ax0 + 1, ay1 - ay0 + 1
+    if width <= 0 or width != height or width > 8:
+        return []
+    wall = background_of(grid)
+    singleton: dict[int, set[Cell]] = defaultdict(set)
+    for color_raw, cells in components(grid):
+        color = int(color_raw)
+        if color != floor and len(cells) == 1:
+            singleton[color].update(cells)
+
+    by_target: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+    for color, points in singleton.items():
+        ordered = sorted(points, key=lambda p: (p[1], p[0]))
+        for x0, y0 in ordered:
+            for x1, top_y in ordered:
+                side = x1 - x0 + 1
+                if top_y != y0 or not width < side <= width + 8 \
+                        or side % 2 != width % 2:
+                    continue
+                y1 = y0 + side - 1
+                corners = {(x0, y0), (x1, y0), (x0, y1), (x1, y1)}
+                if not corners <= points or x0 < HUD_BAND or y0 < HUD_BAND \
+                        or x1 >= GRID - HUD_BAND or y1 >= GRID - HUD_BAND:
+                    continue
+                inset = (side - width) // 2
+                target = (
+                    x0 + inset, y0 + inset,
+                    x0 + inset + width - 1, y0 + inset + height - 1,
+                )
+                tx0, ty0, tx1, ty1 = target
+                values = [
+                    grid[y][x]
+                    for y in range(ty0, ty1 + 1)
+                    for x in range(tx0, tx1 + 1)
+                ]
+                # The target is a decorated floor footprint, never wall.  At
+                # least one marker pixel must remain visible at its centre;
+                # otherwise an arbitrary rectangle of corner specks could arm
+                # the teleport head.
+                if wall in values or not any(value != floor for value in values):
+                    continue
+                marker = tuple(sorted(
+                    (x, y, grid[y][x])
+                    for y in range(y0, y1 + 1)
+                    for x in range(x0, x1 + 1)
+                    if grid[y][x] not in (floor, wall)
+                    and (x, y) not in corners
+                ))
+                candidate = {
+                    "bbox": target,
+                    "outer_bbox": (x0, y0, x1, y1),
+                    "color": color,
+                    "marker_signature": marker,
+                }
+                old = by_target.get(target)
+                if old is None or side > old["outer_bbox"][2] \
+                        - old["outer_bbox"][0] + 1:
+                    by_target[target] = candidate
+    return sorted(by_target.values(), key=lambda p: p["bbox"])
+
+
 def spell_campaign_setup(
     grid: Grid, available_actions: set[int],
 ) -> Optional[dict[str, Any]]:
-    """Read a blank spell board plus an exact scale/fire card pair.
+    """Read a blank spell board plus an exact two/three-card campaign.
 
     Later spell levels stop preselecting one clue.  This detector stays
     deliberately narrower than :func:`spell_program_setup`: the board must be
-    blank, exactly two framed cards must encode the known scale and fire
-    glyphs, and the world must also contain both a unique same-palette
-    actor/socket pair and a uniquely keyed fire ring.  All positions, colours
-    and click cells come from the pixels in the current frame.
+    blank; the framed cards must be exactly scale+fire or
+    scale+teleport+fire; and every fire ring must have one separate solid gate
+    in its core colour.  The three-card form additionally needs one visible
+    size-matched teleport target.  All positions, colours and click cells come
+    from the current pixels.
     """
     if frozenset(available_actions) != PANEL_ACTIONS:
         return None
@@ -879,6 +954,7 @@ def spell_campaign_setup(
     board = boards[0]
 
     cards: dict[str, dict[str, Any]] = {}
+    framed_card_count = 0
     for color_raw, card_cells in comps:
         if int(color_raw) != board["scaffold"] \
                 or card_cells == board["frame"]:
@@ -898,6 +974,10 @@ def spell_campaign_setup(
         }
         if set(card_cells) != perimeter:
             continue
+        # Count the exact outer card grammar before interpreting its interior.
+        # An extra framed card with an unknown/blank/malformed glyph must not be
+        # silently ignored by an otherwise valid two- or three-card campaign.
+        framed_card_count += 1
         side = (width - 4) // 3
         if side < 1:
             continue
@@ -934,7 +1014,7 @@ def spell_campaign_setup(
             if value == glyph
         )
         mode = PANEL_SPELL_MASKS.get(mask)
-        if mode not in {"scale", "fire"} or mode in cards:
+        if mode not in {"scale", "teleport", "fire"} or mode in cards:
             return None
         cards[mode] = {
             "color": glyph,
@@ -947,12 +1027,33 @@ def spell_campaign_setup(
                 for row, col in sorted(mask)
             ],
         }
-    if set(cards) != {"scale", "fire"}:
+    card_modes = set(cards)
+    if card_modes not in (
+            {"scale", "fire"}, {"scale", "teleport", "fire"}):
+        return None
+    if framed_card_count != len(cards):
         return None
 
-    actor = panel_actor(grid, require_lane=False)
-    if actor is None:
+    # Ask the generic rectangle reader one palette at a time.  A blank world
+    # can make a floor strip and an adjacent object look like a second
+    # two-colour rectangle pair; campaign actors cannot use the program base,
+    # scaffold, wall, or any card's glyph colour.
+    excluded_actor_colors = {
+        board["base"], board["scaffold"], background_of(grid),
+        *(card["color"] for card in cards.values()),
+    }
+    world_colors = sorted({int(color) for color, _cells in comps}
+                          - excluded_actor_colors)
+    actors: list[dict[str, Any]] = []
+    for i, c1 in enumerate(world_colors):
+        for c2 in world_colors[i + 1:]:
+            candidate = panel_actor(
+                grid, tuple(sorted((c1, c2))), require_lane=False)
+            if candidate is not None:
+                actors.append(candidate)
+    if len(actors) != 1:
         return None
+    actor = actors[0]
     mx0, my0, mx1, my1 = actor["mover"]["bbox"]
     if mx1 - mx0 != my1 - my0 or mx1 - mx0 + 1 < 4:
         return None
@@ -1001,12 +1102,30 @@ def spell_campaign_setup(
                         (x, y, grid[y][x]) for x, y in cells)),
                     "gate_signature": tuple(sorted(
                         (x, y, grid[y][x]) for x, y in gates[0])),
+                    "key_color": key_color,
                 })
-    if len(keyed) != 1:
+    expected_keys = 2 if "teleport" in cards else 1
+    # Pair iteration cannot legitimately produce the same solid ring twice,
+    # but de-duplicate by its pixel signature before enforcing exactness.
+    keyed = list({target["signature"]: target for target in keyed}.values())
+    keyed.sort(key=lambda target: target["bbox"])
+    if len(keyed) != expected_keys:
+        return None
+    gate_signatures = [target["gate_signature"] for target in keyed]
+    if len(set(gate_signatures)) != len(gate_signatures):
+        return None
+    portals = spell_campaign_portals(
+        grid, actor["mover"]["bbox"], board["base"])
+    if "teleport" in cards and len(portals) != 1:
+        return None
+    if "teleport" not in cards and portals:
+        # Preserve the old two-card gate exactly: a teleport affordance belongs
+        # to the richer campaign and must not be silently ignored.
         return None
     target = keyed[0]
     return {
         "cards": cards,
+        "campaign": "three_card" if "teleport" in cards else "two_card",
         "floor": board["base"],
         "actor_colors": actor["colors"],
         "actor_pixels": actor["mover"]["pixels"],
@@ -1018,12 +1137,61 @@ def spell_campaign_setup(
         "fire_bbox": target["bbox"],
         "fire_signature": target["signature"],
         "gate_signature": target["gate_signature"],
+        "keyed": keyed,
+        "portal": portals[0] if portals else None,
     }
+
+
+def spell_campaign_fire_decorations(grid: Grid, floor: int) -> set[Cell]:
+    """Return explicitly recognized hollow/corner decoration pixels.
+
+    Fire passes the compact symmetric corner/bracket markers used to annotate
+    scale-sensitive portals, but it must not pass an arbitrary non-wall colour.
+    A decoration has all four corners, bilateral symmetry, a small bounding
+    box, and density strictly below a perimeter ring.  Only its observed pixels
+    are transparent; the empty interior is already ordinary floor.
+    """
+    wall = background_of(grid)
+    by_color: dict[int, set[Cell]] = defaultdict(set)
+    for y, row in enumerate(grid):
+        for x, value in enumerate(row):
+            if value not in (floor, wall):
+                by_color[value].add((x, y))
+
+    decorations: set[Cell] = set()
+    for points in by_color.values():
+        for x0, y0 in points:
+            for width in range(3, 9):
+                x1 = x0 + width - 1
+                if (x1, y0) not in points:
+                    continue
+                for height in range(3, 9):
+                    y1 = y0 + height - 1
+                    corners = {
+                        (x0, y0), (x1, y0), (x0, y1), (x1, y1),
+                    }
+                    if not corners <= points:
+                        continue
+                    pattern = {
+                        (x, y) for x, y in points
+                        if x0 <= x <= x1 and y0 <= y <= y1
+                    }
+                    area = width * height
+                    if len(pattern) < 4 or len(pattern) * 4 >= area * 3:
+                        continue
+                    if {(x0 + x1 - x, y) for x, y in pattern} != pattern \
+                            or {(x, y0 + y1 - y) for x, y in pattern} \
+                            != pattern:
+                        continue
+                    decorations.update(pattern)
+    return decorations
 
 
 def spell_campaign_route(
     grid: Grid, actor_bbox: tuple[int, int, int, int], floor: int,
     target_bbox: tuple[int, int, int, int], *, fire: bool,
+    fire_blockers: Optional[set[Cell]] = None,
+    fire_transparent: Optional[set[Cell]] = None,
 ) -> Optional[tuple[list[int], int, tuple[int, int, int, int]]]:
     """BFS a floor component to one final fire/goal-facing move.
 
@@ -1031,7 +1199,10 @@ def spell_campaign_route(
     actor's old pixels are treated as floor while testing future placements;
     all other non-floor pixels remain conservative obstacles.  For fire, the
     final move must leave the projectile's leading row/column on a clear line
-    to the keyed ring.  For a goal, the final move must overlap the socket.
+    to the keyed ring.  Sparse hollow/corner decorations are transparent to a
+    projectile, while the dominant wall component and caller-supplied live
+    keyed solids block it.  For a goal, the final placement may contain only
+    floor, the actor's current cells, and cells inside the socket.
     """
     x0, y0, x1, y1 = actor_bbox
     width, height = x1 - x0 + 1, y1 - y0 + 1
@@ -1047,6 +1218,13 @@ def spell_campaign_route(
 
     def floor_at(x: int, y: int) -> bool:
         return (x, y) in origin_cells or grid[y][x] == floor
+
+    blockers = fire_blockers or set()
+    transparent = fire_transparent or set()
+
+    def fire_clear_at(x: int, y: int) -> bool:
+        return (x, y) not in blockers \
+            and (floor_at(x, y) or (x, y) in transparent)
 
     def open_at(pos: Cell) -> bool:
         bx0, by0, bx1, by1 = bbox_at(pos)
@@ -1073,25 +1251,31 @@ def spell_campaign_route(
                     continue
                 if action_id == GameAction.ACTION3.value and tx1 < dx0 \
                         and ty0 <= dy0 <= ty1:
-                    clear = all(floor_at(x, dy0)
+                    clear = all(fire_clear_at(x, dy0)
                                 for x in range(tx1 + 1, dx0))
                 elif action_id == GameAction.ACTION4.value and tx0 > dx1 \
                         and ty0 <= dy0 <= ty1:
-                    clear = all(floor_at(x, dy0)
+                    clear = all(fire_clear_at(x, dy0)
                                 for x in range(dx1 + 1, tx0))
                 elif action_id == GameAction.ACTION1.value and ty1 < dy0 \
                         and tx0 <= dx0 <= tx1:
-                    clear = all(floor_at(dx0, y)
+                    clear = all(fire_clear_at(dx0, y)
                                 for y in range(ty1 + 1, dy0))
                 elif action_id == GameAction.ACTION2.value and ty0 > dy1 \
                         and tx0 <= dx0 <= tx1:
-                    clear = all(floor_at(dx0, y)
+                    clear = all(fire_clear_at(dx0, y)
                                 for y in range(dy1 + 1, ty0))
                 else:
                     clear = False
                 if clear:
                     return action_id, db
-            elif not (dx1 < tx0 or tx1 < dx0 or dy1 < ty0 or ty1 < dy0):
+            elif not (dx1 < tx0 or tx1 < dx0 or dy1 < ty0 or ty1 < dy0) \
+                    and all(
+                        floor_at(x, y)
+                        or (tx0 <= x <= tx1 and ty0 <= y <= ty1)
+                        for y in range(dy0, dy1 + 1)
+                        for x in range(dx0, dx1 + 1)
+                    ):
                 return action_id, db
         return None
 
@@ -1111,6 +1295,52 @@ def spell_campaign_route(
             seen.add(nxt)
             queue.append((nxt, path + [action_id]))
     return None
+
+
+def spell_campaign_signature_matches(
+    grid: Grid, signature: tuple[tuple[int, int, int], ...],
+) -> bool:
+    """Whether every remembered keyed/goal pixel is still unchanged."""
+    return all(grid[y][x] == value for x, y, value in signature)
+
+
+def spell_campaign_signature_replaced(
+    grid: Grid, signature: tuple[tuple[int, int, int], ...],
+) -> bool:
+    """Whether every remembered pixel was removed or replaced."""
+    return bool(signature) and all(
+        grid[y][x] != value for x, y, value in signature)
+
+
+def spell_campaign_fire_plan(
+    grid: Grid, actor_bbox: tuple[int, int, int, int], floor: int,
+    targets: list[dict[str, Any]],
+) -> Optional[tuple[dict[str, Any], list[int], int,
+                    tuple[int, int, int, int]]]:
+    """Rank all currently reachable keyed rings by pixel-derived BFS cost."""
+    blockers = {
+        (x, y)
+        for target in targets
+        for signature_name in ("signature", "gate_signature")
+        for x, y, _value in target[signature_name]
+    }
+    transparent = spell_campaign_fire_decorations(grid, floor)
+    ranked: list[tuple[int, tuple[int, int, int, int], dict[str, Any],
+                       list[int], int, tuple[int, int, int, int]]] = []
+    for target in targets:
+        route = spell_campaign_route(
+            grid, actor_bbox, floor, target["bbox"], fire=True,
+            fire_blockers=blockers, fire_transparent=transparent)
+        if route is None:
+            continue
+        path, final_action, expected = route
+        ranked.append((len(path) + 1, target["bbox"], target,
+                       path, final_action, expected))
+    if not ranked:
+        return None
+    _cost, _bbox, target, path, final_action, expected = min(
+        ranked, key=lambda item: (item[0], item[1]))
+    return target, path, final_action, expected
 
 
 def panel_macro_setup(
@@ -3027,6 +3257,9 @@ class MyAgent(Agent):
         self._spell_campaign_colors: Optional[tuple[int, int]] = None
         self._spell_campaign_floor: Optional[int] = None
         self._spell_campaign_initial_pixels = 0
+        self._spell_campaign_initial_bbox: Optional[
+            tuple[int, int, int, int]
+        ] = None
         self._spell_campaign_goal_bbox: Optional[
             tuple[int, int, int, int]
         ] = None
@@ -3042,6 +3275,13 @@ class MyAgent(Agent):
         self._spell_campaign_gate_signature: tuple[
             tuple[int, int, int], ...
         ] = tuple()
+        self._spell_campaign_keyed: list[dict[str, Any]] = []
+        self._spell_campaign_target: Optional[dict[str, Any]] = None
+        self._spell_campaign_initial_portal: Optional[dict[str, Any]] = None
+        self._spell_campaign_portal_expected: Optional[
+            tuple[int, int, int, int]
+        ] = None
+        self._spell_campaign_three = False
         self._spell_campaign_expected: Optional[
             tuple[int, int, int, int]
         ] = None
@@ -5115,11 +5355,17 @@ class MyAgent(Agent):
         self._spell_campaign_colors = None
         self._spell_campaign_floor = None
         self._spell_campaign_initial_pixels = 0
+        self._spell_campaign_initial_bbox = None
         self._spell_campaign_goal_bbox = None
         self._spell_campaign_goal_signature = tuple()
         self._spell_campaign_fire_bbox = None
         self._spell_campaign_fire_signature = tuple()
         self._spell_campaign_gate_signature = tuple()
+        self._spell_campaign_keyed = []
+        self._spell_campaign_target = None
+        self._spell_campaign_initial_portal = None
+        self._spell_campaign_portal_expected = None
+        self._spell_campaign_three = False
         self._spell_campaign_expected = None
         self._spell_campaign_steps = 0
         self._spell_campaign_engaged = False
@@ -5137,6 +5383,16 @@ class MyAgent(Agent):
         self._spell_campaign_steps += 1
         return action
 
+    def _spell_campaign_queue_cast(self, mode: str, phase: str) -> bool:
+        """Queue one detected card and its board-derived program cells."""
+        card = self._spell_campaign_cards.get(mode)
+        if card is None:
+            return False
+        self._spell_campaign_clicks = deque(
+            [card["select"], *card["clicks"]])
+        self._spell_campaign_phase = phase
+        return True
+
     def _spell_campaign_actor(self, grid: Grid) -> Optional[dict[str, Any]]:
         if self._spell_campaign_colors is None:
             return None
@@ -5151,11 +5407,12 @@ class MyAgent(Agent):
     def _spell_campaign_policy(
         self, grid: Optional[Grid], latest_frame: FrameData,
     ) -> Optional[GameAction]:
-        """Shrink through a bottleneck, burn its keyed gate, then route.
+        """Run a pixel-planned scale/fire or scale/teleport/fire campaign.
 
         The action sequence is not recorded here: every click comes from the
-        detected card/program geometry and every move is replanned by a
-        bounded BFS over the current floor component.
+        detected card/program geometry, keyed rings are ranked by a fresh BFS,
+        and every scale, teleport, and fire effect is verified before the next
+        phase owns an action.
         """
         if grid is None:
             return None
@@ -5181,15 +5438,19 @@ class MyAgent(Agent):
             self._spell_campaign_colors = setup["actor_colors"]
             self._spell_campaign_floor = setup["floor"]
             self._spell_campaign_initial_pixels = setup["actor_pixels"]
+            self._spell_campaign_initial_bbox = setup["actor_bbox"]
             self._spell_campaign_goal_bbox = setup["goal_bbox"]
             self._spell_campaign_goal_signature = setup["goal_signature"]
             self._spell_campaign_fire_bbox = setup["fire_bbox"]
             self._spell_campaign_fire_signature = setup["fire_signature"]
             self._spell_campaign_gate_signature = setup["gate_signature"]
-            scale = self._spell_campaign_cards["scale"]
-            self._spell_campaign_clicks = deque(
-                [scale["select"], *scale["clicks"]])
-            self._spell_campaign_phase = "scale_cast"
+            self._spell_campaign_keyed = list(setup["keyed"])
+            self._spell_campaign_initial_portal = setup["portal"]
+            self._spell_campaign_three = setup["campaign"] == "three_card"
+            if not self._spell_campaign_queue_cast(
+                    "scale", "scale_down_cast"):
+                self._spell_campaign_fail(level)
+                return None
 
         if self._spell_campaign_steps >= 64:
             self._spell_campaign_fail(level)
@@ -5197,10 +5458,9 @@ class MyAgent(Agent):
 
         # A small transition loop lets one completed animation advance to its
         # next plan without burning a no-op action.
-        for _transition in range(5):
+        for _transition in range(10):
             phase = self._spell_campaign_phase
-            if phase in {"scale_cast", "fire_cast"} \
-                    and self._spell_campaign_clicks:
+            if phase.endswith("_cast") and self._spell_campaign_clicks:
                 cell = self._spell_campaign_clicks.popleft()
                 return self._spell_campaign_click(
                     cell, f"spell campaign {phase.replace('_cast', '')}")
@@ -5211,10 +5471,35 @@ class MyAgent(Agent):
                 return None
             mover = actor["mover"]
 
-            if phase == "scale_cast":
+            if phase == "scale_down_cast":
                 # A scale-down preserves the palette and reduces a square
                 # footprint to one quarter of its pixels.
                 if mover["pixels"] * 4 != self._spell_campaign_initial_pixels:
+                    self._spell_campaign_fail(level)
+                    return None
+                if self._spell_campaign_three:
+                    if self._spell_campaign_floor is None:
+                        self._spell_campaign_fail(level)
+                        return None
+                    portals = spell_campaign_portals(
+                        grid, mover["bbox"], self._spell_campaign_floor)
+                    if len(portals) != 1 \
+                            or portals[0]["bbox"] == mover["bbox"]:
+                        self._spell_campaign_fail(level)
+                        return None
+                    self._spell_campaign_portal_expected = portals[0]["bbox"]
+                    if not self._spell_campaign_queue_cast(
+                            "teleport", "teleport_small_cast"):
+                        self._spell_campaign_fail(level)
+                        return None
+                    continue
+                self._spell_campaign_phase = "route_fire"
+                continue
+
+            if phase == "teleport_small_cast":
+                if mover["bbox"] != self._spell_campaign_portal_expected \
+                        or mover["pixels"] * 4 \
+                        != self._spell_campaign_initial_pixels:
                     self._spell_campaign_fail(level)
                     return None
                 self._spell_campaign_phase = "route_fire"
@@ -5222,19 +5507,35 @@ class MyAgent(Agent):
 
             if phase == "route_fire":
                 if self._spell_campaign_floor is None \
-                        or self._spell_campaign_fire_bbox is None:
+                        or not self._spell_campaign_keyed:
                     self._spell_campaign_fail(level)
                     return None
-                route = spell_campaign_route(
+                if any(
+                    not spell_campaign_signature_matches(
+                        grid, target["signature"])
+                    or not spell_campaign_signature_matches(
+                        grid, target["gate_signature"])
+                    for target in self._spell_campaign_keyed
+                ):
+                    self._spell_campaign_fail(level)
+                    return None
+                plan = spell_campaign_fire_plan(
                     grid, mover["bbox"], self._spell_campaign_floor,
-                    self._spell_campaign_fire_bbox, fire=True)
-                if route is None:
+                    self._spell_campaign_keyed)
+                if plan is None:
                     self._spell_campaign_fail(level)
                     return None
-                path, final_action, expected = route
+                target, path, final_action, expected = plan
                 if path:
                     self._spell_campaign_steps += 1
                     return self._step(GameAction.from_id(path[0]))
+                self._spell_campaign_target = target
+                # Keep the legacy scalar fields synchronized so diagnostics
+                # and two-card regression fixtures retain their old surface.
+                self._spell_campaign_fire_bbox = target["bbox"]
+                self._spell_campaign_fire_signature = target["signature"]
+                self._spell_campaign_gate_signature = \
+                    target["gate_signature"]
                 self._spell_campaign_expected = expected
                 self._spell_campaign_phase = "fire_select"
                 self._spell_campaign_steps += 1
@@ -5244,20 +5545,101 @@ class MyAgent(Agent):
                 if mover["bbox"] != self._spell_campaign_expected:
                     self._spell_campaign_fail(level)
                     return None
-                fire = self._spell_campaign_cards["fire"]
-                self._spell_campaign_clicks = deque(
-                    [fire["select"], *fire["clicks"]])
-                self._spell_campaign_phase = "fire_cast"
+                if not self._spell_campaign_queue_cast(
+                        "fire", "fire_cast"):
+                    self._spell_campaign_fail(level)
+                    return None
                 continue
 
             if phase == "fire_cast":
-                fire_changed = any(
-                    grid[y][x] != value
-                    for x, y, value in self._spell_campaign_fire_signature)
-                gate_changed = any(
-                    grid[y][x] != value
-                    for x, y, value in self._spell_campaign_gate_signature)
+                target = self._spell_campaign_target
+                if target is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                fire_changed = spell_campaign_signature_replaced(
+                    grid, target["signature"])
+                gate_changed = spell_campaign_signature_replaced(
+                    grid, target["gate_signature"])
                 if not fire_changed or not gate_changed:
+                    self._spell_campaign_fail(level)
+                    return None
+                remaining = [
+                    other for other in self._spell_campaign_keyed
+                    if other["signature"] != target["signature"]
+                ]
+                if any(
+                    not spell_campaign_signature_matches(
+                        grid, other["signature"])
+                    or not spell_campaign_signature_matches(
+                        grid, other["gate_signature"])
+                    for other in remaining
+                ):
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_keyed = remaining
+                self._spell_campaign_target = None
+                self._spell_campaign_phase = (
+                    "route_fire" if remaining else "post_keys")
+                continue
+
+            if phase == "post_keys":
+                if self._spell_campaign_floor is None \
+                        or self._spell_campaign_goal_bbox is None \
+                        or not spell_campaign_signature_matches(
+                            grid, self._spell_campaign_goal_signature):
+                    self._spell_campaign_fail(level)
+                    return None
+                direct = spell_campaign_route(
+                    grid, mover["bbox"], self._spell_campaign_floor,
+                    self._spell_campaign_goal_bbox, fire=False)
+                if direct is not None:
+                    self._spell_campaign_phase = "route_goal"
+                    continue
+                if not self._spell_campaign_three \
+                        or self._spell_campaign_initial_portal is None \
+                        or self._spell_campaign_initial_bbox is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                # Scaling is justified only after proving both that the small
+                # component cannot reach the socket and that the original-size
+                # active portal's destination has a valid route to it.
+                large_portal_bbox = \
+                    self._spell_campaign_initial_portal["bbox"]
+                portal_route = spell_campaign_route(
+                    grid, large_portal_bbox, self._spell_campaign_floor,
+                    self._spell_campaign_goal_bbox, fire=False)
+                if portal_route is None or large_portal_bbox == mover["bbox"]:
+                    self._spell_campaign_fail(level)
+                    return None
+                if not self._spell_campaign_queue_cast(
+                        "scale", "scale_up_cast"):
+                    self._spell_campaign_fail(level)
+                    return None
+                continue
+
+            if phase == "scale_up_cast":
+                if mover["pixels"] != self._spell_campaign_initial_pixels \
+                        or self._spell_campaign_floor is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                portals = spell_campaign_portals(
+                    grid, mover["bbox"], self._spell_campaign_floor)
+                initial_portal = self._spell_campaign_initial_portal
+                if len(portals) != 1 or initial_portal is None \
+                        or portals[0]["bbox"] != initial_portal["bbox"] \
+                        or portals[0]["bbox"] == mover["bbox"]:
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_portal_expected = portals[0]["bbox"]
+                if not self._spell_campaign_queue_cast(
+                        "teleport", "teleport_large_cast"):
+                    self._spell_campaign_fail(level)
+                    return None
+                continue
+
+            if phase == "teleport_large_cast":
+                if mover["bbox"] != self._spell_campaign_portal_expected \
+                        or mover["pixels"] != self._spell_campaign_initial_pixels:
                     self._spell_campaign_fail(level)
                     return None
                 self._spell_campaign_phase = "route_goal"
@@ -5266,8 +5648,8 @@ class MyAgent(Agent):
             if phase == "route_goal":
                 if self._spell_campaign_floor is None \
                         or self._spell_campaign_goal_bbox is None \
-                        or not all(grid[y][x] == value for x, y, value
-                                   in self._spell_campaign_goal_signature):
+                        or not spell_campaign_signature_matches(
+                            grid, self._spell_campaign_goal_signature):
                     self._spell_campaign_fail(level)
                     return None
                 route = spell_campaign_route(

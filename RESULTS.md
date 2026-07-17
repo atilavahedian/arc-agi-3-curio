@@ -76,6 +76,31 @@ results at a 1,000-action cap:
 
 `re86` also remains an 8-level WIN in 552 actions on the fixed proxy runs.
 
+## Dynamic node-maze promotion gate
+
+Commit `9a4d78f` replaces rare-color identity guesses with stable visual glyph
+and goal identities, learns actor activation and motion from settled frame
+transitions, and plans in joint player/actor state space. The dynamic state
+graph is confined to the parsed lattice domain.
+
+Exact official seed-0 result from the combined committed `main` tree:
+
+| Game | Result | Actions | Scorecard |
+|---|---:|---:|---:|
+| tu93 | 9/9 WIN | 211 | 100.0 |
+
+Verification at promotion:
+
+- combined full unit suite: 127/127;
+- focused graph/slide tests: 40/40;
+- all 25 official opening frames checked: only `tu93` passed the complete
+  slide-head gate;
+- combined official gate preserved `ka59`, `re86`, `cn04`, `ft09`, `tr87`,
+  and `sc25` exact wins;
+- no game/level dispatch, fixed coordinates/colors, or scripted paths;
+- `git diff --check`: clean;
+- independent read-only review: approved.
+
 ## Kinetic-push promotion gate
 
 Commit `e3170f0` adds an original frame-derived selected-piece, collision,
@@ -133,8 +158,9 @@ Verification at promotion:
 - `dc22`: current clean sweep is 4 levels. An original, frame-derived remote
   manipulator prototype reaches the level-5 upper branch; production handoff
   with the existing switch planner is in progress.
-- `tu93`: repair late-stage avatar/goal tracking and promote the proved
-  time-aware hazard planner without regressing its early campaign levels.
+- `sk48`: the frame-only opening probe established a telescoping-arm movement
+  grammar and visible target/instruction layout; the interaction rule is still
+  unproved, so no production head has been promoted.
 
 ## Reproduction
 

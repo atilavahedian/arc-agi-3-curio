@@ -166,6 +166,7 @@ PORT_VOTES = 4          # frames a color must qualify on 2+ pieces before
                         # it is trusted as the port accent color
 PC_SOLS = 12            # pairing solutions kept per solve
 PC_NODES = 20000        # pairing-DFS node budget
+PC_DEEP_NODES = 650000  # branch-and-bound proof budget for multi-stack boards
 PC_SCOUT = 2            # selection clicks probing one piece for hidden ports
 PC_STRIKES = 8          # exec failures / desyncs before the port planner
                         # benches the level (novelty search takes over)
@@ -4078,14 +4079,27 @@ class MyAgent(Agent):
                 handled = False
                 if mv is not None and mv[0] == act:
                     _act, delta, union = mv
-                    pid = max(pieces,
-                              key=lambda q: len(pieces[q]["cells"] & union))
+                    def moved_overlap(q: int) -> int:
+                        expected = {
+                            (x + delta[0], y + delta[1])
+                            for x, y in pieces[q]["cells"]
+                        }
+                        return len(expected & union)
+
+                    # A click establishes selection exactly.  Pairing feedback
+                    # can recolor a joint and make an adjacent piece overlap
+                    # more of the raw diff, so overlap inference is only safe
+                    # while selection is unknown.  ``union`` contains current
+                    # frame coordinates, so compare it with each piece shifted
+                    # by the observed delta rather than its stale footprint.
+                    pid = self._pc_sel if self._pc_sel in pieces else max(
+                        pieces, key=moved_overlap,
+                    )
                     # credible only when the moved group accounts for the
                     # whole piece: a lone aliased port blob gliding inside
                     # a big STATIC piece fails the size test, and sparse
                     # glyphs (tiny self-overlap after one step) pass it
-                    if pieces[pid]["cells"] & union \
-                            and len(union) * 2 >= len(pieces[pid]["cells"]):
+                    if moved_overlap(pid) * 2 >= len(pieces[pid]["cells"]):
                         self._pc_shift(pid, delta)
                         self._pc_sel = pid
                         self._pc_bounce = 0
@@ -4172,6 +4186,13 @@ class MyAgent(Agent):
         pids = [pid for pid in sorted(pieces) if pieces[pid]["ports"]]
         if len(pids) < 2:
             return []
+        stack_pids = [pid for pid in pids if pieces[pid].get("stack")]
+        # Once a non-rotational variant proves that a piece is a stack, its
+        # observed library is incomplete until the bounded transform cycle has
+        # run out.  Solving earlier can lock onto a cheap but incomplete model.
+        if any(self._pc_vscout[pid] < XFORM_CAP for pid in stack_pids):
+            return []
+        deep = len(stack_pids) >= 2
         cur = {pid: (pat_norm(pieces[pid]["cells"], pieces[pid]["ports"]),
                      bbox_min(pieces[pid]["cells"])) for pid in pids}
         pats = {pid: self._pc_patterns(pid) for pid in pids}
@@ -4192,6 +4213,95 @@ class MyAgent(Agent):
         def place(occ: Counter, pat: tuple, pos: Cell, k: int) -> None:
             for a in anchors[pat]:
                 occ[(a[0] + pos[0], a[1] + pos[1])] += k
+
+        if deep:
+            # Variant-rich boards have many valid geometric completions.  The
+            # legacy first-N cutoff can miss every cheap completion, so prove
+            # the best reachable non-blacklisted assignment with an admissible
+            # assigned-cost lower bound.  This expensive path is deliberately
+            # restricted to boards with at least two positively detected,
+            # fully scanned stacks.
+            deep_nodes = [0]
+            best_cost = [float("inf")]
+            best_sol: list[Optional[dict[int, tuple]]] = [None]
+
+            def placement_cost(pid: int, pat: tuple, pos: Cell) -> int:
+                cpat, cpos = cur[pid]
+                steps = (abs(pos[0] - cpos[0])
+                         + abs(pos[1] - cpos[1])) // scale
+                return (4 if pat != cpat else 0) \
+                    + (3 + steps if steps else 0)
+
+            def deep_dfs(assign: dict, occ: Counter,
+                         partial_cost: int) -> None:
+                if deep_nodes[0] >= PC_DEEP_NODES \
+                        or partial_cost >= best_cost[0]:
+                    return
+                deep_nodes[0] += 1
+                open_cells = sorted(c for c, n in occ.items() if n == 1)
+                if not open_cells:
+                    rest = [q for q in order if q not in assign]
+                    if not rest:
+                        if self._pc_cfg_key(assign) in self._pc_failed_cfgs:
+                            return
+                        best_cost[0] = partial_cost
+                        best_sol[0] = dict(assign)
+                        return
+                    q = rest[0]  # disjoint cluster: seed where it stands
+                    pos = cur[q][1]
+                    branches = []
+                    for pat_index, pat in enumerate(pats[q]):
+                        if fits(occ, pat, pos):
+                            branches.append((placement_cost(q, pat, pos),
+                                             pat_index, pat))
+                    branches.sort(key=lambda branch: branch[:2])
+                    for added, _pat_index, pat in branches:
+                        assign[q] = (pat, pos)
+                        place(occ, pat, pos, 1)
+                        deep_dfs(assign, occ, partial_cost + added)
+                        place(occ, pat, pos, -1)
+                        del assign[q]
+                    return
+
+                c = open_cells[0]
+                branches = []
+                for q_index, q in enumerate(order):
+                    if q in assign:
+                        continue
+                    qx, qy = cur[q][1]
+                    for pat_index, pat in enumerate(pats[q]):
+                        for anchor_index, a in enumerate(anchors[pat]):
+                            pos = (c[0] - a[0], c[1] - a[1])
+                            if (pos[0] - qx) % scale \
+                                    or (pos[1] - qy) % scale:
+                                continue
+                            if not fits(occ, pat, pos):
+                                continue
+                            branches.append((placement_cost(q, pat, pos),
+                                             q_index, pat_index, anchor_index,
+                                             q, pat, pos))
+                branches.sort(key=lambda branch: branch[:4])
+                for added, _qi, _pi, _ai, q, pat, pos in branches:
+                    assign[q] = (pat, pos)
+                    place(occ, pat, pos, 1)
+                    deep_dfs(assign, occ, partial_cost + added)
+                    place(occ, pat, pos, -1)
+                    del assign[q]
+
+            seed = order[0]
+            seed_pos = cur[seed][1]
+            seed_branches = sorted(
+                ((placement_cost(seed, pat, seed_pos), pat_index, pat)
+                 for pat_index, pat in enumerate(pats[seed])),
+                key=lambda branch: branch[:2],
+            )
+            for added, _pat_index, pat in seed_branches:
+                if deep_nodes[0] >= PC_DEEP_NODES:
+                    break
+                occ: Counter[Cell] = Counter()
+                place(occ, pat, seed_pos, 1)
+                deep_dfs({seed: (pat, seed_pos)}, occ, added)
+            return [best_sol[0]] if best_sol[0] is not None else []
 
         def dfs(assign: dict, occ: Counter) -> None:
             nodes[0] += 1
@@ -4348,7 +4458,15 @@ class MyAgent(Agent):
         blacklist it and re-solve."""
         sol = self._pc_solution
         pieces = self._pc_pieces
-        for pid in sorted(sol):
+        def work_rank(pid: int) -> tuple[int, int]:
+            if pid not in pieces:
+                return (0, pid)  # preserve immediate stale-plan failure
+            pat_t, _pos_t = sol[pid]
+            p = pieces[pid]
+            return (1 if pat_norm(p["cells"], p["ports"]) != pat_t else 2,
+                    pid)
+
+        for pid in sorted(sol, key=work_rank):
             if pid not in pieces:
                 self._pc_fail(sol)
                 return None
@@ -4416,6 +4534,13 @@ class MyAgent(Agent):
         # transform verb, L5's ping-pong shapes shift one blob diagonally)
         by_dir: dict[tuple[int, Cell], list[tuple[int, int]]] = {}
         for a, d in self._movement_rules().items():
+            xform_votes = self._xform_votes[a]
+            move_votes = max(self._move_votes[a].values(), default=0)
+            if xform_votes >= 2 and xform_votes >= 2 * move_votes:
+                # A variant cycle can fake a few coherent translations.  Once
+                # in-place evidence dominates by 2x, it is a transform verb,
+                # never one of the four movement controls.
+                continue
             s = abs(d[0]) + abs(d[1])
             if s >= 2 and (d[0] == 0 or d[1] == 0):
                 by_dir.setdefault((s, d), []).append(

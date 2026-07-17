@@ -879,6 +879,25 @@ def spell_campaign_portals(
     return sorted(by_target.values(), key=lambda p: p["bbox"])
 
 
+def spell_campaign_after_portal_grid(
+    grid: Grid, portal: dict[str, Any], floor: int,
+) -> Grid:
+    """Return the walk map expected immediately after using ``portal``.
+
+    The active nested marker is a non-collidable annotation which advances to
+    the next portal when teleport fires.  A pre-cast reachability proof must
+    therefore remove only that observed marker—not arbitrary coloured cells—
+    or it can reject a valid first step through the marker's old corner.
+    """
+    out = [row[:] for row in grid]
+    x0, y0, x1, y1 = portal["outer_bbox"]
+    marker_color = portal["color"]
+    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        if out[y][x] == marker_color:
+            out[y][x] = floor
+    return out
+
+
 def spell_campaign_setup(
     grid: Grid, available_actions: set[int],
 ) -> Optional[dict[str, Any]]:
@@ -1310,6 +1329,67 @@ def spell_campaign_signature_replaced(
     """Whether every remembered pixel was removed or replaced."""
     return bool(signature) and all(
         grid[y][x] != value for x, y, value in signature)
+
+
+def spell_campaign_revealed_pads(
+    grid: Grid, floor: int, cleared: list[dict[str, Any]],
+    actor_colors: tuple[int, int],
+) -> list[dict[str, Any]]:
+    """Find compact solid rewards revealed inside destroyed keyed rings.
+
+    Some multi-key campaigns use a destroyed ring as both a reward and a safe
+    staging footprint for the next scale transition.  The reward is not
+    assumed from a colour or coordinate: every remembered ring and gate must
+    be completely gone, and the replacement must be one smaller monochrome
+    solid rectangle contained by the old ring.  Returning the old ring bbox as
+    ``stage_bbox`` lets the runtime prove that the original-size actor will fit
+    there before it spends a scale cast.
+    """
+    pads: list[dict[str, Any]] = []
+    actor_palette = set(actor_colors)
+    wall = background_of(grid)
+    for target in cleared:
+        if not spell_campaign_signature_replaced(grid, target["signature"]) \
+                or not spell_campaign_signature_replaced(
+                    grid, target["gate_signature"]):
+            continue
+        tx0, ty0, tx1, ty1 = target["bbox"]
+        width, height = tx1 - tx0 + 1, ty1 - ty0 + 1
+        cells_by_color: dict[int, set[Cell]] = defaultdict(set)
+        for y in range(ty0, ty1 + 1):
+            for x in range(tx0, tx1 + 1):
+                value = grid[y][x]
+                if value not in (floor, wall) and value not in actor_palette:
+                    cells_by_color[value].add((x, y))
+        if len(cells_by_color) != 1:
+            continue
+        color, cells = next(iter(cells_by_color.items()))
+        if not cells:
+            continue
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        pad_width, pad_height = x1 - x0 + 1, y1 - y0 + 1
+        pad_cells = set(cells)
+        if pad_width >= width or pad_height >= height \
+                or len(cells) != pad_width * pad_height \
+                or len(cells) * 2 > width * height \
+                or any(
+                    grid[y][x] != floor and (x, y) not in pad_cells
+                    for y in range(ty0, ty1 + 1)
+                    for x in range(tx0, tx1 + 1)
+                ):
+            continue
+        pads.append({
+            "bbox": (x0, y0, x1, y1),
+            "stage_bbox": target["bbox"],
+            "signature": tuple(sorted(
+                (x, y, color) for x, y in cells)),
+            "ring_signature": target["signature"],
+        })
+    pads.sort(key=lambda pad: pad["bbox"])
+    return pads
 
 
 def spell_campaign_fire_plan(
@@ -3276,11 +3356,14 @@ class MyAgent(Agent):
             tuple[int, int, int], ...
         ] = tuple()
         self._spell_campaign_keyed: list[dict[str, Any]] = []
+        self._spell_campaign_cleared: list[dict[str, Any]] = []
         self._spell_campaign_target: Optional[dict[str, Any]] = None
+        self._spell_campaign_bridge_pad: Optional[dict[str, Any]] = None
         self._spell_campaign_initial_portal: Optional[dict[str, Any]] = None
         self._spell_campaign_portal_expected: Optional[
             tuple[int, int, int, int]
         ] = None
+        self._spell_campaign_portal_pixels: Optional[int] = None
         self._spell_campaign_three = False
         self._spell_campaign_expected: Optional[
             tuple[int, int, int, int]
@@ -5362,9 +5445,12 @@ class MyAgent(Agent):
         self._spell_campaign_fire_signature = tuple()
         self._spell_campaign_gate_signature = tuple()
         self._spell_campaign_keyed = []
+        self._spell_campaign_cleared = []
         self._spell_campaign_target = None
+        self._spell_campaign_bridge_pad = None
         self._spell_campaign_initial_portal = None
         self._spell_campaign_portal_expected = None
+        self._spell_campaign_portal_pixels = None
         self._spell_campaign_three = False
         self._spell_campaign_expected = None
         self._spell_campaign_steps = 0
@@ -5403,6 +5489,68 @@ class MyAgent(Agent):
         if actor["socket"]["bbox"] != self._spell_campaign_goal_bbox:
             return None
         return actor
+
+    def _spell_campaign_begin_bridge(
+        self, grid: Grid, mover: dict[str, Any],
+    ) -> bool:
+        """Stage a small actor on a verified reward revealed by a fire.
+
+        A bridge is armed only when the current component cannot reach any
+        live key, the actor is at the reduced scale, and a destroyed keyed
+        ring now contains a reachable compact solid pad.  The ring must be the
+        same size as the original actor, which gives a pixel-derived proof that
+        scaling there has enough room.
+        """
+        if self._spell_campaign_floor is None \
+                or self._spell_campaign_colors is None \
+                or self._spell_campaign_initial_bbox is None \
+                or mover["pixels"] * 4 != self._spell_campaign_initial_pixels:
+            return False
+        ix0, iy0, ix1, iy1 = self._spell_campaign_initial_bbox
+        initial_size = (ix1 - ix0 + 1, iy1 - iy0 + 1)
+        ranked: list[tuple[int, tuple[int, int, int, int], dict[str, Any]]] = []
+        for pad in spell_campaign_revealed_pads(
+                grid, self._spell_campaign_floor,
+                self._spell_campaign_cleared,
+                self._spell_campaign_colors):
+            sx0, sy0, sx1, sy1 = pad["stage_bbox"]
+            if (sx1 - sx0 + 1, sy1 - sy0 + 1) != initial_size:
+                continue
+            route = spell_campaign_route(
+                grid, mover["bbox"], self._spell_campaign_floor,
+                pad["bbox"], fire=False)
+            if route is None:
+                continue
+            path, _final, _expected = route
+            ranked.append((len(path) + 1, pad["bbox"], pad))
+        if not ranked:
+            return False
+        _cost, _bbox, pad = min(ranked, key=lambda item: (item[0], item[1]))
+        self._spell_campaign_bridge_pad = pad
+        self._spell_campaign_expected = None
+        self._spell_campaign_phase = "bridge_route_pad"
+        return True
+
+    def _spell_campaign_goal_portal(
+        self, grid: Grid, mover: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Return the unique *current* size-matched portal leading to goal."""
+        if self._spell_campaign_floor is None \
+                or self._spell_campaign_goal_bbox is None:
+            return None
+        usable = []
+        for portal in spell_campaign_portals(
+                grid, mover["bbox"], self._spell_campaign_floor):
+            if portal["bbox"] == mover["bbox"]:
+                continue
+            after = spell_campaign_after_portal_grid(
+                grid, portal, self._spell_campaign_floor)
+            route = spell_campaign_route(
+                after, portal["bbox"], self._spell_campaign_floor,
+                self._spell_campaign_goal_bbox, fire=False)
+            if route is not None:
+                usable.append(portal)
+        return usable[0] if len(usable) == 1 else None
 
     def _spell_campaign_policy(
         self, grid: Optional[Grid], latest_frame: FrameData,
@@ -5523,6 +5671,9 @@ class MyAgent(Agent):
                     grid, mover["bbox"], self._spell_campaign_floor,
                     self._spell_campaign_keyed)
                 if plan is None:
+                    if self._spell_campaign_three \
+                            and self._spell_campaign_begin_bridge(grid, mover):
+                        continue
                     self._spell_campaign_fail(level)
                     return None
                 target, path, final_action, expected = plan
@@ -5576,10 +5727,117 @@ class MyAgent(Agent):
                 ):
                     self._spell_campaign_fail(level)
                     return None
+                self._spell_campaign_cleared.append(target)
                 self._spell_campaign_keyed = remaining
                 self._spell_campaign_target = None
                 self._spell_campaign_phase = (
                     "route_fire" if remaining else "post_keys")
+                continue
+
+            if phase == "bridge_route_pad":
+                pad = self._spell_campaign_bridge_pad
+                if pad is None or self._spell_campaign_floor is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                # The solid reward is intentionally allowed as the route's
+                # final footprint, but pixels alone cannot prove it is
+                # enterable.  Once that final move is issued, require both
+                # the exact predicted actor motion and consumption of the pad
+                # on the very next frame.  A collidable lookalike is benched
+                # immediately instead of receiving the same move repeatedly.
+                if self._spell_campaign_expected is not None:
+                    expected = self._spell_campaign_expected
+                    self._spell_campaign_expected = None
+                    mx0, my0, mx1, my1 = mover["bbox"]
+                    sx0, sy0, sx1, sy1 = pad["stage_bbox"]
+                    staged = sx0 <= mx0 <= mx1 <= sx1 \
+                        and sy0 <= my0 <= my1 <= sy1
+                    mover_cells = set(mover["cells"])
+                    # _begin_bridge already requires stage_bbox to have the
+                    # exact initial actor dimensions, so this is the unique
+                    # possible expansion footprint.  Re-prove it immediately
+                    # before casting: only floor and the current reduced actor
+                    # may occupy any cell the larger body will need.
+                    scale_clear = all(
+                        grid[y][x] == self._spell_campaign_floor
+                        or (x, y) in mover_cells
+                        for y in range(sy0, sy1 + 1)
+                        for x in range(sx0, sx1 + 1)
+                    )
+                    if mover["bbox"] != expected or not staged \
+                            or not scale_clear \
+                            or not spell_campaign_signature_replaced(
+                                grid, pad["signature"]) \
+                            or mover["pixels"] * 4 \
+                            != self._spell_campaign_initial_pixels \
+                            or not self._spell_campaign_queue_cast(
+                                "scale", "bridge_scale_up_cast"):
+                        self._spell_campaign_fail(level)
+                        return None
+                    continue
+                if spell_campaign_signature_replaced(grid, pad["signature"]):
+                    self._spell_campaign_fail(level)
+                    return None
+                if not spell_campaign_signature_matches(
+                        grid, pad["signature"]):
+                    self._spell_campaign_fail(level)
+                    return None
+                route = spell_campaign_route(
+                    grid, mover["bbox"], self._spell_campaign_floor,
+                    pad["bbox"], fire=False)
+                if route is None:
+                    self._spell_campaign_fail(level)
+                    return None
+                path, final_action, expected = route
+                self._spell_campaign_steps += 1
+                if path:
+                    action_id = path[0]
+                else:
+                    self._spell_campaign_expected = expected
+                    action_id = final_action
+                return self._step(GameAction.from_id(action_id))
+
+            if phase == "bridge_scale_up_cast":
+                if mover["pixels"] != self._spell_campaign_initial_pixels \
+                        or self._spell_campaign_floor is None \
+                        or not self._spell_campaign_keyed:
+                    self._spell_campaign_fail(level)
+                    return None
+                # The newly active portal must do useful work: from its
+                # observed destination at least one untouched keyed ring has
+                # to be fire-reachable.  This prevents a decorative marker or
+                # an unhelpful portal cycle from consuming another cast.
+                useful = []
+                for portal in spell_campaign_portals(
+                        grid, mover["bbox"], self._spell_campaign_floor):
+                    if portal["bbox"] == mover["bbox"]:
+                        continue
+                    after = spell_campaign_after_portal_grid(
+                        grid, portal, self._spell_campaign_floor)
+                    plan = spell_campaign_fire_plan(
+                        after, portal["bbox"], self._spell_campaign_floor,
+                        self._spell_campaign_keyed)
+                    if plan is not None:
+                        useful.append(portal)
+                if len(useful) != 1:
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_portal_expected = useful[0]["bbox"]
+                self._spell_campaign_portal_pixels = mover["pixels"]
+                if not self._spell_campaign_queue_cast(
+                        "teleport", "bridge_teleport_cast"):
+                    self._spell_campaign_fail(level)
+                    return None
+                continue
+
+            if phase == "bridge_teleport_cast":
+                if mover["bbox"] != self._spell_campaign_portal_expected \
+                        or mover["pixels"] \
+                        != self._spell_campaign_portal_pixels:
+                    self._spell_campaign_fail(level)
+                    return None
+                self._spell_campaign_bridge_pad = None
+                self._spell_campaign_phase = "route_fire"
                 continue
 
             if phase == "post_keys":
@@ -5595,9 +5853,23 @@ class MyAgent(Agent):
                 if direct is not None:
                     self._spell_campaign_phase = "route_goal"
                     continue
+                # Portal markers can cycle after each cast.  Always read the
+                # current size-matched target and require a hypothetical route
+                # from its destination to the still-untouched socket.
+                portal = self._spell_campaign_goal_portal(grid, mover)
+                if portal is not None:
+                    self._spell_campaign_portal_expected = portal["bbox"]
+                    self._spell_campaign_portal_pixels = mover["pixels"]
+                    if not self._spell_campaign_queue_cast(
+                            "teleport", "goal_teleport_cast"):
+                        self._spell_campaign_fail(level)
+                        return None
+                    continue
                 if not self._spell_campaign_three \
                         or self._spell_campaign_initial_portal is None \
-                        or self._spell_campaign_initial_bbox is None:
+                        or self._spell_campaign_initial_bbox is None \
+                        or mover["pixels"] * 4 \
+                        != self._spell_campaign_initial_pixels:
                     self._spell_campaign_fail(level)
                     return None
                 # Scaling is justified only after proving both that the small
@@ -5605,8 +5877,11 @@ class MyAgent(Agent):
                 # active portal's destination has a valid route to it.
                 large_portal_bbox = \
                     self._spell_campaign_initial_portal["bbox"]
+                after = spell_campaign_after_portal_grid(
+                    grid, self._spell_campaign_initial_portal,
+                    self._spell_campaign_floor)
                 portal_route = spell_campaign_route(
-                    grid, large_portal_bbox, self._spell_campaign_floor,
+                    after, large_portal_bbox, self._spell_campaign_floor,
                     self._spell_campaign_goal_bbox, fire=False)
                 if portal_route is None or large_portal_bbox == mover["bbox"]:
                     self._spell_campaign_fail(level)
@@ -5624,22 +5899,30 @@ class MyAgent(Agent):
                     return None
                 portals = spell_campaign_portals(
                     grid, mover["bbox"], self._spell_campaign_floor)
-                initial_portal = self._spell_campaign_initial_portal
-                if len(portals) != 1 or initial_portal is None \
-                        or portals[0]["bbox"] != initial_portal["bbox"] \
-                        or portals[0]["bbox"] == mover["bbox"]:
+                useful = [
+                    portal for portal in portals
+                    if portal["bbox"] != mover["bbox"]
+                    and spell_campaign_route(
+                        spell_campaign_after_portal_grid(
+                            grid, portal, self._spell_campaign_floor),
+                        portal["bbox"], self._spell_campaign_floor,
+                        self._spell_campaign_goal_bbox, fire=False) is not None
+                ]
+                if len(useful) != 1:
                     self._spell_campaign_fail(level)
                     return None
-                self._spell_campaign_portal_expected = portals[0]["bbox"]
+                self._spell_campaign_portal_expected = useful[0]["bbox"]
+                self._spell_campaign_portal_pixels = mover["pixels"]
                 if not self._spell_campaign_queue_cast(
-                        "teleport", "teleport_large_cast"):
+                        "teleport", "goal_teleport_cast"):
                     self._spell_campaign_fail(level)
                     return None
                 continue
 
-            if phase == "teleport_large_cast":
+            if phase == "goal_teleport_cast":
                 if mover["bbox"] != self._spell_campaign_portal_expected \
-                        or mover["pixels"] != self._spell_campaign_initial_pixels:
+                        or mover["pixels"] \
+                        != self._spell_campaign_portal_pixels:
                     self._spell_campaign_fail(level)
                     return None
                 self._spell_campaign_phase = "route_goal"

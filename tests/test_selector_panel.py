@@ -409,6 +409,182 @@ class SelectorPanelTests(unittest.TestCase):
         self.assertEqual([portal["bbox"] for portal in small],
                          [(41, 41, 42, 42)])
 
+    def test_destroyed_ring_exposes_a_verified_scale_staging_pad(self) -> None:
+        grid = [[2 for _x in range(64)] for _y in range(64)]
+        ring = tuple(
+            (x, y, 6 if x in (10, 13) or y in (20, 23) else 13)
+            for y in range(20, 24) for x in range(10, 14)
+        )
+        gate = tuple(
+            (x, y, 13) for y in range(8, 11) for x in range(30, 34)
+        )
+        target = {
+            "bbox": (10, 20, 13, 23),
+            "signature": ring,
+            "gate_signature": gate,
+        }
+        for y in range(20, 22):
+            for x in range(10, 12):
+                grid[y][x] = 14
+
+        pads = self.module.spell_campaign_revealed_pads(
+            grid, 2, [target], (9, 10))
+
+        self.assertEqual(len(pads), 1)
+        self.assertEqual(pads[0]["bbox"], (10, 20, 11, 21))
+        self.assertEqual(pads[0]["stage_bbox"], target["bbox"])
+
+        # A ring that was only partly altered cannot certify a reward/stage.
+        incomplete = [row[:] for row in grid]
+        incomplete[23][13] = 6
+        self.assertEqual(self.module.spell_campaign_revealed_pads(
+            incomplete, 2, [target], (9, 10)), [])
+
+        # A compact patch in the dominant wall colour is a collidable
+        # lookalike, not a consumable reward.
+        walled = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(20, 22):
+            for x in range(10, 12):
+                walled[y][x] = 5
+        self.assertEqual(self.module.spell_campaign_revealed_pads(
+            walled, 2, [target], (9, 10)), [])
+
+        # Even with a valid reward, one wall cell elsewhere in the old ring
+        # makes its original-size scale footprint unsafe.
+        obstructed_stage = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(20, 24):
+            for x in range(10, 14):
+                obstructed_stage[y][x] = 2
+        for y in range(20, 22):
+            for x in range(10, 12):
+                obstructed_stage[y][x] = 14
+        obstructed_stage[23][13] = 5
+        self.assertEqual(self.module.spell_campaign_revealed_pads(
+            obstructed_stage, 2, [target], (9, 10)), [])
+
+    def test_portal_reachability_removes_only_the_advancing_marker(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        placements = [
+            (29, 33), (29, 29), (33, 29),
+            (33, 25), (33, 21), (33, 17), (33, 13),
+        ]
+        for x0, y0 in placements:
+            for y in range(y0, y0 + 4):
+                for x in range(x0, x0 + 4):
+                    grid[y][x] = 2
+        # The old active portal's outer corner blocks the only right turn in
+        # the pre-cast pixels, but this non-collidable marker advances as the
+        # teleport lands.  An unrelated same-colour pixel must remain intact.
+        grid[32][33] = 11
+        grid[34][28] = 11
+        grid[50][50] = 11
+        portal = {
+            "bbox": (29, 33, 32, 36),
+            "outer_bbox": (28, 32, 33, 37),
+            "color": 11,
+        }
+        raw = self.module.spell_campaign_route(
+            grid, portal["bbox"], 2, (33, 8, 38, 12), fire=False)
+        after = self.module.spell_campaign_after_portal_grid(
+            grid, portal, 2)
+        routed = self.module.spell_campaign_route(
+            after, portal["bbox"], 2, (33, 8, 38, 12), fire=False)
+
+        self.assertIsNone(raw)
+        self.assertIsNotNone(routed)
+        self.assertEqual(after[32][33], 2)
+        self.assertEqual(after[34][28], 11)
+        self.assertEqual(after[50][50], 11)
+        self.assertEqual(grid[32][33], 11)
+
+    def test_blocked_bridge_pad_move_benches_without_repeating(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        # A two-cell-high floor lane contains the reduced 2x2 actor and ends
+        # at a synthetic solid pad.  The large same-palette socket keeps the
+        # actor detector grounded while the pad deliberately remains present
+        # after the attempted final move, modelling a collidable lookalike.
+        for y in range(20, 22):
+            for x in range(10, 18):
+                grid[y][x] = 2
+        for y in range(8, 14):
+            for x in range(5, 10):
+                grid[y][x] = 9 if x < 7 else 10
+        for y in range(20, 22):
+            for x in range(14, 16):
+                grid[y][x] = 9 if x == 14 else 10
+        pad_signature = tuple(
+            (x, y, 14) for y in range(20, 22) for x in range(12, 14)
+        )
+        for x, y, value in pad_signature:
+            grid[y][x] = value
+
+        agent = self._agent()
+        agent._spell_campaign_level = 0
+        agent._spell_campaign_engaged = True
+        agent._spell_campaign_phase = "bridge_route_pad"
+        agent._spell_campaign_colors = (9, 10)
+        agent._spell_campaign_floor = 2
+        agent._spell_campaign_initial_pixels = 16
+        agent._spell_campaign_initial_bbox = (30, 30, 33, 33)
+        agent._spell_campaign_goal_bbox = (5, 8, 9, 13)
+        agent._spell_campaign_bridge_pad = {
+            "bbox": (12, 20, 13, 21),
+            "stage_bbox": (12, 20, 15, 23),
+            "signature": pad_signature,
+        }
+        frame = self._frame(grid)
+
+        first = agent._spell_campaign_policy(grid, frame)
+        second = agent._spell_campaign_policy(grid, frame)
+
+        self.assertIs(first, GameAction.ACTION3)
+        self.assertIsNone(second)
+        self.assertEqual(agent._spell_campaign_benched, 0)
+        self.assertFalse(agent._spell_campaign_engaged)
+
+    def test_bridge_scale_rechecks_the_full_original_footprint(self) -> None:
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(20, 24):
+            for x in range(12, 16):
+                grid[y][x] = 2
+        # The reduced actor has consumed the 2x2 reward at the upper-left of
+        # its old 4x4 ring, but a single wall cell still blocks expansion.
+        for y in range(20, 22):
+            for x in range(12, 14):
+                grid[y][x] = 9 if x == 12 else 10
+        grid[23][15] = 5
+        for y in range(8, 14):
+            for x in range(5, 10):
+                grid[y][x] = 9 if x < 7 else 10
+
+        agent = self._agent()
+        agent._spell_campaign_level = 0
+        agent._spell_campaign_engaged = True
+        agent._spell_campaign_phase = "bridge_route_pad"
+        agent._spell_campaign_cards = {
+            "scale": {"select": (30, 45), "clicks": []},
+        }
+        agent._spell_campaign_colors = (9, 10)
+        agent._spell_campaign_floor = 2
+        agent._spell_campaign_initial_pixels = 16
+        agent._spell_campaign_initial_bbox = (30, 30, 33, 33)
+        agent._spell_campaign_goal_bbox = (5, 8, 9, 13)
+        agent._spell_campaign_expected = (12, 20, 13, 21)
+        agent._spell_campaign_bridge_pad = {
+            "bbox": (12, 20, 13, 21),
+            "stage_bbox": (12, 20, 15, 23),
+            "signature": tuple(
+                (x, y, 14)
+                for y in range(20, 22) for x in range(12, 14)
+            ),
+        }
+
+        action = agent._spell_campaign_policy(grid, self._frame(grid))
+
+        self.assertIsNone(action)
+        self.assertEqual(agent._spell_campaign_benched, 0)
+        self.assertFalse(agent._spell_campaign_engaged)
+
     def test_fire_plan_allows_only_detected_decorations(self) -> None:
         grid = [[5 for _x in range(64)] for _y in range(64)]
         for y in range(6, 18):

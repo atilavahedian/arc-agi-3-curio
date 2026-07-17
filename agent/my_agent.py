@@ -210,6 +210,15 @@ SW_CLICK_COST = 2       # budget units a click edge spends (dc22 charges a
 SW_BFS_CAP = 6000       # (anchor x phase-vector) product-graph state budget
 SW_STRIKES = 10         # model surprises before the switch planner benches
                         # the level (novelty search takes over)
+MP_MOVE_MAX = 8         # largest axial rigid-body displacement a remote
+                        # manipulator observation may claim in one click
+MP_BODY_MIN = 16        # one INDIVIDUAL matched body component must be this
+                        # large (rejects paired thin-strip translations)
+MP_BODY_SIDE = 3        # and genuinely two-dimensional, not a moving strip
+MP_WALK_BASE = 4        # one directional probe per advertised simple action
+MP_WALK_REWARD = 2      # extra fuel per newly reached avatar anchor
+MP_WALK_MAX = 36        # bound even a productive local exploration burst
+MP_SWITCH_MISMATCH = 1  # retry the blocked move after each phase advance
 SL_ACCENT_MAX = 4       # max pixels a node-maze avatar accent color may span
                         # for the slide observer to track it (a unique tiny
                         # marker, not a sprawling object)
@@ -359,6 +368,76 @@ def shape_signature(color: int, cells: frozenset[Cell]) -> int:
         variants.append(tuple(sorted((x - mx, y - my) for x, y in pts)))
         pts = [(-y, x) for x, y in pts]  # rotate 90°
     return hash((color, min(variants)))
+
+
+def remote_translation(
+    prev: Grid, cur: Grid,
+    clicked: frozenset[Cell] = frozenset(),
+) -> Optional[tuple[Cell, tuple, Cell, frozenset[Cell], Cell,
+                    frozenset[Cell]]]:
+    """A strong remote rigid-body translation between settled frames.
+
+    Exact colored component shapes vote for an axial displacement, but the
+    winning displacement is accepted only when one *individual* matched
+    component is a sizeable 2-D body.  Aggregate synchronized strips are not
+    enough.  The representative body must also be remote from the component
+    that was clicked, excluding direct click-to-move pieces.
+
+    Returns ``(delta, mode, source_anchor, source_cells, dest_anchor,
+    dest_cells)``.  ``mode`` is the body's exact normalized visible shape;
+    it deliberately changes when a grab/tool action morphs the body.
+    """
+    grouped: list[dict[tuple, dict[Cell, frozenset[Cell]]]] = []
+    for grid in (prev, cur):
+        by_shape: dict[tuple, dict[Cell, frozenset[Cell]]] = defaultdict(dict)
+        for color, cells in components(grid):
+            if not 2 <= len(cells) <= 160:
+                continue
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            if max(xs) - min(xs) >= GROUP_BBOX \
+                    or max(ys) - min(ys) >= GROUP_BBOX:
+                continue
+            anchor = (min(xs), min(ys))
+            norm = tuple(sorted((x - anchor[0], y - anchor[1])
+                                for x, y in cells))
+            by_shape[(color, norm)][anchor] = cells
+        grouped.append(by_shape)
+    before, after = grouped
+    votes: Counter[Cell] = Counter()
+    strong: dict[Cell, list[tuple]] = defaultdict(list)
+    for mode in before.keys() & after.keys():
+        old = set(before[mode]) - set(after[mode])
+        new = set(after[mode]) - set(before[mode])
+        for src in old:
+            source = before[mode][src]
+            xs = [x for x, _y in source]
+            ys = [y for _x, y in source]
+            width = max(xs) - min(xs) + 1
+            height = max(ys) - min(ys) + 1
+            for dst in new:
+                delta = dst[0] - src[0], dst[1] - src[1]
+                if (delta[0] == 0) == (delta[1] == 0):
+                    continue  # zero or diagonal
+                if not 1 <= max(abs(delta[0]), abs(delta[1])) <= MP_MOVE_MAX:
+                    continue
+                dest = after[mode][dst]
+                votes[delta] += len(source)
+                if len(source) >= MP_BODY_MIN \
+                        and min(width, height) >= MP_BODY_SIDE \
+                        and not (source & clicked) and not (dest & clicked):
+                    strong[delta].append(
+                        (len(source), mode, src, source, dst, dest))
+    eligible = [(weight, delta) for delta, weight in votes.items()
+                if strong.get(delta)]
+    if not eligible:
+        return None
+    _weight, delta = max(eligible, key=lambda item: (item[0], item[1]))
+    # The compact controller is a better body landmark than a larger carried
+    # object that shares its displacement.
+    _n, mode, src, source, dst, dest = min(
+        strong[delta], key=lambda item: (item[0], item[2], item[4]))
+    return delta, mode, src, source, dst, dest
 
 
 def signature_under(
@@ -3434,6 +3513,59 @@ class MyAgent(Agent):
         self._sw_strikes = 0
         self._sw_benched: Optional[int] = None
         self._sw_nogoal: Optional[tuple] = None  # (key, phases) of a dry BFS
+        # ── remote manipulator (compound-controller family) ──
+        # A regular one-dimensional pad of direction buttons plus one adjacent
+        # mode button controls a separate visible rigid body.  Instance IDs
+        # include anchors because opposite buttons may render identically.
+        # Graph states are (normalized visible body shape, live body anchor),
+        # so attaching/carrying is observed as a mode transition rather than
+        # assumed from game-specific semantics.
+        self._mp_votes: dict[tuple[int, Cell], Counter[Cell]] = \
+            defaultdict(Counter)
+        self._mp_delta: dict[tuple[int, Cell], Cell] = {}
+        self._mp_actions: dict[tuple[int, Cell], Cell] = {}
+        self._mp_mode_button: Optional[tuple[int, Cell]] = None
+        self._mp_quarantine: set[int] = set()
+        self._mp_engaged = False
+        self._mp_modes: set[tuple] = set()
+        self._mp_state: Optional[tuple[tuple, Cell]] = None
+        self._mp_start: Optional[tuple[tuple, Cell]] = None
+        self._mp_body: frozenset[Cell] = frozenset()
+        self._mp_edges: dict[
+            tuple[tuple[tuple, Cell], tuple[int, Cell]], tuple[tuple, Cell]
+        ] = {}
+        self._mp_pending: Optional[
+            tuple[tuple[tuple, Cell], tuple[int, Cell], frozenset[Cell]]
+        ] = None
+        self._mp_last_mode: Optional[
+            tuple[tuple[tuple, Cell], tuple[int, Cell]]
+        ] = None
+        self._mp_resync: set[tuple[int, Cell]] = set()
+        self._mp_blocked: set[
+            tuple[tuple[tuple, Cell], tuple[int, Cell], Cell]
+        ] = set()
+        self._mp_world_seen: set[tuple] = set()
+        self._mp_world_epoch = 0
+        self._mp_productive: set[tuple[tuple, Cell]] = set()
+        self._mp_sweep: set[tuple[int, int]] = set()
+        self._mp_frontier_anchor: Optional[Cell] = None
+        self._mp_frontier_actions: set[int] = set()
+        self._mp_force_walk = False
+        self._mp_walk_epoch = 0
+        self._mp_walk: Counter[tuple] = Counter()
+        self._mp_av_open: dict[tuple[Cell, int], Cell] = {}
+        self._mp_av_tried: set[tuple] = set()
+        self._mp_av_budget: Counter[tuple] = Counter()
+        self._mp_av_new: dict[tuple, set[Cell]] = defaultdict(set)
+        self._mp_av_pending: Optional[tuple[tuple, Cell, int]] = None
+        self._mp_av_stop: set[tuple] = set()
+        self._mp_av_noop: dict[tuple[tuple, Cell], set[int]] = \
+            defaultdict(set)
+        self._mp_av_start: dict[tuple, Cell] = {}
+        self._mp_av_momentum: dict[tuple, int] = {}
+        self._mp_blocked_act: dict[Cell, int] = {}
+        self._mp_switch_pause: Optional[Cell] = None
+        self._mp_switch_rounds: Counter[Cell] = Counter()
         # ── slide / node-maze head (tu93 family) ──
         # A directional node-maze: each ACTION steps the avatar one corridor
         # node toward that direction (blocked moves spend budget, no motion).
@@ -3687,6 +3819,32 @@ class MyAgent(Agent):
             self._sw_strikes = 0
             self._sw_benched = None
             self._sw_nogoal = None
+            # A same-level replay restores the controller to its start body.
+            # Retain learned panel physics/edges, but reacquire live state.
+            self._mp_state = self._mp_start
+            self._mp_body = frozenset()
+            self._mp_pending = None
+            self._mp_last_mode = None
+            self._mp_resync.clear()
+            self._mp_blocked.clear()
+            self._mp_world_seen.clear()
+            self._mp_world_epoch = 0
+            self._mp_frontier_anchor = None
+            self._mp_frontier_actions.clear()
+            self._mp_force_walk = False
+            self._mp_walk_epoch = 0
+            self._mp_walk.clear()
+            self._mp_av_tried.clear()
+            self._mp_av_budget.clear()
+            self._mp_av_new.clear()
+            self._mp_av_pending = None
+            self._mp_av_stop.clear()
+            self._mp_av_noop.clear()
+            self._mp_av_start.clear()
+            self._mp_av_momentum.clear()
+            self._mp_blocked_act.clear()
+            self._mp_switch_pause = None
+            self._mp_switch_rounds.clear()
             # the slide maze level replays deterministically: refresh the
             # strikes/bench (board rewinds to its start), keep the engaged
             # flag, direction map and edge memory learned in this level.
@@ -3853,6 +4011,43 @@ class MyAgent(Agent):
             self._sw_strikes = 0
             self._sw_benched = None
             self._sw_nogoal = None
+            # Manipulator panel, body modes and graph are level geography.
+            self._mp_votes.clear()
+            self._mp_delta.clear()
+            self._mp_actions.clear()
+            self._mp_mode_button = None
+            self._mp_quarantine.clear()
+            self._mp_engaged = False
+            self._mp_modes.clear()
+            self._mp_state = None
+            self._mp_start = None
+            self._mp_body = frozenset()
+            self._mp_edges.clear()
+            self._mp_pending = None
+            self._mp_last_mode = None
+            self._mp_resync.clear()
+            self._mp_blocked.clear()
+            self._mp_world_seen.clear()
+            self._mp_world_epoch = 0
+            self._mp_productive.clear()
+            self._mp_sweep.clear()
+            self._mp_frontier_anchor = None
+            self._mp_frontier_actions.clear()
+            self._mp_force_walk = False
+            self._mp_walk_epoch = 0
+            self._mp_walk.clear()
+            self._mp_av_open.clear()
+            self._mp_av_tried.clear()
+            self._mp_av_budget.clear()
+            self._mp_av_new.clear()
+            self._mp_av_pending = None
+            self._mp_av_stop.clear()
+            self._mp_av_noop.clear()
+            self._mp_av_start.clear()
+            self._mp_av_momentum.clear()
+            self._mp_blocked_act.clear()
+            self._mp_switch_pause = None
+            self._mp_switch_rounds.clear()
             # editor geography: the new level has its own slots, reference
             # row and rules (the verbs and the cursor marker persist)
             self._ed_boxes.clear()
@@ -3943,6 +4138,30 @@ class MyAgent(Agent):
             self._wp_log.clear()
             self._wp_replay = None
             self._wp_pending_start = True
+            self._mp_state = self._mp_start
+            self._mp_body = frozenset()
+            self._mp_pending = None
+            self._mp_last_mode = None
+            self._mp_resync.clear()
+            self._mp_blocked.clear()
+            self._mp_world_seen.clear()
+            self._mp_world_epoch = 0
+            self._mp_frontier_anchor = None
+            self._mp_frontier_actions.clear()
+            self._mp_force_walk = False
+            self._mp_walk_epoch = 0
+            self._mp_walk.clear()
+            self._mp_av_tried.clear()
+            self._mp_av_budget.clear()
+            self._mp_av_new.clear()
+            self._mp_av_pending = None
+            self._mp_av_stop.clear()
+            self._mp_av_noop.clear()
+            self._mp_av_start.clear()
+            self._mp_av_momentum.clear()
+            self._mp_blocked_act.clear()
+            self._mp_switch_pause = None
+            self._mp_switch_rounds.clear()
             self._panel_clear(level=latest_frame.levels_completed)
             self._spell_clear(level=latest_frame.levels_completed)
             self._spell_campaign_clear(level=latest_frame.levels_completed)
@@ -3989,6 +4208,21 @@ class MyAgent(Agent):
                 x, y = map(int, self._prev_action[2:].split(","))
                 comps_prev = components(self._prev_grid)
                 sig = signature_under(comps_prev, (x, y))
+                # Remote rigid-body controls must claim their second
+                # consistent translation before it can masquerade as a tiny
+                # cyclic floor switch.  The first motion intentionally falls
+                # through so the switch event schedules a confirming probe.
+                mp_handled = self._learn_manip(
+                    grid, (x, y), comps_prev, sig)
+                if self._mp_engaged and len(self._mp_modes) >= 2:
+                    av_before = self._find_avatar(self._prev_grid)
+                    av_after = self._find_avatar(grid)
+                    if av_before is not None and av_after is not None \
+                            and (abs(av_after[0][0] - av_before[0][0])
+                                 + abs(av_after[0][1] - av_before[0][1])) > 4:
+                        self._mp_force_walk = True
+                        self._mp_walk_epoch += 1
+                        self._mp_world_epoch += 1
                 if frames and any(flood_color(f) != flood_color(grid)
                                   for f in frames[:-1]) \
                         and self._sw_band_drop(self._prev_grid, grid) \
@@ -4024,7 +4258,7 @@ class MyAgent(Agent):
                     self._gx_note_instance(
                         sig, (x, y), changed=changed, comps=comps_prev)
                 self._learn_click_fx(grid, (x, y), comps_prev, leveled)
-                if not leveled:
+                if not leveled and not mp_handled:
                     # SWITCH: record what this click repainted away from
                     # the click site (appended after the lattice path —
                     # ft09's machinery above is untouched)
@@ -4043,6 +4277,7 @@ class MyAgent(Agent):
             # attributes.  Drop the plan, learn nothing.
             self._plan.clear()
             return
+        self._mp_note_avatar(self._prev_grid, grid, act)
         reg = self._attr_register()
         self._budget_rose = False
         if reg is not None:
@@ -9015,6 +9250,325 @@ class MyAgent(Agent):
                     return False
         return True
 
+    @staticmethod
+    def _mp_id(
+        comps: list[tuple[int, frozenset[Cell]]], cell: Cell
+    ) -> Optional[tuple[int, Cell]]:
+        """Exact clickable component instance (appearance, live anchor)."""
+        for color, cells in comps:
+            if cell in cells:
+                return shape_signature(color, cells), min(cells)
+        return None
+
+    def _mp_panel(
+        self, comps: list[tuple[int, frozenset[Cell]]],
+        clicked_id: tuple[int, Cell], delta: Cell,
+    ) -> Optional[tuple[
+        dict[tuple[int, Cell], Cell], tuple[int, Cell]
+    ]]:
+        """Recognize a compact remote-control panel from frame geometry.
+
+        Four or more solid equal-square controls must form a regular 1-D run
+        containing the clicked instance.  Exactly one adjacent solid mode
+        control is elongated parallel to that run.  Dimensions, pitch,
+        orientation, colors and coordinates are all inferred from the frame.
+        """
+        items = []
+        clicked = None
+        for color, cells in comps:
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            box = (min(xs), min(ys), max(xs), max(ys))
+            width, height = box[2] - box[0] + 1, box[3] - box[1] + 1
+            ident = (shape_signature(color, cells), min(cells))
+            item = (ident, cells, box, width, height)
+            items.append(item)
+            if ident == clicked_id:
+                clicked = item
+        if clicked is None:
+            return None
+        _cid, ccells, cbox, width, height = clicked
+        if width != height or width < MP_BODY_SIDE \
+                or len(ccells) != width * height:
+            return None
+        side = width
+        squares = [item for item in items
+                   if item[3] == side and item[4] == side
+                   and len(item[1]) == side * side]
+        panels = []
+        for horizontal in (True, False):
+            cross = cbox[1] if horizontal else cbox[0]
+            line = [item for item in squares
+                    if abs((item[2][1] if horizontal else item[2][0])
+                           - cross) <= 1]
+            line.sort(key=lambda item: item[2][0] if horizontal
+                      else item[2][1])
+            for lo in range(len(line)):
+                for hi in range(lo + 4, len(line) + 1):
+                    run = line[lo:hi]
+                    if not any(item[0] == clicked_id for item in run):
+                        continue
+                    coords = [item[2][0] if horizontal else item[2][1]
+                              for item in run]
+                    gaps = [b - a for a, b in zip(coords, coords[1:])]
+                    if not gaps or min(gaps) < side \
+                            or max(gaps) > 3 * side \
+                            or max(gaps) - min(gaps) > 1:
+                        continue
+                    pitch = round(sum(gaps) / len(gaps))
+                    magnitude = max(abs(delta[0]), abs(delta[1]))
+                    if not side - 1 <= magnitude <= pitch:
+                        continue
+                    rset = {item[0] for item in run}
+                    rx0 = min(item[2][0] for item in run)
+                    ry0 = min(item[2][1] for item in run)
+                    rx1 = max(item[2][2] for item in run)
+                    ry1 = max(item[2][3] for item in run)
+                    modes = []
+                    for item in items:
+                        ident, cells, box, w, h = item
+                        if ident in rset or len(cells) != w * h:
+                            continue
+                        long_side = w if horizontal else h
+                        short_side = h if horizontal else w
+                        if not (2 * side <= long_side <= 3 * side
+                                and 2 <= short_side < side):
+                            continue
+                        cx2, cy2 = box[0] + box[2], box[1] + box[3]
+                        if horizontal:
+                            if not 2 * rx0 <= cx2 <= 2 * rx1:
+                                continue
+                            gap = (box[1] - ry1 - 1 if box[1] > ry1
+                                   else ry0 - box[3] - 1
+                                   if box[3] < ry0 else 0)
+                        else:
+                            if not 2 * ry0 <= cy2 <= 2 * ry1:
+                                continue
+                            gap = (box[0] - rx1 - 1 if box[0] > rx1
+                                   else rx0 - box[2] - 1
+                                   if box[2] < rx0 else 0)
+                        if 1 <= gap <= pitch:
+                            modes.append(item)
+                    if len(modes) == 1:
+                        panels.append((len(run), -max(gaps) + min(gaps),
+                                       run, modes[0]))
+        if not panels:
+            return None
+        _n, _regularity, run, mode = max(panels, key=lambda p: p[:2])
+        actions = {item[0]: self._sw_click_cell(item[1]) for item in run}
+        actions[mode[0]] = self._sw_click_cell(mode[1])
+        return actions, mode[0]
+
+    @staticmethod
+    def _mp_body_mode(color: int, cells: frozenset[Cell]) -> tuple:
+        anchor = min(cells)
+        return color, tuple(sorted((x - anchor[0], y - anchor[1])
+                                   for x, y in cells))
+
+    def _mp_near_body(
+        self, comps: list[tuple[int, frozenset[Cell]]],
+        old: frozenset[Cell],
+    ) -> Optional[tuple[tuple, Cell, frozenset[Cell]]]:
+        """The settled controller body overlapping a pre-click body."""
+        if not old:
+            return None
+        ox = [x for x, _y in old]
+        oy = [y for _x, y in old]
+        obox = (min(ox), min(oy), max(ox), max(oy))
+        found = []
+        for color, cells in comps:
+            if len(cells) < MP_BODY_MIN:
+                continue
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            box = (min(xs), min(ys), max(xs), max(ys))
+            if min(box[2] - box[0] + 1, box[3] - box[1] + 1) \
+                    < MP_BODY_SIDE:
+                continue
+            gapx = max(0, obox[0] - box[2] - 1, box[0] - obox[2] - 1)
+            gapy = max(0, obox[1] - box[3] - 1, box[1] - obox[3] - 1)
+            if gapx > 1 or gapy > 1:
+                continue
+            overlap = len(old & cells)
+            found.append((-overlap, len(cells), min(cells), color, cells))
+        if not found:
+            return None
+        _overlap, _n, anchor, color, cells = min(found)
+        return self._mp_body_mode(color, cells), anchor, cells
+
+    def _mp_quarantine_switches(self) -> None:
+        """Remove early controller motions from the cyclic-switch model."""
+        dirty = False
+        for sig in self._mp_quarantine:
+            if sig in self._sw_recs or sig in self._sw_probe \
+                    or sig in self._sw_belief:
+                dirty = True
+            self._sw_recs.pop(sig, None)
+            self._sw_probe.pop(sig, None)
+            self._sw_belief.pop(sig, None)
+        if dirty:
+            self._sw_plan.clear()
+            self._sw_nogoal = None
+
+    def _mp_infer_opposite(self, ident: tuple[int, Cell], delta: Cell) -> None:
+        """Infer the inverse control from an identical-looking peer pair."""
+        peers = [button for button in self._mp_actions
+                 if button[0] == ident[0] and button != ident]
+        if len(peers) == 1:
+            self._mp_delta.setdefault(peers[0], (-delta[0], -delta[1]))
+
+    def _mp_sw_epoch(self) -> int:
+        return sum(len(rec.get("events", ()))
+                   for sig, rec in self._sw_recs.items()
+                   if sig not in self._mp_quarantine)
+
+    def _mp_note_avatar(self, prev: Grid, cur: Grid, act: int) -> None:
+        """Record one observed avatar edge under the current body placement."""
+        if not self._mp_engaged or len(self._mp_modes) < 2 \
+                or self._mp_state is None:
+            return
+        before = self._find_avatar(prev)
+        after = self._find_avatar(cur)
+        if before is None or after is None:
+            return
+        context = (self._mp_state, self._mp_sw_epoch(), self._mp_walk_epoch)
+        key = (context, before[0], act)
+        self._mp_av_tried.add(key)
+        self._mp_av_open[key] = after[0]
+        if after[0] == before[0]:
+            self._mp_blocked_act[before[0]] = act
+        if self._mp_av_pending == (context, before[0], act):
+            # A systematic probe that hits a wall after the ordinary planner
+            # has gone dry is causal evidence that this body placement has
+            # reached its local frontier.  Yield to a remote-body experiment
+            # now, while preserving the avatar at that boundary, instead of
+            # walking the entire reachable island backwards.
+            if after[0] == before[0]:
+                noops = self._mp_av_noop[(context, before[0])]
+                noops.add(act)
+                start = self._mp_av_start.get(context)
+                if not self._mp_force_walk and start is not None \
+                        and len(noops) >= 2 \
+                        and (abs(before[0][0] - start[0])
+                             + abs(before[0][1] - start[1])) >= GRID // 4:
+                    self._mp_av_stop.add(context)
+                    self._mp_world_epoch += 1
+                    self._mp_frontier_anchor = before[0]
+                    self._mp_frontier_actions = set(noops)
+            elif self._mp_frontier_anchor == before[0] \
+                    and after[0] not in self._visited_anchors:
+                self._mp_frontier_anchor = None
+                self._mp_frontier_actions.clear()
+                self._mp_world_epoch += 1
+            self._mp_av_pending = None
+        # The ordinary planner has not yet seen this post-action frame, so its
+        # global anchor set is a clean novelty oracle here.  Productive body
+        # placements earn enough fuel to keep following a newly opened
+        # corridor; unproductive placements still stop after a few probes.
+        if after[0] != before[0] and after[0] not in self._visited_anchors:
+            self._mp_av_new[context].add(after[0])
+            self._mp_productive.add(self._mp_state)
+            self._mp_av_momentum[context] = act
+
+    def _learn_manip(
+        self, grid: Grid, click: Cell,
+        comps_prev: list[tuple[int, frozenset[Cell]]], sig: int,
+    ) -> bool:
+        """Learn one remote-control click before cyclic-switch learning.
+
+        The first strong motion remains available to `_learn_switch`: its one
+        event schedules the second probe.  A second consistent motion plus the
+        compound panel grammar claims the controls, purges that tentative
+        switch event, and owns all later actions from those exact instances.
+        """
+        ident = self._mp_id(comps_prev, click)
+        if ident is None:
+            return False
+        owned = ident in self._mp_actions
+        clicked = next((cells for _color, cells in comps_prev if click in cells),
+                       frozenset())
+        moved = remote_translation(self._prev_grid, grid, clicked)
+        if moved is not None:
+            delta, mode, _src, source, _dst, dest = moved
+            # Position is a latent lattice coordinate updated only by proven
+            # translations.  Rendered body anchors can shift by one pixel in
+            # click-feedback frames, so they are not controller graph nodes.
+            if self._mp_state is None:
+                source_state = (mode, (0, 0))
+                if self._mp_start is None:
+                    self._mp_start = source_state
+            else:
+                old_mode, pos = self._mp_state
+                source_state = (mode, pos)
+                if old_mode != mode and self._mp_last_mode is not None:
+                    # A preceding mode-button click visibly changed the body;
+                    # the next actual translation confirms that persistent
+                    # mode and repairs the provisional self-loop.
+                    self._mp_edges[self._mp_last_mode] = source_state
+            pos = source_state[1]
+            dest_state = (mode, (pos[0] + delta[0], pos[1] + delta[1]))
+            self._mp_votes[ident][delta] += 1
+            self._mp_delta[ident] = delta
+            self._mp_edges[(source_state, ident)] = dest_state
+            self._mp_modes.add(mode)
+            self._mp_state = dest_state
+            self._mp_body = dest
+            self._mp_last_mode = None
+            self._mp_resync.clear()
+            confirmed = False
+            if self._mp_votes[ident][delta] >= 2:
+                panel = self._mp_panel(comps_prev, ident, delta)
+                if panel is not None:
+                    self._mp_actions, self._mp_mode_button = panel
+                    self._mp_quarantine = {
+                        button[0] for button in self._mp_actions}
+                    self._mp_engaged = True
+                    self._mp_quarantine_switches()
+                    self._mp_infer_opposite(ident, delta)
+                    confirmed = True
+            if owned:
+                self._mp_infer_opposite(ident, delta)
+            if owned or confirmed:
+                self._mp_pending = None
+                self._sw_plan.clear()
+                self._sw_nogoal = None
+                if len(self._mp_modes) >= 2:
+                    # A carried remote body can rewrite topology at every
+                    # placement.  Positional wall marks from the preceding
+                    # placement are stale; appearance-keyed switch evidence
+                    # remains intact.
+                    self._walls.clear()
+                    self._wall_bounces.clear()
+                return True
+            return False
+        if not owned:
+            return False
+        # A blocked direction or a mode click is provisionally a self-loop.
+        # We do NOT key state from the click-feedback sprite: the next proven
+        # translation confirms whether the mode button persistently changed
+        # the body and repairs this edge above.
+        if self._mp_pending is not None:
+            source_state, pending_id, _old_body = self._mp_pending
+            if pending_id == ident:
+                initial_mode = (self._mp_start[0]
+                                if self._mp_start is not None else None)
+                if ident != self._mp_mode_button \
+                        and source_state[0] != initial_mode:
+                    # A carried body can be blocked temporarily by the avatar
+                    # standing on it.  Keep that fact local to the observed
+                    # avatar anchor; it is not a permanent controller edge.
+                    av = self._find_avatar(self._prev_grid)
+                    if av is not None:
+                        self._mp_blocked.add((source_state, ident, av[0]))
+                else:
+                    self._mp_edges[(source_state, ident)] = source_state
+                if ident == self._mp_mode_button:
+                    self._mp_last_mode = (source_state, ident)
+        else:
+            self._mp_resync.add(ident)
+        self._mp_pending = None
+        return True
+
     def _learn_switch(
         self, grid: Grid, click: Cell,
         comps_prev: list[tuple[int, frozenset[Cell]]], sig: int,
@@ -9261,6 +9815,372 @@ class MyAgent(Agent):
             return self._pc_click((x, y), "switch plan click")
         return self._step(GameAction.from_id(int(key)))
 
+    def _mp_refresh(
+        self, comps: list[tuple[int, frozenset[Cell]]]
+    ) -> None:
+        """Refresh static button hit cells and resync after a level reset."""
+        if not self._mp_engaged:
+            return
+        live = {}
+        for color, cells in comps:
+            ident = (shape_signature(color, cells), min(cells))
+            if ident in self._mp_actions:
+                live[ident] = self._sw_click_cell(cells)
+        self._mp_actions.update(live)
+        self._mp_quarantine_switches()
+
+    def _mp_emit(self, ident: tuple[int, Cell], why: str) -> GameAction:
+        """Click one learned panel instance with source-state bookkeeping."""
+        if self._mp_state is not None:
+            self._mp_pending = (self._mp_state, ident, self._mp_body)
+        else:
+            self._mp_pending = None
+        return self._pc_click(self._mp_actions[ident], why)
+
+    def _mp_route(
+        self, start: tuple[tuple, Cell], predicate: Any,
+        actions: list[tuple[int, Cell]],
+        blocked_anchor: Optional[Cell] = None,
+    ) -> Optional[list[tuple[int, Cell]]]:
+        """Shortest known directed controller-graph route to a predicate."""
+        dq = deque([(start, [])])
+        seen = {start}
+        known = {start}
+        for (source, _ident), dest in self._mp_edges.items():
+            if source[0] == start[0]:
+                known.add(source)
+                known.add(dest)
+        while dq and len(seen) <= 512:
+            state, path = dq.popleft()
+            if state != start and predicate(state):
+                return path
+            for ident in actions:
+                if blocked_anchor is not None \
+                        and (state, ident, blocked_anchor) in self._mp_blocked:
+                    continue
+                dest = self._mp_edges.get((state, ident))
+                if dest is None:
+                    delta = self._mp_delta.get(ident)
+                    if delta is not None:
+                        predicted = (
+                            state[0],
+                            (state[1][0] + delta[0],
+                             state[1][1] + delta[1]),
+                        )
+                        if predicted in known:
+                            dest = predicted
+                if dest is None or dest == state or dest in seen:
+                    continue
+                seen.add(dest)
+                dq.append((dest, path + [ident]))
+        return None
+
+    def _mp_avatar_policy(
+        self, avatar: tuple[Cell, frozenset[Cell]],
+        move_actions: set[int],
+    ) -> Optional[GameAction]:
+        """Bounded systematic avatar-edge search at one body placement."""
+        if self._mp_state is None or len(self._mp_modes) < 2:
+            return None
+        context = (self._mp_state, self._mp_sw_epoch(), self._mp_walk_epoch)
+        if context in self._mp_av_stop:
+            return None
+        budget_key = context
+        self._mp_av_start.setdefault(context, avatar[0])
+        cap = min(MP_WALK_MAX,
+                  MP_WALK_BASE + MP_WALK_REWARD
+                  * len(self._mp_av_new[context]))
+        acts = sorted(move_actions)
+        momentum = self._mp_av_momentum.get(context)
+        inverse = None
+        rules = self._movement_rules()
+        if momentum in rules:
+            delta = rules[momentum]
+            inverse = next(
+                (act for act, d in rules.items()
+                 if d == (-delta[0], -delta[1])),
+                None,
+            )
+        ordered_acts = ([momentum] if momentum in move_actions else []) \
+            + [act for act in acts if act not in (momentum, inverse)] \
+            + ([inverse] if inverse in move_actions else [])
+        anchor = avatar[0]
+
+        # While changing a remote body to open a newly reached boundary,
+        # retry only the directions that actually bounced there.  This keeps
+        # the avatar parked at the causal frontier instead of walking the
+        # solved island backwards at every intermediate body placement.
+        if anchor == self._mp_frontier_anchor:
+            for act in sorted(self._mp_frontier_actions):
+                key = (context, anchor, act)
+                if key not in self._mp_av_tried:
+                    self._mp_av_tried.add(key)
+                    self._mp_av_pending = (context, anchor, act)
+                    return self._step(GameAction.from_id(act))
+            self._mp_av_stop.add(context)
+            return None
+
+        def unseen(pos: Cell) -> bool:
+            return any((context, pos, act) not in self._mp_av_tried
+                       for act in acts)
+
+        if self._mp_av_budget[budget_key] < cap:
+            for act in ordered_acts:
+                key = (context, anchor, act)
+                if key not in self._mp_av_tried:
+                    self._mp_av_tried.add(key)
+                    self._mp_av_budget[budget_key] += 1
+                    self._mp_av_pending = (context, anchor, act)
+                    return self._step(GameAction.from_id(act))
+        # Navigate through already observed successful edges to the nearest
+        # anchor that still has an untried direction in this exact placement.
+        dq = deque([(anchor, [])])
+        seen = {anchor}
+        while dq and len(seen) <= 256:
+            pos, path = dq.popleft()
+            if pos != anchor and unseen(pos) \
+                    and self._mp_av_budget[budget_key] < cap:
+                self._mp_av_pending = (context, anchor, path[0])
+                return self._step(GameAction.from_id(path[0]))
+            for act in ordered_acts:
+                dest = self._mp_av_open.get((context, pos, act))
+                if dest is None or dest == pos or dest in seen:
+                    continue
+                seen.add(dest)
+                dq.append((dest, path + [act]))
+        # The local graph is exhausted (or its productive burst reached the
+        # cap).  Park at the farthest newly discovered two-wall boundary
+        # before moving the remote body.  Choosing after exploration avoids
+        # mistaking an early corridor corner for the actual bridge frontier.
+        start_anchor = self._mp_av_start[context]
+        frontiers = [
+            pos for pos in self._mp_av_new[context]
+            if len(self._mp_av_noop.get((context, pos), ())) >= 2
+        ]
+        if frontiers:
+            target = max(
+                frontiers,
+                key=lambda pos: (
+                    abs(pos[0] - start_anchor[0])
+                    + abs(pos[1] - start_anchor[1]),
+                    -pos[1], -pos[0],
+                ),
+            )
+            if anchor == target:
+                if self._mp_force_walk:
+                    self._mp_force_walk = False
+                    self._mp_av_stop.add(context)
+                    return None
+                self._mp_av_stop.add(context)
+                self._mp_world_epoch += 1
+                self._mp_frontier_anchor = target
+                self._mp_frontier_actions = set(
+                    self._mp_av_noop[(context, target)])
+                return None
+            dq = deque([(anchor, [])])
+            seen = {anchor}
+            while dq and len(seen) <= 256:
+                pos, path = dq.popleft()
+                if pos == target and path:
+                    self._mp_av_pending = (context, anchor, path[0])
+                    return self._step(GameAction.from_id(path[0]))
+                for act in acts:
+                    dest = self._mp_av_open.get((context, pos, act))
+                    if dest is None or dest == pos or dest in seen:
+                        continue
+                    seen.add(dest)
+                    dq.append((dest, path + [act]))
+        if self._mp_force_walk:
+            self._mp_force_walk = False
+        return None
+
+    def _manip_policy(
+        self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
+        avatar: tuple[Cell, frozenset[Cell]],
+        move_actions: set[int],
+    ) -> Optional[GameAction]:
+        """Explore the learned controller graph, then tour world contexts.
+
+        Existing switch routing calls this only after its movement plans and
+        finite ordinary-switch probes are dry.  Thus every newly positioned
+        remote body is offered to the avatar planner before it moves again.
+        """
+        self._mp_refresh(comps)
+        if not self._mp_engaged or len(self._mp_actions) < 5:
+            return None
+        controls = sorted(
+            (ident for ident in self._mp_actions
+             if ident != self._mp_mode_button),
+            key=lambda ident: (ident[1][1], ident[1][0], ident[0]))
+        initial_mode = self._mp_start[0] if self._mp_start is not None else None
+        mode_available = self._mp_mode_button in self._mp_actions \
+            and (self._mp_state is None
+                 or self._mp_state[0] == initial_mode)
+        actions = controls
+        if self._mp_state is None:
+            for ident in controls:
+                if ident not in self._mp_resync:
+                    return self._mp_emit(ident, "resync remote controller")
+            self._mp_resync.clear()
+            return self._mp_emit(controls[0], "resync remote controller")
+        state = self._mp_state
+        known = {state}
+        for (source, _ident), dest in self._mp_edges.items():
+            if source[0] == state[0]:
+                known.add(source)
+                known.add(dest)
+        # A mode click changes the payload carried by the remote body, not
+        # the control panel's coordinate lattice.  Learn that lattice while
+        # the body is unladen, then restrict later modes to the already
+        # demonstrated positions.  Payload collisions may remove an edge
+        # (the attempted move becomes a self-loop), but cannot create a new
+        # controller coordinate.  Without this invariant the explorer spends
+        # most of its budget probing the same impossible outward moves again
+        # for every carried-body appearance.
+        initial_positions: set[Cell] = set()
+        if initial_mode is not None:
+            if self._mp_start is not None:
+                initial_positions.add(self._mp_start[1])
+            for (source, _ident), dest in self._mp_edges.items():
+                if source[0] == initial_mode:
+                    initial_positions.add(source[1])
+                    if dest[0] == initial_mode:
+                        initial_positions.add(dest[1])
+
+        def needs(s: tuple[tuple, Cell], ident: tuple[int, Cell],
+                  forward: bool) -> bool:
+            if (s, ident, avatar[0]) in self._mp_blocked:
+                return False
+            if (s, ident) in self._mp_edges:
+                return False
+            delta = self._mp_delta.get(ident)
+            if delta is None:
+                return forward  # learn each direction from any movable node
+            predicted = (s[0], (s[1][0] + delta[0], s[1][1] + delta[1]))
+            if s[0] != initial_mode \
+                    and predicted[1] not in initial_positions:
+                return False
+            if forward and predicted not in known:
+                # The controller is a one-dimensional articulated track.  A
+                # coordinate with two already demonstrated neighbours is an
+                # interior track node; trying its remaining axial controls
+                # can only spend budget on off-track space.  Endpoints (one
+                # neighbour) are still fully probed, so branches cannot be
+                # silently truncated.
+                neighbours = {
+                    (s[1][0] + d[0], s[1][1] + d[1])
+                    for button in controls
+                    if (d := self._mp_delta.get(button)) is not None
+                    and (s[0], (s[1][0] + d[0],
+                                s[1][1] + d[1])) in known
+                }
+                if len(neighbours) >= 2:
+                    return False
+            return (predicted not in known) if forward else (predicted in known)
+
+        def has_frontier(s: tuple[tuple, Cell]) -> bool:
+            return any(needs(s, ident, True) for ident in actions)
+
+        for ident in actions:
+            if needs(state, ident, True):
+                return self._mp_emit(ident, "probe remote controller edge")
+        route = self._mp_route(
+            state, has_frontier, actions, blocked_anchor=avatar[0])
+        if route:
+            return self._mp_emit(route[0], "route to controller frontier")
+        # A mode action is alignment-dependent in this family of mechanisms.
+        # First learn the complete unloaded control lattice, then try the mode
+        # action once at each coordinate.  Interleaving mode tests with
+        # topology discovery can attach a payload before half of the lattice
+        # is known, leaving later exploration unable to distinguish a genuine
+        # boundary from a payload collision.
+        if mode_available and self._mp_mode_button is not None:
+            learned_modes = [
+                (source, dest)
+                for (source, ident), dest in self._mp_edges.items()
+                if ident == self._mp_mode_button
+                and source[0] == initial_mode and dest[0] != initial_mode
+            ]
+            if learned_modes:
+                source, _dest = min(learned_modes, key=lambda item: item[0][1])
+                if state == source:
+                    return self._mp_emit(
+                        self._mp_mode_button, "restore learned remote mode")
+                route = self._mp_route(
+                    state, lambda target, goal=source: target == goal,
+                    controls, blocked_anchor=avatar[0])
+                if route:
+                    return self._mp_emit(
+                        route[0], "route to learned remote mode")
+
+            def mode_untested(s: tuple[tuple, Cell]) -> bool:
+                return (s, self._mp_mode_button) not in self._mp_edges
+
+            if mode_untested(state):
+                return self._mp_emit(
+                    self._mp_mode_button, "probe aligned remote mode")
+            route = self._mp_route(
+                state, mode_untested, controls, blocked_anchor=avatar[0])
+            if route:
+                return self._mp_emit(route[0], "route to remote mode probe")
+        attached_positions = {s[1] for s in known}
+        topology_ready = state[0] == initial_mode \
+            or bool(initial_positions) \
+            and initial_positions <= attached_positions
+        if topology_ready:
+            walk = self._mp_avatar_policy(avatar, move_actions)
+            if walk is not None:
+                return walk
+        # Once the controller graph is known, revisit each reachable body
+        # placement whenever the avatar geography or ordinary-switch evidence
+        # changes.  This is what discovers a movable bridge's useful placements
+        # without encoding a target coordinate or action trace.
+        sw_epoch = self._mp_sw_epoch()
+        world = (self._mp_world_epoch, sw_epoch)
+        self._mp_world_seen.add((world, state))
+        if self._mp_productive and self._mp_frontier_anchor is None:
+            route = self._mp_route(
+                state,
+                lambda target: target in self._mp_productive
+                and (world, target) not in self._mp_world_seen,
+                actions,
+                blocked_anchor=avatar[0],
+            )
+            if route:
+                return self._mp_emit(route[0], "revisit productive placement")
+            # Once at least one placement has expanded the avatar geography,
+            # do not re-test every inert placement after each switch phase.
+            # A bounded ordinary-switch perturbation below creates the next
+            # causal context instead.
+            for sig, rec in sorted(self._sw_recs.items()):
+                sweep_key = (self._mp_world_epoch, sig)
+                if sig in self._mp_quarantine or sweep_key in self._mp_sweep \
+                        or not rec.get("events") \
+                        or set(rec.get("mask", ())) & set(avatar[1]):
+                    continue
+                cand = next(
+                    (cells for color, cells in comps
+                     if shape_signature(color, cells) == sig
+                     and not (cells & set(rec.get("mask", ())))),
+                    None,
+                )
+                if cand is not None:
+                    self._mp_sweep.add(sweep_key)
+                    return self._pc_click(
+                        self._sw_click_cell(cand),
+                        "perturb switch after body-placement sweep",
+                    )
+            return None
+        route = self._mp_route(
+            state,
+            lambda target: (world, target) not in self._mp_world_seen,
+            actions,
+            blocked_anchor=avatar[0],
+        )
+        if route:
+            return self._mp_emit(route[0], "tour remote body placement")
+        return None
+
     def _switch_policy(
         self, grid: Optional[Grid], latest_frame: FrameData
     ) -> Optional[GameAction]:
@@ -9306,9 +10226,39 @@ class MyAgent(Agent):
                 and flood_color(self._prev_grid) == flood_color(grid):
             self._observe_budget(self._prev_grid, grid)
         comps = components(grid)
+        self._mp_refresh(comps)
+        if self._mp_frontier_anchor == avatar[0]:
+            return self._manip_policy(grid, comps, avatar, simple)
+        if self._mp_force_walk:
+            return self._manip_policy(grid, comps, avatar, simple)
+        if self._mp_engaged and self._mp_state is not None \
+                and self._mp_start is not None \
+                and self._mp_state[0] != self._mp_start[0]:
+            initial_positions = {self._mp_start[1]}
+            attached_positions = {self._mp_state[1]}
+            for (source, _ident), dest in self._mp_edges.items():
+                if source[0] == self._mp_start[0]:
+                    initial_positions.add(source[1])
+                    if dest[0] == self._mp_start[0]:
+                        initial_positions.add(dest[1])
+                if source[0] == self._mp_state[0]:
+                    attached_positions.add(source[1])
+                    if dest[0] == self._mp_state[0]:
+                        attached_positions.add(dest[1])
+            if not initial_positions <= attached_positions:
+                return self._manip_policy(grid, comps, avatar, simple)
+        if self._mp_switch_pause is not None:
+            paused = self._mp_switch_pause
+            self._mp_switch_pause = None
+            if avatar[0] != paused:
+                self._mp_switch_rounds.pop(paused, None)
+            elif self._mp_switch_rounds[paused] >= SW_CYCLE_CAP:
+                return self._manip_policy(grid, comps, avatar, simple)
         confirmed: dict[int, tuple] = {}
         mask_cells: set[Cell] = set()
         for s in self._sw_recs:
+            if s in self._mp_quarantine:
+                continue
             cyc = self._switch_cycle(s)
             if cyc is not None:
                 confirmed[s] = cyc
@@ -9360,6 +10310,21 @@ class MyAgent(Agent):
                 return self._sw_emit(key)
             self._sw_plan.clear()
             self._sw_strikes += 1
+            if self._mp_engaged \
+                    and self._sw_strikes >= MP_SWITCH_MISMATCH:
+                # A remote switch plan that repeatedly predicts the wrong
+                # successor at one fixed anchor is usually trying to open the
+                # very edge that just bounced.  After a bounded click burst,
+                # retry that observed blocked action before spending another
+                # switch cycle.  If it remains blocked, the pause delegates to
+                # the bounded local/controller explorer on the next frame.
+                self._mp_switch_pause = avatar[0]
+                self._mp_switch_rounds[avatar[0]] += 1
+                self._sw_strikes = 0
+                retry = self._mp_blocked_act.get(avatar[0])
+                if retry in simple:
+                    return self._step(GameAction.from_id(retry))
+                return self._manip_policy(grid, comps, avatar, simple)
         # a confirmed ping-pong switch whose direction is unreadable (the
         # board sits mid-path with no fresh transition on record): one
         # click both re-reveals the direction and advances the puzzle —
@@ -9409,11 +10374,26 @@ class MyAgent(Agent):
             key, _pos, _ph = plan[0]
             self._sw_plan.extend((k, p, swt, ph) for k, p, ph in plan[1:])
             return self._sw_emit(key)
+        if self._mp_engaged and len(self._mp_modes) < 2:
+            # Once a compound controller panel is confirmed, finish learning
+            # its unloaded geometry before spending more clicks on unrelated
+            # board components.  Already confirmed ordinary switches remain
+            # modelled and candidate discovery resumes immediately after the
+            # payload transition.
+            return self._manip_policy(grid, comps, avatar, simple)
         # 3 — probe: unconfirmed compact signatures, observed-remote-effect
         # candidates first (one more click may close their cycle), then
         # larger components first (buttons are chunky, goals are tiny)
         cands: list[tuple[int, int, int, Cell]] = []
         seen_sigs: set[int] = set(confirmed)
+        av_near = {
+            (x + dx, y + dy) for x, y in av_cells
+            for dx in range(-2, 3) for dy in range(-2, 3)
+        } if self._mp_engaged else set()
+        body_near = {
+            (x + dx, y + dy) for x, y in self._mp_body
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+        } if self._mp_engaged else set()
         for color, cells in comps:
             xs = [x for x, _y in cells]
             ys = [y for _x, y in cells]
@@ -9426,7 +10406,13 @@ class MyAgent(Agent):
             if cells & av_cells or cells & mask_cells \
                     or min(cells) in goal_anchors:
                 continue  # toggled tiles and goal pads are not causes
+            if self._mp_engaged \
+                    and (cells & av_near or cells & body_near):
+                continue  # local terrain / the remote body are not buttons
             sig = shape_signature(color, cells)
+            ident = (sig, min(cells))
+            if ident in self._mp_actions or sig in self._mp_quarantine:
+                continue
             if sig in seen_sigs:
                 continue
             seen_sigs.add(sig)
@@ -9456,7 +10442,7 @@ class MyAgent(Agent):
             key, _pos, _ph = plan[0]
             self._sw_plan.extend((k, p, swt, ph) for k, p, ph in plan[1:])
             return self._sw_emit(key)
-        return None
+        return self._manip_policy(grid, comps, avatar, simple)
 
     def _plan_switch_route(
         self, grid: Grid, avatar: tuple[Cell, frozenset[Cell]],

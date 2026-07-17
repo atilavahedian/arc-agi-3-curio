@@ -100,6 +100,8 @@ import os
 import random
 import zlib
 from collections import Counter, defaultdict, deque
+from heapq import heappop, heappush
+from itertools import count, permutations
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
@@ -278,6 +280,19 @@ HERD_TRIAL = 8          # exploratory clicks the herd head may spend on a level
                         # 8 leaves margin for a few inert decoys; a non-herd
                         # {6,7} board never confirms and benches at this budget,
                         # deferring to baseline instead of flailing for 24.
+KP_ACTIONS = frozenset({1, 2, 3, 4, 6})
+                        # selected-push/socket signature: four cardinal inputs
+                        # plus click, with no transform/undo verb
+KP_PITCH = 3            # inferred family lattice pitch; every compact framed
+                        # mover and countdown stripe is aligned to this pitch
+KP_SEARCH_CAP = 650000  # bounded state budget; dense four-selector transfer
+                        # stages need ~500k visible-model states before the
+                        # first collision-shove ordering reaches all sockets
+KP_SEARCH_WEIGHT = 20   # favor goal progress while retaining broad rerouting
+KP_DEPTH_CAP = 220      # safely above the longest public human baseline plan
+KP_STRIKES = 8          # visible model contradictions before the head benches
+KP_MARGIN = 15          # bounded off-screen planning margin; selected pieces
+                        # can leave the viewport through a visible corridor
 
 # ABLATION TOGGLE: CURIO_GENERIC_ONLY=1 disables the five family-specific
 # modules (lattice/GF2, editor, attribute-state, port-align, switch) and
@@ -3087,6 +3102,661 @@ def assign_overlay_pieces(
     return list(solved[4]) if solved is not None else None
 
 
+def kp_bounds(cells: frozenset[Cell] | set[Cell]) -> tuple[int, int, int, int]:
+    xs = [x for x, _y in cells]
+    ys = [y for _x, y in cells]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def kp_normalize(cells: frozenset[Cell] | set[Cell]) -> frozenset[Cell]:
+    x0, y0, _x1, _y1 = kp_bounds(cells)
+    return frozenset((x - x0, y - y0) for x, y in cells)
+
+
+def kp_multicolor_components(
+    grid: Grid, colors: frozenset[int], *, exclude_hud: bool = True,
+) -> list[frozenset[Cell]]:
+    """Connected components over a small color union.
+
+    Countdown blocks use two phases of one material, so ordinary per-color
+    segmentation splits a single block.  The bottom display row is interface
+    state rather than world geometry and is never allowed into a component.
+    """
+    seen: set[Cell] = set()
+    out: list[frozenset[Cell]] = []
+    y_cap = GRID - 1 if exclude_hud else GRID
+    for y in range(y_cap):
+        for x in range(GRID):
+            if (x, y) in seen or grid[y][x] not in colors:
+                continue
+            cells: set[Cell] = set()
+            dq = deque([(x, y)])
+            seen.add((x, y))
+            while dq:
+                cx, cy = dq.popleft()
+                cells.add((cx, cy))
+                for nx, ny in ((cx + 1, cy), (cx - 1, cy),
+                               (cx, cy + 1), (cx, cy - 1)):
+                    if 0 <= nx < GRID and 0 <= ny < y_cap \
+                            and (nx, ny) not in seen \
+                            and grid[ny][nx] in colors:
+                        seen.add((nx, ny))
+                        dq.append((nx, ny))
+            out.append(frozenset(cells))
+    return out
+
+
+def kp_marker_cells(
+    bbox: tuple[int, int, int, int],
+) -> tuple[Cell, ...]:
+    x0, y0, x1, y1 = bbox
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    if (width, height) == (3, 3):
+        return ((x0 + 1, y0 + 1),)
+    if (width, height) == (3, 6):
+        return ((x0 + 1, y0 + 2), (x0 + 1, y0 + 3))
+    if (width, height) == (6, 3):
+        return ((x0 + 2, y0 + 1), (x0 + 3, y0 + 1))
+    return tuple(
+        (x, y) for y in range(y0 + 2, min(y0 + 4, y1))
+        for x in range(x0 + 2, min(x0 + 4, x1))
+    )
+
+
+def kp_control_boxes(grid: Grid) -> list[dict[str, Any]]:
+    """Read compact, fully rendered selector frames.
+
+    The gate is deliberately stronger than merely seeing color 14: a compact
+    rectangle must have a connected 14 scaffold spanning its full bbox and a
+    zero/value marker at the geometry-specific centre.  This visual grammar
+    is absent from the existing port, switch, panel and spell families.
+    """
+    out: list[dict[str, Any]] = []
+    for color, cells in components(grid):
+        if color != 14 or len(cells) < 8:
+            continue
+        x0, y0, x1, y1 = kp_bounds(cells)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (3 <= width <= 8 and 3 <= height <= 8):
+            continue
+        # The rendered selector owns its whole bbox.  Its frame is 14 and its
+        # selected/value aperture is one of 0/4/5; background/wall pixels in
+        # the bbox reject an incidental 14 component.
+        allowed = {0, 4, 5, 14}
+        if any(grid[y][x] not in allowed
+               for y in range(y0, y1 + 1)
+               for x in range(x0, x1 + 1)):
+            continue
+        markers = kp_marker_cells((x0, y0, x1, y1))
+        if not markers or not all(grid[y][x] in {0, 4, 5}
+                                  for x, y in markers):
+            continue
+        out.append({
+            "bbox": (x0, y0, x1, y1),
+            "pos": (x0, y0),
+            "w": width,
+            "h": height,
+            "selected": all(grid[y][x] == 0 for x, y in markers),
+        })
+    return sorted(out, key=lambda rec: (rec["pos"][1], rec["pos"][0]))
+
+
+def kp_goal_boxes(grid: Grid) -> list[dict[str, Any]]:
+    """Read non-HUD color-4 sockets and classify rectangle vs shaped shell."""
+    out: list[dict[str, Any]] = []
+    for color, raw in components(grid):
+        cells = frozenset((x, y) for x, y in raw if y < GRID - 1)
+        if color != 4 or len(cells) < 12:
+            continue
+        x0, y0, x1, y1 = kp_bounds(cells)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (5 <= width <= 13 and 5 <= height <= 13):
+            continue
+        on_perimeter = sum(
+            x in (x0, x1) or y in (y0, y1) for x, y in cells)
+        perimeter = 2 * width + 2 * height - 4
+        rectangular = on_perimeter == len(cells) \
+            and len(cells) >= max(12, int(0.65 * perimeter))
+        out.append({
+            "bbox": (x0, y0, x1, y1),
+            "pos": (x0 + 1, y0 + 1),
+            "w": width - 2,
+            "h": height - 2,
+            "rect": rectangular,
+        })
+    return sorted(out, key=lambda rec: (rec["pos"][1], rec["pos"][0]))
+
+
+def kp_bomb_read(
+    grid: Grid, bbox: tuple[int, int, int, int],
+) -> tuple[Optional[Cell], int]:
+    """Return (blast direction, filled-stripe count) for a 12/13 block."""
+    x0, y0, x1, y1 = bbox
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    rows = [[grid[y][x] for x in range(x0, x1 + 1)]
+            for y in range(y0, y1 + 1)]
+    if all(value == 13 for row in rows for value in row):
+        return None, 0
+
+    candidates: list[tuple[Cell, int]] = []
+    top = 0
+    while top < height and all(value == 12 for value in rows[top]):
+        top += 1
+    if 0 < top < height and all(value == 13 for row in rows[top:]
+                                for value in row):
+        candidates.append(((0, 1), top))
+    bottom = 0
+    while bottom < height and all(value == 12
+                                  for value in rows[height - 1 - bottom]):
+        bottom += 1
+    if 0 < bottom < height and all(value == 13 for row in rows[:height-bottom]
+                                   for value in row):
+        candidates.append(((0, -1), bottom))
+    left = 0
+    while left < width and all(rows[y][left] == 12 for y in range(height)):
+        left += 1
+    if 0 < left < width and all(rows[y][x] == 13 for y in range(height)
+                                for x in range(left, width)):
+        candidates.append(((1, 0), left))
+    right = 0
+    while right < width and all(rows[y][width - 1 - right] == 12
+                                for y in range(height)):
+        right += 1
+    if 0 < right < width and all(rows[y][x] == 13 for y in range(height)
+                                 for x in range(width - right)):
+        candidates.append(((-1, 0), right))
+    return candidates[0] if len(candidates) == 1 else (None, 0)
+
+
+def kp_setup(
+    grid: Grid, available_actions: set[int],
+) -> Optional[dict[str, Any]]:
+    """Strong frame-only gate and initial selected-push world model."""
+    if frozenset(available_actions) != KP_ACTIONS:
+        return None
+    controls = kp_control_boxes(grid)
+    goals = kp_goal_boxes(grid)
+    control_shapes = {(rec["w"], rec["h"]) for rec in controls}
+    control_goals = [g for g in goals
+                     if g["rect"] and (g["w"], g["h"]) in control_shapes]
+    if not controls or not control_goals or sum(c["selected"] for c in controls) != 1:
+        return None
+
+    object_goals = [g for g in goals if not g["rect"]]
+    object_shapes = {(g["w"], g["h"]) for g in object_goals}
+    objects: list[dict[str, Any]] = []
+    reserved = {0, 1, 2, 4, 5, 12, 13, 14, 15}
+    for color, cells in components(grid):
+        if color in reserved or not cells:
+            continue
+        x0, y0, x1, y1 = kp_bounds(cells)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if (width, height) not in object_shapes:
+            continue
+        objects.append({
+            "kind": "object", "color": color, "pos": (x0, y0),
+            "w": width, "h": height, "mask": kp_normalize(cells),
+        })
+    objects.sort(key=lambda rec: (rec["pos"][1], rec["pos"][0]))
+
+    bombs: list[dict[str, Any]] = []
+    for cells in kp_multicolor_components(grid, frozenset({12, 13})):
+        x0, y0, x1, y1 = kp_bounds(cells)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (3 <= width <= 8 and 3 <= height <= 8
+                and len(cells) == width * height):
+            continue
+        direction, phase = kp_bomb_read(grid, (x0, y0, x1, y1))
+        bombs.append({
+            "kind": "bomb", "color": 13, "pos": (x0, y0),
+            "w": width, "h": height,
+            "mask": frozenset((x, y) for y in range(height)
+                               for x in range(width)),
+            "dir": direction, "phase": phase,
+        })
+    bombs.sort(key=lambda rec: (rec["pos"][1], rec["pos"][0]))
+
+    entities: list[dict[str, Any]] = []
+    control_ids: list[int] = []
+    selected = 0
+    for rec in controls:
+        entity = {
+            "kind": "control", "color": 14, "pos": rec["pos"],
+            "w": rec["w"], "h": rec["h"],
+            "mask": frozenset((x, y) for y in range(rec["h"])
+                               for x in range(rec["w"])),
+        }
+        control_ids.append(len(entities))
+        if rec["selected"]:
+            selected = len(entities)
+        entities.append(entity)
+    object_ids: list[int] = []
+    for rec in objects:
+        object_ids.append(len(entities))
+        entities.append(rec)
+    bomb_ids: list[int] = []
+    phases: list[int] = []
+    for rec in bombs:
+        bomb_ids.append(len(entities))
+        phases.append(rec["phase"])
+        entities.append(rec)
+
+    return {
+        "entities": tuple(entities),
+        "controls": tuple(control_ids),
+        "objects": tuple(object_ids),
+        "bombs": tuple(bomb_ids),
+        "control_targets": tuple((g["w"], g["h"], g["pos"])
+                                 for g in control_goals),
+        "object_targets": tuple((g["w"], g["h"], g["pos"])
+                                for g in object_goals),
+        "hard": frozenset((x, y) for y in range(GRID - 1)
+                           for x in range(GRID) if grid[y][x] == 2),
+        "force": frozenset((x, y) for y in range(GRID - 1)
+                            for x in range(GRID) if grid[y][x] == 15),
+        "direct_blocked": frozenset(),
+        "start": (tuple(rec["pos"] for rec in entities), selected,
+                  tuple(phases)),
+    }
+
+
+def kp_entity_cells(model: dict[str, Any], entity: int, pos: Cell) -> set[Cell]:
+    x0, y0 = pos
+    return {(x0 + x, y0 + y) for x, y in model["entities"][entity]["mask"]}
+
+
+def kp_hits_static(
+    model: dict[str, Any], entity: int, pos: Cell,
+    static: frozenset[Cell] | set[Cell],
+) -> bool:
+    x0, y0 = pos
+    return any((x0 + x, y0 + y) in static
+               for x, y in model["entities"][entity]["mask"])
+
+
+def kp_collides(
+    model: dict[str, Any], a: int, apos: Cell, b: int, bpos: Cell,
+) -> bool:
+    ae, be = model["entities"][a], model["entities"][b]
+    ax, ay = apos
+    bx, by = bpos
+    if ax >= bx + be["w"] or ax + ae["w"] <= bx \
+            or ay >= by + be["h"] or ay + ae["h"] <= by:
+        return False
+    bcells = kp_entity_cells(model, b, bpos)
+    return any((ax + x, ay + y) in bcells for x, y in ae["mask"])
+
+
+def kp_move_entity(
+    model: dict[str, Any], positions: list[Cell], entity: int,
+    delta: Cell, moving: Optional[set[int]] = None,
+) -> bool:
+    """Engine-faithful recursive shove.  Return True when blocked."""
+    moving = set() if moving is None else moving
+    if entity in moving:
+        return True
+    moving.add(entity)
+    dx, dy = delta
+    original = positions[entity]
+    candidate = (original[0] + dx, original[1] + dy)
+    if not (-KP_MARGIN <= candidate[0] <= GRID + KP_MARGIN
+            and -KP_MARGIN <= candidate[1] <= GRID + KP_MARGIN):
+        moving.remove(entity)
+        return True
+    positions[entity] = candidate
+    if kp_hits_static(model, entity, candidate, model["hard"]):
+        positions[entity] = original
+        moving.remove(entity)
+        return True
+    collisions = [other for other in range(len(positions))
+                  if other != entity
+                  and kp_collides(model, entity, candidate,
+                                  other, positions[other])]
+    for other in collisions:
+        if kp_move_entity(model, positions, other, delta, moving):
+            positions[entity] = original
+            moving.remove(entity)
+            return True
+    moving.remove(entity)
+    return False
+
+
+def kp_blast_cells(
+    model: dict[str, Any], bomb: int, pos: Cell, index: int,
+) -> frozenset[Cell]:
+    rec = model["entities"][bomb]
+    dx, dy = rec["dir"]
+    size = max(rec["w"], rec["h"])
+    if size <= KP_PITCH:
+        near, length = KP_PITCH * index, KP_PITCH
+    else:
+        near, length = size, KP_PITCH * index
+    x0, y0 = pos
+    if dx > 0:
+        return frozenset((x, y) for x in range(x0 + rec["w"],
+                                               x0 + rec["w"] + length)
+                         for y in range(y0, y0 + rec["h"]))
+    if dx < 0:
+        return frozenset((x, y) for x in range(x0 - near - length + size,
+                                               x0 - near + size)
+                         for y in range(y0, y0 + rec["h"]))
+    if dy > 0:
+        return frozenset((x, y) for y in range(y0 + rec["h"],
+                                               y0 + rec["h"] + length)
+                         for x in range(x0, x0 + rec["w"]))
+    return frozenset((x, y) for y in range(y0 - near - length + size,
+                                           y0 - near + size)
+                     for x in range(x0, x0 + rec["w"]))
+
+
+def kp_tick(
+    model: dict[str, Any], positions: list[Cell], phases0: tuple[int, ...],
+) -> tuple[list[Cell], tuple[int, ...]]:
+    if not model["bombs"]:
+        return positions, phases0
+    phases = list(phases0)
+    triggered: list[int] = []
+    for ordinal, bomb in enumerate(model["bombs"]):
+        phases[ordinal] += 1
+        if phases[ordinal] >= model["entities"][bomb]["h"]:
+            triggered.append(bomb)
+    if not triggered:
+        return positions, tuple(phases)
+    last_push: dict[int, Cell] = {}
+    for index in range(1, 4):
+        for bomb in triggered:
+            blast = kp_blast_cells(model, bomb, positions[bomb], index)
+            delta = tuple(KP_PITCH * value
+                          for value in model["entities"][bomb]["dir"])
+            for entity in range(len(positions)):
+                if kp_entity_cells(model, entity, positions[entity]) & blast:
+                    kp_move_entity(model, positions, entity, delta)
+                    last_push[entity] = delta
+    for ordinal, bomb in enumerate(model["bombs"]):
+        if bomb in triggered:
+            phases[ordinal] = 0
+    for _ in range(64):
+        moved = False
+        for entity, delta in last_push.items():
+            if kp_hits_static(model, entity, positions[entity], model["force"]) \
+                    and not kp_move_entity(model, positions, entity, delta):
+                moved = True
+        if not moved:
+            break
+    return positions, tuple(phases)
+
+
+KP_DIRS: dict[int, Cell] = {
+    GameAction.ACTION1.value: (0, -KP_PITCH),
+    GameAction.ACTION2.value: (0, KP_PITCH),
+    GameAction.ACTION3.value: (-KP_PITCH, 0),
+    GameAction.ACTION4.value: (KP_PITCH, 0),
+}
+
+
+def kp_step(
+    model: dict[str, Any],
+    state: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+    token: tuple[str, int],
+) -> tuple[tuple[Cell, ...], int, tuple[int, ...]]:
+    positions0, selected, phases = state
+    kind, value = token
+    if kind == "select":
+        return positions0, value, phases
+    positions = list(positions0)
+    delta = KP_DIRS[value]
+    original = positions[selected]
+    candidate = (original[0] + delta[0], original[1] + delta[1])
+    direct_walls = model["hard"] | model["force"] | model["direct_blocked"]
+    positions[selected] = candidate
+    if kp_hits_static(model, selected, candidate, direct_walls):
+        positions[selected] = original
+        positions, phases = kp_tick(model, positions, phases)
+        return tuple(positions), selected, phases
+    collisions = [other for other in range(len(positions))
+                  if other != selected and kp_collides(
+                      model, selected, candidate, other, positions[other])]
+    if collisions:
+        positions[selected] = original
+        animation = 0
+        while animation < 64:
+            done = True
+            for other in collisions:
+                on_force = kp_hits_static(
+                    model, other, positions[other], model["force"])
+                if animation >= 5 and not on_force:
+                    continue
+                if kp_move_entity(model, positions, other, delta):
+                    continue
+                done = False
+            if done:
+                break
+            animation += 1
+    positions, phases = kp_tick(model, positions, phases)
+    return tuple(positions), selected, phases
+
+
+def kp_solved(
+    model: dict[str, Any],
+    state: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+) -> bool:
+    positions = state[0]
+    for ids, targets in ((model["controls"], model["control_targets"]),
+                         (model["objects"], model["object_targets"])):
+        available: Counter[tuple[int, int, Cell]] = Counter()
+        for entity in ids:
+            rec = model["entities"][entity]
+            available[(rec["w"], rec["h"], positions[entity])] += 1
+        for width, height, target in targets:
+            key = (width, height, target)
+            if available[key] <= 0:
+                return False
+            available[key] -= 1
+    return True
+
+
+def kp_assignment_distance(items: list[Cell], targets: list[Cell], divisor: int) -> int:
+    if not targets:
+        return 0
+    if len(items) < len(targets):
+        return 10 ** 6
+    return min(sum(abs(px - tx) + abs(py - ty)
+                   for (px, py), (tx, ty) in zip(perm, targets))
+               for perm in permutations(items, len(targets))) // divisor
+
+
+def kp_heuristic(
+    model: dict[str, Any],
+    state: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+) -> int:
+    positions = state[0]
+    total = 0
+    for ids, targets, divisor in (
+        (model["controls"], model["control_targets"], KP_PITCH),
+        (model["objects"], model["object_targets"], KP_PITCH * 5),
+    ):
+        by_shape: dict[tuple[int, int], list[Cell]] = defaultdict(list)
+        for entity in ids:
+            rec = model["entities"][entity]
+            by_shape[(rec["w"], rec["h"])].append(positions[entity])
+        target_shapes: dict[tuple[int, int], list[Cell]] = defaultdict(list)
+        for width, height, target in targets:
+            target_shapes[(width, height)].append(target)
+        for shape, goal_positions in target_shapes.items():
+            total += kp_assignment_distance(
+                by_shape[shape], goal_positions, divisor)
+    return total
+
+
+def kp_plan(
+    model: dict[str, Any],
+    start: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+) -> Optional[list[tuple[str, int]]]:
+    """Weighted A* over selected identity, object positions and bomb phases."""
+    if any(model["entities"][bomb]["dir"] is None for bomb in model["bombs"]):
+        return None
+    serial = count()
+    queue: list[tuple[int, int, int, tuple]] = []
+    heappush(queue, (KP_SEARCH_WEIGHT * kp_heuristic(model, start),
+                     0, next(serial), start))
+    best = {start: 0}
+    parent: dict[tuple, tuple[tuple, tuple[str, int]]] = {}
+    while queue and len(best) <= KP_SEARCH_CAP:
+        _priority, cost, _serial, state = heappop(queue)
+        if best.get(state) != cost:
+            continue
+        if kp_solved(model, state):
+            path: list[tuple[str, int]] = []
+            while state != start:
+                state, token = parent[state]
+                path.append(token)
+            return list(reversed(path))
+        if cost >= KP_DEPTH_CAP:
+            continue
+        tokens = [("move", action) for action in sorted(KP_DIRS)]
+        tokens.extend(("select", entity) for entity in model["controls"]
+                      if entity != state[1])
+        for token in tokens:
+            nxt = kp_step(model, state, token)
+            if nxt == state:
+                continue
+            ncost = cost + 1
+            if best.get(nxt, 10 ** 9) <= ncost:
+                continue
+            best[nxt] = ncost
+            parent[nxt] = (state, token)
+            heappush(queue, (ncost + KP_SEARCH_WEIGHT * kp_heuristic(model, nxt),
+                             ncost, next(serial), nxt))
+    return None
+
+
+def kp_state_matches(
+    grid: Grid, model: dict[str, Any],
+    state: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+) -> bool:
+    """Validate every visible predicted entity and reject unexpected frames.
+
+    A predicted entity may be fully outside the viewport: later socket stages
+    deliberately route a selected frame through an off-screen corridor.  The
+    inverse is not allowed—an observed full selector with no predicted overlap
+    proves a bounce/model error and forces replanning.
+    """
+    positions, _selected, phases = state
+    expected_control_boxes: list[tuple[int, int, int, int]] = []
+    bomb_ord = {entity: ordinal for ordinal, entity in enumerate(model["bombs"])}
+    for entity, pos in enumerate(positions):
+        rec = model["entities"][entity]
+        x0, y0 = pos
+        x1, y1 = x0 + rec["w"] - 1, y0 + rec["h"] - 1
+        if rec["kind"] == "control":
+            expected_control_boxes.append((x0, y0, x1, y1))
+            allowed = {0, 4, 5, 14}
+            visible = [(x0 + x, y0 + y) for x, y in rec["mask"]
+                       if 0 <= x0 + x < GRID and 0 <= y0 + y < GRID - 1]
+            if visible and any(grid[y][x] not in allowed for x, y in visible):
+                return False
+        elif rec["kind"] == "object":
+            visible = [(x0 + x, y0 + y) for x, y in rec["mask"]
+                       if 0 <= x0 + x < GRID and 0 <= y0 + y < GRID - 1]
+            if visible and any(grid[y][x] != rec["color"] for x, y in visible):
+                return False
+        else:
+            if not (0 <= x0 and 0 <= y0 and x1 < GRID and y1 < GRID - 1):
+                continue
+            if any(grid[y][x] not in {12, 13}
+                   for y in range(y0, y1 + 1)
+                   for x in range(x0, x1 + 1)):
+                return False
+            direction, phase = kp_bomb_read(grid, (x0, y0, x1, y1))
+            if phase != phases[bomb_ord[entity]]:
+                return False
+            if direction is not None and rec["dir"] is not None \
+                    and direction != rec["dir"]:
+                return False
+    for observed in kp_control_boxes(grid):
+        ox0, oy0, ox1, oy1 = observed["bbox"]
+        if not any(not (ox1 < ex0 or ex1 < ox0 or oy1 < ey0 or ey1 < oy0)
+                   for ex0, ey0, ex1, ey1 in expected_control_boxes):
+            return False
+    return True
+
+
+def kp_observe_state(
+    grid: Grid, model: dict[str, Any],
+    reference: tuple[tuple[Cell, ...], int, tuple[int, ...]],
+) -> tuple[tuple[Cell, ...], int, tuple[int, ...]]:
+    """Repair a contradicted prediction from currently visible entities."""
+    positions = list(reference[0])
+    selected = reference[1]
+    phases = list(reference[2])
+
+    detected_controls = kp_control_boxes(grid)
+    remaining = set(model["controls"])
+    # Unique shapes first, then nearest same-shape twins to the prediction.
+    for observed in sorted(detected_controls,
+                           key=lambda rec: (rec["w"], rec["h"], rec["pos"])):
+        candidates = [entity for entity in remaining
+                      if (model["entities"][entity]["w"],
+                          model["entities"][entity]["h"])
+                      == (observed["w"], observed["h"])]
+        if not candidates:
+            continue
+        entity = min(candidates, key=lambda idx: (
+            abs(positions[idx][0] - observed["pos"][0])
+            + abs(positions[idx][1] - observed["pos"][1]), idx))
+        positions[entity] = observed["pos"]
+        remaining.remove(entity)
+        if observed["selected"]:
+            selected = entity
+
+    for entity in model["objects"]:
+        rec = model["entities"][entity]
+        candidates: list[Cell] = []
+        for color, cells in components(grid):
+            if color != rec["color"] or not cells:
+                continue
+            x0, y0, x1, y1 = kp_bounds(cells)
+            if (x1 - x0 + 1, y1 - y0 + 1) == (rec["w"], rec["h"]):
+                candidates.append((x0, y0))
+        if candidates:
+            positions[entity] = min(candidates, key=lambda pos: (
+                abs(positions[entity][0] - pos[0])
+                + abs(positions[entity][1] - pos[1]), pos))
+
+    bomb_components: list[tuple[Cell, int, int, Optional[Cell], int]] = []
+    for cells in kp_multicolor_components(grid, frozenset({12, 13})):
+        x0, y0, x1, y1 = kp_bounds(cells)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if len(cells) != width * height:
+            continue
+        direction, phase = kp_bomb_read(grid, (x0, y0, x1, y1))
+        bomb_components.append(((x0, y0), width, height, direction, phase))
+    remaining_bombs = set(model["bombs"])
+    for pos, width, height, direction, phase in bomb_components:
+        candidates = [entity for entity in remaining_bombs
+                      if (model["entities"][entity]["w"],
+                          model["entities"][entity]["h"]) == (width, height)]
+        if not candidates:
+            continue
+        entity = min(candidates, key=lambda idx: (
+            abs(positions[idx][0] - pos[0]) + abs(positions[idx][1] - pos[1]),
+            idx))
+        positions[entity] = pos
+        ordinal = model["bombs"].index(entity)
+        phases[ordinal] = phase
+        if direction is not None:
+            model["entities"][entity]["dir"] = direction
+        remaining_bombs.remove(entity)
+
+    model["hard"] = model["hard"] | frozenset(
+        (x, y) for y in range(GRID - 1) for x in range(GRID)
+        if grid[y][x] == 2)
+    model["force"] = model["force"] | frozenset(
+        (x, y) for y in range(GRID - 1) for x in range(GRID)
+        if grid[y][x] == 15)
+    return tuple(positions), selected, tuple(phases)
+
+
 def canon_window(grid: Grid, x: int, y: int, p: int) -> tuple:
     """Rotation-canonical pixel tuple of a p x p window: the same card
     appearance hashes equal wherever it sits and however it is rotated
@@ -3495,6 +4165,25 @@ class MyAgent(Agent):
         self._herd_strikes = 0
         self._herd_benched: Optional[int] = None
         self._herd_level = -1
+        # ── selected push/socket model: compact framed pieces
+        # are selected by click, cardinal inputs move the selected frame, and
+        # collisions shove other entities through a visually distinct force
+        # wall.  Stripe-filled blocks are periodic directional impulses.  All
+        # geometry is parsed from the frame; no game/level id or path is kept.
+        self._kp_level = -1
+        self._kp_model: Optional[dict[str, Any]] = None
+        self._kp_state: Optional[tuple[tuple[Cell, ...], int,
+                                       tuple[int, ...]]] = None
+        self._kp_plan: deque[tuple[str, int]] = deque()
+        self._kp_expected: Optional[tuple[tuple[Cell, ...], int,
+                                          tuple[int, ...]]] = None
+        self._kp_before: Optional[tuple[tuple[Cell, ...], int,
+                                        tuple[int, ...]]] = None
+        self._kp_last_token: Optional[tuple[str, int]] = None
+        self._kp_probe = 0
+        self._kp_strikes = 0
+        self._kp_engaged = False
+        self._kp_benched: Optional[int] = None
         # ── win-path replay + level-start signatures (efficiency) ──
         # paths are keyed (level index, masked start-frame hash): replay
         # only ever fires when the SAME level restarts from the SAME start
@@ -3704,6 +4393,11 @@ class MyAgent(Agent):
             self._sort_prev_sig = None
             self._sort_strikes = 0
             self._sort_benched = None
+            # selected-push geometry, countdown phases and any closed
+            # viewport edge are level-local; the next policy call re-gates
+            # and reconstructs them from the fresh frame.
+            self._kp_clear(latest_frame.levels_completed)
+            self._kp_benched = None
             # the herd level replays deterministically: void the inert memory
             # and aim (the board rewinds to its start layout) and refresh the
             # strikes so a dead life's strikes don't carry over.  The bench is
@@ -3716,6 +4410,17 @@ class MyAgent(Agent):
             self._herd_trials = 0
             self._herd_any_progress = False
             self._herd_strikes = 0
+            # A life reset restores the whole selected-push board, including
+            # countdown phases and any piece that was routed off-screen.
+            # Re-read the start frame instead of carrying a contradicted plan.
+            self._kp_level = -1
+            self._kp_model = None
+            self._kp_state = None
+            self._kp_plan.clear()
+            self._kp_expected = None
+            self._kp_before = None
+            self._kp_last_token = None
+            self._kp_engaged = False
             # the dead life's win-path recording is garbage; the frame
             # after RESET is a level start (the engine replays the level)
             self._wp_log.clear()
@@ -8718,6 +9423,144 @@ class MyAgent(Agent):
         self._prev_action = f"6:{tx},{ty}"
         return action
 
+    def _kp_clear(self, level: int) -> None:
+        self._kp_level = level
+        self._kp_model = None
+        self._kp_state = None
+        self._kp_plan.clear()
+        self._kp_expected = None
+        self._kp_before = None
+        self._kp_last_token = None
+        self._kp_probe = 0
+        self._kp_strikes = 0
+        self._kp_engaged = False
+
+    def _kp_emit(self, token: tuple[str, int]) -> Optional[GameAction]:
+        if self._kp_model is None or self._kp_state is None:
+            return None
+        kind, value = token
+        self._kp_before = self._kp_state
+        self._kp_last_token = token
+        self._kp_expected = kp_step(self._kp_model, self._kp_state, token)
+        if kind == "move":
+            action = GameAction.from_id(value)
+            action.reasoning = {"why": "selected-push causal plan"}
+            self._prev_action = str(value)
+            return action
+        x, y = self._kp_state[0][value]
+        rec = self._kp_model["entities"][value]
+        tx, ty = x + rec["w"] // 2, y + rec["h"] // 2
+        if not (0 <= tx < GRID and 0 <= ty < GRID - 1):
+            self._kp_expected = None
+            self._kp_before = None
+            self._kp_last_token = None
+            return None
+        action = GameAction.ACTION6
+        action.set_data({"x": tx, "y": ty})
+        action.reasoning = {"why": f"select framed mover at {(tx, ty)}"}
+        self._prev_action = f"6:{tx},{ty}"
+        return action
+
+    def _kp_policy(
+        self, grid: Grid, latest_frame: FrameData,
+    ) -> Optional[GameAction]:
+        """Closed-loop selected-piece push/socket planner.
+
+        The initial model is read entirely from pixels.  Every issued action
+        has a predicted compact causal state; the next frame validates all
+        visible entities.  A contradicted bounce augments the direct-wall map
+        and replans from observation.  Fully off-screen predicted selectors
+        remain in state so a proved corridor can be traversed and re-entered.
+        """
+        level = latest_frame.levels_completed
+        if self._kp_benched == level:
+            return None
+        if self._kp_level != level:
+            self._kp_clear(level)
+            self._kp_benched = None
+        if self._kp_model is None:
+            setup = kp_setup(grid, set(latest_frame.available_actions or []))
+            if setup is None:
+                return None
+            self._kp_model = setup
+            self._kp_state = setup["start"]
+            self._kp_engaged = True
+
+        assert self._kp_model is not None and self._kp_state is not None
+        if self._kp_expected is not None:
+            matched = kp_state_matches(grid, self._kp_model, self._kp_expected)
+            observed = kp_observe_state(
+                grid, self._kp_model,
+                self._kp_expected if matched else self._kp_before or self._kp_state)
+            if not matched:
+                before = self._kp_before or self._kp_state
+                token = self._kp_last_token
+                if token is not None and token[0] == "move":
+                    selected = before[1]
+                    expected_pos = self._kp_expected[0][selected]
+                    if observed[0][selected] == before[0][selected] \
+                            and expected_pos != before[0][selected]:
+                        blocked = kp_entity_cells(
+                            self._kp_model, selected, expected_pos)
+                        # One proved boundary bounce closes that viewport edge
+                        # for this level.  A later level starts fresh; a real
+                        # off-screen corridor never earns this ban.
+                        if expected_pos[0] < 0:
+                            blocked |= {(x, y) for x in range(-KP_MARGIN, 0)
+                                        for y in range(-KP_MARGIN,
+                                                       GRID + KP_MARGIN)}
+                        elif expected_pos[0] >= GRID:
+                            blocked |= {(x, y) for x in range(GRID,
+                                                              GRID + KP_MARGIN)
+                                        for y in range(-KP_MARGIN,
+                                                       GRID + KP_MARGIN)}
+                        elif expected_pos[1] < 0:
+                            blocked |= {(x, y) for y in range(-KP_MARGIN, 0)
+                                        for x in range(-KP_MARGIN,
+                                                       GRID + KP_MARGIN)}
+                        elif expected_pos[1] >= GRID - 1:
+                            blocked |= {(x, y) for y in range(GRID - 1,
+                                                              GRID + KP_MARGIN)
+                                        for x in range(-KP_MARGIN,
+                                                       GRID + KP_MARGIN)}
+                        self._kp_model["direct_blocked"] = \
+                            self._kp_model["direct_blocked"] | frozenset(blocked)
+                self._kp_plan.clear()
+                self._kp_strikes += 1
+                if self._kp_strikes >= KP_STRIKES:
+                    self._kp_benched = level
+                    self._kp_engaged = False
+                    return None
+            self._kp_state = observed
+            self._kp_expected = None
+            self._kp_before = None
+            self._kp_last_token = None
+
+        unknown_bombs = [bomb for bomb in self._kp_model["bombs"]
+                         if self._kp_model["entities"][bomb]["dir"] is None]
+        if unknown_bombs:
+            if self._kp_probe >= 2:
+                self._kp_benched = level
+                self._kp_engaged = False
+                return None
+            self._kp_probe += 1
+            return self._kp_emit(("move", GameAction.ACTION1.value))
+
+        if not self._kp_plan:
+            plan = kp_plan(self._kp_model, self._kp_state)
+            if not plan:
+                self._kp_strikes += 1
+                if self._kp_strikes >= 2:
+                    self._kp_benched = level
+                    self._kp_engaged = False
+                return None
+            self._kp_plan.extend(plan)
+        token = self._kp_plan.popleft()
+        action = self._kp_emit(token)
+        if action is None:
+            self._kp_plan.clear()
+        return action
+
     # ── planning ─────────────────────────────────────────────────────────
     def _policy(self, grid: Optional[Grid], latest_frame: FrameData) -> GameAction:
         # CURIO_GENERIC_ONLY ablation: skip every family-specific head and
@@ -8731,6 +9574,13 @@ class MyAgent(Agent):
             lattice = self._lattice_policy(grid, latest_frame)
             if lattice is not None:
                 return lattice
+            # Compact framed selectors + shape-matched hollow sockets + the
+            # exact cardinal/click action profile identify the selected-push
+            # family.  Its own causal planner must run before generic warmup:
+            # countdown blocks consume the level budget while novelty probes.
+            kinetic_push = self._kp_policy(grid, latest_frame)
+            if kinetic_push is not None:
+                return kinetic_push
             # Once the strongly-gated overlay head has a catalog or proved
             # assignment in flight, it owns the simple-action stream.  Shape
             # deformation resembles an editor's in-place mutation and could

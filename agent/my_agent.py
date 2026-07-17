@@ -694,6 +694,11 @@ class MyAgent(Agent):
         self._ov_select: Optional[int] = None       # the cycle-selection verb
         self._ov_idprobe = 0        # arrow-probe cursor (learn the 4 deltas)
         self._ov_level = -1
+        # Immutable goal evidence captured only after the rich-overlay gate.
+        # The moving piece can cover live rings/centres, so re-detecting the
+        # goal every frame would erase the target while a valid plan runs.
+        self._ov_cached_outline: Optional[int] = None
+        self._ov_cached_anchors: dict[int, tuple[Cell, ...]] = {}
         self._ov_solved: set[int] = set()           # colours already covered
         self._ov_plan: deque[int] = deque()         # queued MOVE action ids
         self._ov_target: Optional[Cell] = None      # centre we are driving to
@@ -914,7 +919,9 @@ class MyAgent(Agent):
             # the overlay level replays deterministically: void the in-flight
             # plan/target and solved-colour progress, give a benched run a
             # fresh life (strikes die with the budget that earned them).  The
-            # outline colour and SELECT verb are physics — kept.
+            # outline colour and SELECT verb are physics — kept.  The trusted
+            # goal snapshot is level geography, but the same level replays
+            # exactly after death, so retain it too.
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
@@ -1063,6 +1070,8 @@ class MyAgent(Agent):
             self._pc_idprobe = 0
             # overlay geography: the new level has its own anchor centres and
             # piece roster (outline colour and SELECT verb are physics).
+            self._ov_cached_outline = None
+            self._ov_cached_anchors.clear()
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
@@ -2474,6 +2483,34 @@ class MyAgent(Agent):
                  and a != GameAction.RESET.value]
         return cands[0] if len(cands) == 1 else None
 
+    def _ov_goal_snapshot(
+        self, grid: Grid,
+    ) -> Optional[tuple[int, dict[int, tuple[Cell, ...]]]]:
+        """Return a trusted per-level overlay goal, detecting it only once.
+
+        A selected piece may paint over the static rings and centre pixels as
+        it is placed.  Once the existing rich-overlay gates have confirmed a
+        goal, copied tuples preserve that evidence until a real level-up.
+        """
+        if self._ov_cached_outline is not None and self._ov_cached_anchors:
+            return self._ov_cached_outline, self._ov_cached_anchors
+        outline = self._ov_outline(grid)
+        if outline is None:
+            return None
+        anchors = overlay_anchors(grid, outline)
+        if sum(len(v) for v in anchors.values()) < OV_MIN_TOTAL:
+            return None
+        # Do not make a transient rich-ring animation sticky: the original
+        # gate also required one clean selection hole before this head acted.
+        if self._ov_selected(grid, outline) is None:
+            return None
+        self._ov_outline_votes[outline] += 1
+        self._ov_cached_outline = outline
+        self._ov_cached_anchors = {
+            color: tuple(cells) for color, cells in anchors.items()
+        }
+        return outline, self._ov_cached_anchors
+
     def _ov_selected(
         self, grid: Grid, outline: int
     ) -> Optional[tuple[Cell, int]]:
@@ -2540,13 +2577,14 @@ class MyAgent(Agent):
         level = latest_frame.levels_completed
         if self._ov_benched == level:
             return None
-        outline = self._ov_outline(grid)
-        if outline is None:
-            return None  # no static box overlay → not this family
-        self._ov_outline_votes[outline] += 1
-        anchors = overlay_anchors(grid, outline)
-        if not anchors:
-            return None
+        if self._ov_level != level:
+            self._ov_level = level
+            self._ov_cached_outline = None
+            self._ov_cached_anchors.clear()
+            self._ov_solved.clear()
+            self._ov_plan.clear()
+            self._ov_target = None
+            self._ov_idprobe = 0
         # CONFIDENCE GATE (round 6 tighten): the genuine re86 static overlay is
         # a RICH anchor structure — the dominant outline alone exposes 3-4
         # boxes and the full overlay spans several anchor centres across one or
@@ -2554,9 +2592,10 @@ class MyAgent(Agent):
         # sharing this action set is a plausible false positive that would send
         # the head driving a piece toward phantom goals.  Require a substantial
         # total anchor count so the head only fires on an unambiguous overlay.
-        total_anchors = sum(len(v) for v in anchors.values())
-        if total_anchors < OV_MIN_TOTAL:
-            return None
+        goal = self._ov_goal_snapshot(grid)
+        if goal is None:
+            return None  # no trusted static box overlay → not this family
+        outline, anchors = goal
         sel = self._ov_selected(grid, outline)
         if sel is None:
             return None  # transient frame with no clean selection hole
@@ -2590,12 +2629,6 @@ class MyAgent(Agent):
         if self._ov_strikes >= OV_STRIKES:
             self._ov_benched = level
             return None
-        if self._ov_level != level:
-            self._ov_level = level
-            self._ov_solved.clear()
-            self._ov_plan.clear()
-            self._ov_target = None
-            self._ov_idprobe = 0
         # PROBE PHASE: arrows aren't all learned yet.  Cycle ACTION1..4 once
         # each (and SELECT can't be probed — it desyncs selection), recording
         # the hole displacement.  Bail out of probing once all four deltas are

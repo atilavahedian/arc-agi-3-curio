@@ -5144,8 +5144,8 @@ class MyAgent(Agent):
         LHS→RHS rewrite examples; the unpaired run nearest the mutable row
         is the frozen reference; goal candidates are the reference
         rewritten through the rules (every DFS segmentation, depth 1 then
-        2 for chained variants), accepted when the output length matches
-        the mutable row."""
+        2 for chained variants), accepted when both its length and backing-
+        card type sequence match the mutable row."""
         rules: dict[tuple, tuple] = {}
         unpaired: list[tuple[int, list]] = []
         by_y: dict[int, list[list]] = defaultdict(list)
@@ -5178,6 +5178,17 @@ class MyAgent(Agent):
         ref = min(unpaired, key=lambda yr: abs(yr[0] - mut_y))[1]
         seq = tuple(c[2] for c in ref)
         want = len(mut_run)
+        sig_ring = {
+            sig: ring
+            for _y, run in rows
+            for _x, ring, sig in run
+        }
+        target_rings = tuple(ring for _x, ring, _sig in mut_run)
+
+        def fits_target(g: tuple) -> bool:
+            return len(g) == want and tuple(
+                sig_ring.get(sig) for sig in g
+            ) == target_rings
 
         def expand(s: tuple, cap: int = 24) -> list[tuple]:
             outs: list[tuple] = []
@@ -5195,10 +5206,10 @@ class MyAgent(Agent):
             return outs
 
         once = expand(seq)
-        goals = [g for g in once if len(g) == want]
+        goals = [g for g in once if fits_target(g)]
         if not goals:
             for mid in once:
-                goals += [g for g in expand(mid) if len(g) == want]
+                goals += [g for g in expand(mid) if fits_target(g)]
         seen: set[tuple] = set()
         out: list[tuple] = []
         for g in goals:

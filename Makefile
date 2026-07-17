@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local pull-sample notebook submit status submit-duck-v15 status-duck-v15 verify-duck-v15 verify-local clean _check-kaggle
+.PHONY: help setup play-local pull-sample notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 submit-duck-v15 status-duck-v15 verify-duck-v15 verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -31,7 +31,7 @@ _check-kaggle:
 	fi
 
 help:
-	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-15s %s\n",$$1,$$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*##"} /^[a-zA-Z0-9_-]+:.*##/ {printf "  %-28s %s\n",$$1,$$2}' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "Vars: PYTHON=$(PYTHON)  GAME=$(GAME)  STEPS=$(STEPS)"
 
@@ -78,6 +78,21 @@ submit: notebook _check-kaggle ## Build notebook and push to Kaggle (one-line su
 
 status: _check-kaggle ## Show the status of your most recent Kaggle kernel run
 	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('notebooks/kernel-metadata.json'))['id'])"); \
+	$(KAGGLE) kernels status $$KERNEL_ID
+
+package-curio-graph-v16: ## Build the separate original Curio graph candidate
+	$(VENV_PY) scripts/build_curio_candidate.py
+
+verify-curio-graph-v16: package-curio-graph-v16 ## Validate Curio source identity and Kaggle metadata
+	$(VENV_PY) scripts/validate_curio_candidate.py submissions/curio-graph-v16
+
+submit-curio-graph-v16: verify-curio-graph-v16 _check-kaggle ## Push original Curio graph v16 to Kaggle
+	$(KAGGLE) kernels push -p submissions/curio-graph-v16/
+	@echo ""
+	@echo "Pushed Curio graph v16. Track it with: make status-curio-graph-v16"
+
+status-curio-graph-v16: _check-kaggle ## Show the Curio graph v16 kernel status
+	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/curio-graph-v16/kernel-metadata.json'))['id'])"); \
 	$(KAGGLE) kernels status $$KERNEL_ID
 
 verify-duck-v15: ## Validate the high-score Duck v15 notebook and Kaggle metadata

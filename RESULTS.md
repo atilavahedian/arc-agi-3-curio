@@ -1,243 +1,136 @@
-# Honest Scoreboard — Curio v7
+# Curio — Verified Results
 
-Measured numbers for the Curio ARC-AGI-3 agent. Every figure below is from
-a real local bench run; nothing is estimated or extrapolated.
+This file records measured results for the original Curio agent. Local public
+environments are regression and development evidence; they are not a prediction
+of the hidden ARC-AGI-3 leaderboard score.
 
-> **Headline (2026-06-13 final):** the night's explorer work did **not** beat
-> the shipped default on the honest proxy — HELD-18 stays at **0.07802**
-> (default config A; explorer hybrid measured 0.0391, ~2x lower). So the
-> default is unchanged and remains the submitted config. The deliverable of
-> the night is the *measurement* itself: explorer "wins slowly → low score"
-> was confirmed directly, the lethal-click memory was kept behind a toggle,
-> and the FIT regression floor is intact. **Held-out generalization did not
-> improve; the hidden-set score remains unknown until submission.**
+Last updated: 2026-07-17.
 
-Bench command shape (per game set):
+## Official Kaggle evidence
 
+The latest completed original-Curio submission scored **0.18**. Its submitted
+agent matches repository commit `29e278a`, not the current head. The current
+agent has several later, locally verified capabilities and has not yet received
+an official hidden score.
+
+The existing generated notebook is intentionally considered stale until the
+next capability batch is finished. Rebuild and identity validation are required
+before the next Kaggle push.
+
+## Clean 25-game sweep
+
+Source identity: commit `c6b7f9169851f2cf0f813e51a16e17dfb5c94a69`.
+
+Configuration:
+
+```text
+CURIO_EXPLORER=graph
+CURIO_SEED=0
+MAX_ACTIONS=10000
 ```
-cd ARC-AGI-3-Kaggle-Starter
-CURIO_SEED=<s> make play-local GAME=<csv> STEPS=4000 2>&1 | grep -E "levels=|Aggregate"
+
+The framework loop is inclusive, so capped runs report 10,001 actions.
+
+| Game | Levels | Actions | Final state |
+|---|---:|---:|---|
+| tu93 | 5 | 10001 | NOT_FINISHED |
+| ar25 | 1 | 10001 | NOT_FINISHED |
+| re86 | 8 | 552 | WIN |
+| su15 | 1 | 10001 | NOT_FINISHED |
+| m0r0 | 1 | 10001 | NOT_FINISHED |
+| cn04 | 6 | 328 | WIN |
+| ft09 | 6 | 124 | WIN |
+| tr87 | 6 | 242 | WIN |
+| sc25 | 6 | 147 | WIN |
+| lp85 | 1 | 10001 | NOT_FINISHED |
+| dc22 | 4 | 10001 | NOT_FINISHED |
+| sp80 | 1 | 10001 | NOT_FINISHED |
+| ka59 | 0 | 10001 | NOT_FINISHED |
+| g50t | 1 | 10001 | GAME_OVER |
+| sb26 | 1 | 10001 | NOT_FINISHED |
+| lf52 | 2 | 10001 | NOT_FINISHED |
+| bp35 | 1 | 10001 | NOT_FINISHED |
+| s5i5 | 1 | 10001 | NOT_FINISHED |
+| r11l | 1 | 10001 | NOT_FINISHED |
+| sk48 | 0 | 10001 | NOT_FINISHED |
+| wa30 | 0 | 10001 | NOT_FINISHED |
+| vc33 | 2 | 10001 | NOT_FINISHED |
+| ls20 | 2 | 10001 | NOT_FINISHED |
+| cd82 | 1 | 10001 | NOT_FINISHED |
+| tn36 | 1 | 10001 | NOT_FINISHED |
+
+Measured total: **59 levels**, **5 complete wins**, aggregate local scorecard
+`21.011111569871918`.
+
+## Protected complete wins
+
+The current graph-backtracking head `c7977cb` preserves these exact seed-0
+results at a 1,000-action cap:
+
+| Game | Result | Actions |
+|---|---:|---:|
+| cn04 | 6/6 WIN | 328 |
+| ft09 | 6/6 WIN | 124 |
+| tr87 | 6/6 WIN | 242 |
+| sc25 | 6/6 WIN | 147 |
+
+`re86` also remains an 8-level WIN in 552 actions on the fixed proxy runs.
+
+## Graph-backtracking promotion gate
+
+Commit `c7977cb` adds branch-complete, fatal-edge-safe backtracking. RESET is a
+true last resort after 256 consecutive non-novel states; exact fatal edges need
+four identical state/action deaths before they are excluded. This avoids
+mistaking timer or concurrent-hazard deaths for causal evidence.
+
+Fixed 18-game proxy, 1,000 actions/game:
+
+| Seed | Pushed baseline | `c7977cb` |
+|---:|---:|---:|
+| 0 | 11.570994662830218 | 11.570994662830218 |
+| 7 | 11.572613173241251 | 11.572231892877130 |
+| 42 | 11.568548011882740 | 11.568548011882740 |
+| **Mean** | **11.570718615984737** | **11.570591522530030** |
+
+Completion counts are identical for every game and seed. Two seeds match
+exactly; seed 7 differs by 0.00038 after `bp35` confirms one deterministic
+fatal edge. The change is treated as proxy-neutral, not as evidence of a hidden
+score gain.
+
+Verification at promotion:
+
+- graph tests: 33/33;
+- full unit suite: 112/112;
+- `git diff --check`: clean;
+- independent read-only review: no blocker;
+- protected complete wins: unchanged.
+
+## Next measured targets
+
+- `dc22`: current clean sweep is 4 levels. An original, frame-derived remote
+  manipulator prototype reaches the level-5 upper branch; production handoff
+  with the existing switch planner is in progress.
+- `ka59`: current sweep is 0 levels. An original symbolic diagnostic using only
+  the official local runtime solves all 7 stages in 291 actions. Production
+  work must infer the same selection, push, socket, and countdown mechanics
+  from frames; no fixed paths, coordinates, game IDs, or level IDs will ship.
+
+## Reproduction
+
+Run a single public game:
+
+```bash
+CURIO_EXPLORER=graph CURIO_SEED=0 make play-local GAME=cn04 STEPS=1000
 ```
 
-Date: 2026-06-13. Budget: 4000 steps/game. All runs at seed 0.
+Run the fixed three-seed proxy:
 
----
+```bash
+CURIO_EXPLORER=graph STEPS=1000 SEEDS="0 7 42" scripts/bench_held.sh
+```
 
-## Final shipped-config scorecards (config A default, seed 0, STEPS=4000)
+Run unit tests:
 
-These three aggregates are the final honest measurement of the submitted
-agent (`CURIO_EXPLORER` unset, `CURIO_GENERIC_ONLY` unset — byte-identical to
-verbatim Curio v7).
-
-| game set | members | aggregate score | games at L1+ |
-|----------|---------|:---------------:|:------------:|
-| **HELD-18** (honest proxy) | 18 held-out games | **`0.07802407296184444`** | 9 |
-| **FROZEN-8** (proxy subset) | tu93 ar25 re86 ka59 g50t sb26 wa30 s5i5 | **`0.08678098667496416`** | 3 (ar25, g50t, s5i5) |
-| **all-25** (FIT + HELD-18) | full local battery | **`8.735237851346563`** | — |
-
-The all-25 aggregate is dominated by the FIT games (which the agent solves to
-high levels, e.g. ft09 6-level WIN in 124 actions) and so is **not** a
-generalization signal — it is reported only as a complete battery readout.
-The HELD-18 aggregate (`0.07802`) is the honest proxy; FROZEN-8 (`0.08678`)
-is a fixed subset of it for run-to-run tracking.
-
----
-
-## Game sets
-
-- **FIT (7)** — reverse-engineered; used only to guard regressions, NOT to
-  judge generalization: `lp85 vc33 ls20 ft09 tr87 cn04 dc22`
-- **HELD-18** — honest proxy, never tuned on:
-  `tu93 ar25 re86 su15 m0r0 sc25 sp80 ka59 g50t sb26 lf52 bp35 s5i5 r11l sk48 wa30 cd82 tn36`
-
----
-
-## HELD-18 — full agent (default, CURIO_GENERIC_ONLY unset), seed 0
-
-| game | levels |   | game | levels |   | game | levels |
-|------|:------:|---|------|:------:|---|------|:------:|
-| tu93 | 0 |   | sc25 | 0 |   | s5i5 | 1 |
-| ar25 | 1 |   | sp80 | 1 |   | r11l | 1 |
-| re86 | 0 |   | ka59 | 0 |   | sk48 | 0 |
-| su15 | 0 |   | g50t | 1 |   | wa30 | 0 |
-| m0r0 | 1 |   | sb26 | 0 |   | cd82 | 1 |
-|      |   |   | lf52 | 1 |   | tn36 | 1 |
-|      |   |   | bp35 | 0 |   |      |   |
-
-**Aggregate scorecard score: `0.07802407296184444`**
-
-(9 of 18 games reach level 1; none reach level 2 within budget.)
-
----
-
-## HELD-18 — generic core only (CURIO_GENERIC_ONLY=1), seed 0
-
-Family heads disabled: lattice/GF2, editor, attribute-state, port-align,
-switch — and their gates. Only the generic core runs (object perception,
-movement-rule voting, BFS routing, novelty exploration, HUD masking,
-affordance).
-
-| game | levels |   | game | levels |   | game | levels |
-|------|:------:|---|------|:------:|---|------|:------:|
-| tu93 | 0 |   | sc25 | 0 |   | s5i5 | 1 |
-| ar25 | 1 |   | sp80 | 1 |   | r11l | 1 |
-| re86 | 0 |   | ka59 | 0 |   | sk48 | 0 |
-| su15 | 0 |   | g50t | 0 |   | wa30 | 0 |
-| m0r0 | 1 |   | sb26 | 0 |   | cd82 | 1 |
-|      |   |   | lf52 | 1 |   | tn36 | 1 |
-|      |   |   | bp35 | 0 |   |      |   |
-
-**Aggregate scorecard score: `0.03518127148821125`**
-
-(8 of 18 games reach level 1; the only per-game regression vs. full is
-`g50t` 1 → 0 — a family head was carrying that level.)
-
----
-
-## Ablation summary
-
-| configuration              | HELD-18 aggregate | games at L1+ |
-|----------------------------|:-----------------:|:------------:|
-| full agent (default)       | 0.07802407296184444 | 9 |
-| generic core only          | 0.03518127148821125 | 8 |
-| **family-head contribution** | **+0.04284280147363319** | **+1** |
-
-The five family heads roughly **double** the held-set aggregate score
-(0.078 vs 0.035) over the generic substrate alone. Most of that lift is
-concentrated: on this proxy set at seed 0 the family heads add exactly one
-extra level (`g50t`), while the generic core carries the other eight L1
-games on its own. This is the honest floor — the family heads help, but the
-generic perception+planning substrate is doing most of the held-set work.
-
----
-
-## Submittable-config matrix (HELD-18, seed 0, STEPS=4000)
-
-The decision metric is the HELD-18 aggregate. Three submittable shapes are
-measured. The graph explorer (`CURIO_EXPLORER=graph`) only replaces the
-generic *fallthrough* in `_novelty_policy`; family heads still run first in
-`_policy` unless `CURIO_GENERIC_ONLY=1` also disables them — so a true
-"explorer + family heads" hybrid and an "explorer alone" run are both
-expressible with the existing toggles.
-
-| # | config | env | HELD-18 aggregate | L1+ |
-|---|--------|-----|:-----------------:|:---:|
-| **A** | **default (family heads, v7 novelty)** | *(none)* | **`0.07802407296184444`** | 9 |
-| B | explorer alone | `CURIO_EXPLORER=graph CURIO_GENERIC_ONLY=1` | `0.04048432535920809` | 9 |
-| C | hybrid (explorer + family heads) | `CURIO_EXPLORER=graph` | `0.03910295557622979` | 11 |
-
-**Winner: A (default).** It scores ~2x the explorer configs. The graph
-explorer reaches *more* levels (C: tu93 0→3, lf52→2-class, bp35 0→1) but
-**wins slowly** — the extra completed levels carry bloated action counts, so
-the `(baseline/actions)^2` term doesn't recover the cost, and meanwhile the
-explorer loses generic games the v7 novelty fallback carries (e.g. `g50t`
-1→0). Net: more levels, lower score. This is the "wins slowly → low score"
-problem from the brief, measured directly.
-
-Note C reproduces the prior stage's documented "explorer" number
-(`0.03910295557622979`) exactly — confirming that figure was the *hybrid*
-(family heads on, explorer fallthrough). Explorer-alone (B) is marginally
-higher than hybrid (0.0405 vs 0.0391): on this set the family-head + explorer
-combination nets slightly negative vs explorer-only, because the family head
-that carries `g50t` is overridden by explorer geography elsewhere. Both lose
-to A by a wide margin.
-
-No default change is made: A is already the shipped behavior and is
-byte-identical to the prior agent when both toggles are unset. The explorer
-remains a documented toggle, never the default — exactly per the
-regression-floor rule.
-
-### Seed stability (winner, config A, HELD-18)
-
-| seed | HELD-18 aggregate |
-|------|:-----------------:|
-| 0 | `0.07802407296184444` |
-| 7 | `0.07904488915365787` |
-
-Stable across seeds (0.078–0.079 band); seed 7 is marginally higher. The
-submittable config is not seed-fragile.
-
----
-
-## Regression floor (FIT set, default = both toggles unset, seed 0)
-
-Confirms the submittable (default) agent holds the FIT floor. Re-measured
-fresh this final stage inside the all-25 battery run; every per-game level is
-identical to the prior agent (bit-identical default path).
-
-| game | required        | measured            | ok |
-|------|-----------------|---------------------|:--:|
-| ft09 | 6 levels, WIN   | 6 levels, state WIN (124 actions) | ✓ |
-| cn04 | >= 5            | 5                   | ✓ |
-| tr87 | >= 3            | 3                   | ✓ |
-| ls20 | >= 2            | 2                   | ✓ |
-| vc33 | >= 2            | 2                   | ✓ |
-| lp85 | >= 1            | 1                   | ✓ |
-| dc22 | >= 4            | 4                   | ✓ |
-
-FIT-only aggregate (default, seed 0, FIT games run alone):
-`30.996644710050123`. (Distinct from the all-25 aggregate `8.735237851346563`
-above — that figure scores FIT and HELD-18 in one shared scorecard, so the
-two numbers are not comparable; both are real, just different batteries.)
-
-**Floor intact** — the default path is bit-identical to the prior agent when
-`CURIO_GENERIC_ONLY` and `CURIO_EXPLORER` are both unset, so neither toggle
-can touch the submitted behavior.
-
----
-
-## Round 5 — coverage expansion (2026-06-13, all measured seed 0, STEPS=4000)
-
-Four new game families added; full FIT floor intact; no crashes.
-
-| Game | before | after | head |
-|------|:-----:|:-----:|------|
-| tu93 | 0 | 1 | slide / node-maze |
-| re86 | 0 | 1 | overlay-align |
-| su15 | 0 | 2 | attractor-herd |
-| sb26 | 0 | 1 | sequence-match / sort |
-
-- **all-25 scorecard: 8.74 → 9.09**; agent now scores on 17 / 25 games (was 13).
-- FIT floor intact: ft09=6 WIN, cn04=5, tr87=3, dc22=4, ls20=2, vc33=2, lp85=1; held games (ar25,m0r0,sp80,g50t,lf52,s5i5,r11l,cd82,tn36) all ≥1.
-- Held-out proxy (ka59, wa30 — untouched this round): both still 0 (no spontaneous generalization signal from these two).
-- **Known regression — speed:** the new heads have a gating leak (expensive detection on non-target games). Slowest: lp85 28 fps, dc22 29, m0r0 39, lf52 46, tn36 58 (vs ~100–160 elsewhere). Nothing DNF'd locally, but the hidden re-run has a shared ~8–9h wall-clock cap, so this could cost completed games on the real set. Fix = cheap early-outs in the new heads. To validate net effect (more coverage vs slower): submit and compare to the 0.22 baseline.
-
----
-
-## Round 6 — speed hardening (2026-06-25, seed 0, STEPS=4000)
-
-Cheap early-outs added to 3 of 4 new heads (tu93/sb26/re86) so they skip
-non-target games before expensive detection. Capability unchanged, speed ~2x.
-
-| slow game | fps before | fps after |
-|-----------|:---------:|:--------:|
-| lp85 | 28 | 47 |
-| dc22 | 29 | 67 |
-| m0r0 | 39 | 82 |
-| lf52 | 46 | 97 |
-| tn36 | 58 | 101 |
-
-- all-25 scorecard unchanged: **9.09**; all 4 families intact; FIT floor intact.
-- su15/herd head early-out still pending (lp85 remains slowest at 47 fps).
-- Net: same capability as v8, ~2x faster on the games that dragged it — the
-  speed regression that sank v8 (0.22→0.20 on the hidden set) is largely undone.
-  This (v9) is the submission candidate for the next daily slot.
-
----
-
-## Round 7 — confidence tightening (2026-06-25, v10)
-
-Diagnosis from 3 real submissions: the round-5 heads MISFIRE on hidden games
-(false-positive their family → wrong actions → lose levels baseline would win).
-Real scores: baseline v7=0.22, +families v8/v9=0.20. So additions are net-negative.
-
-Fix: each round-5 head now engages ONLY on near-certain matches, else defers to
-baseline exploration (which earned 0.22). Tightenings:
-- slide/tu93: SL_MIN_NODES=12, exit≠start, require concrete route
-- overlay/re86: min anchors 2→3, min total centres=4
-- sort/sb26: min targets 3→4
-- herd/su15: dead-board bench after 8 inert clicks (lighter — su15 L2 geometry forced backoff)
-
-Verified seed 0: families intact (tu93=1,re86=1,su15=2,sb26=1), floor intact,
-heads quiet on ka59/wa30. Goal: floor recovers toward 0.22, upside when heads
-are genuinely right. Only a submission can confirm hidden-set effect.
+```bash
+MPLCONFIGDIR=/tmp/arc3-mpl .venv/bin/python -m unittest discover -s tests
+```

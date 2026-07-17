@@ -743,6 +743,7 @@ class MyAgent(Agent):
         self._sl_probe: Counter[int] = Counter()  # directional probe spend
         self._sl_dirmap: dict[int, Cell] = {}     # act -> unit step (probed)
         self._sl_corridor: Optional[int] = None   # learned passable color
+        self._sl_lethal_edges: set[tuple[Cell, int]] = set()
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
         # ── sequence-match assignment head (sb26 family) ──
@@ -880,6 +881,11 @@ class MyAgent(Agent):
                             if self._gx_lethal_hits[lsig] >= GX_LETHAL_HITS \
                                     and not productive:
                                 self._gx_lethal_sig.add(lsig)
+                # A confirmed slide-maze death identifies one directed
+                # corridor edge as lethal.  Keep it across this level's
+                # respawn so the planner routes around it instead of
+                # replaying the exact fatal path forever.
+                self._sl_note_lethal_edge()
             self._prev_grid, self._prev_key, self._prev_action = None, None, None
             self._plan.clear()
             self._lattice_plan.clear()
@@ -924,8 +930,9 @@ class MyAgent(Agent):
             self._sw_nogoal = None
             # the slide maze level replays deterministically: refresh the
             # strikes/bench (board rewinds to its start), keep the engaged
-            # flag and direction map (physics).  The head re-plans every step
-            # so there is no standing plan to void.
+            # flag, direction map and lethal edges learned in this level.
+            # The head re-plans every step so there is no standing plan to
+            # void.
             self._sl_strikes = 0
             self._sl_benched = None
             # the sort level replays deterministically: void the in-flight
@@ -1077,6 +1084,7 @@ class MyAgent(Agent):
             # (engaged flag and the learned direction map persist as physics)
             self._sl_probe.clear()
             self._sl_corridor = None
+            self._sl_lethal_edges.clear()
             self._sl_strikes = 0
             self._sl_benched = None
             # sort geography: the new level has its own target row, palette
@@ -4974,6 +4982,28 @@ class MyAgent(Agent):
         ys = [y for _x, y in cells]
         return ((min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2)
 
+    def _sl_note_lethal_edge(self) -> None:
+        """Remember the slide-maze edge whose action caused GAME_OVER.
+
+        The edge is keyed by the avatar's lattice node plus the simple action,
+        rather than by the rendered frame hash, so a ticking HUD cannot make
+        the same physical hazard look new after every respawn.
+        """
+        if not self._sl_engaged or self._prev_grid is None \
+                or self._prev_action not in {"1", "2", "3", "4"}:
+            return
+        accent = self._sl_avatar_anchor(self._prev_grid)
+        if accent is None:
+            return
+        av_center = self._sl_body_center(self._prev_grid, accent[0])
+        lat = self._sl_lattice(self._prev_grid, av_center)
+        if lat is None:
+            return
+        snode = self._sl_node(
+            self._sl_body_center(self._prev_grid, accent[0], lat), lat)
+        if snode is not None and snode in lat[3]:
+            self._sl_lethal_edges.add((snode, int(self._prev_action)))
+
     def _sl_route(
         self, grid: Grid, start: Cell, lat: tuple, corridor: int
     ) -> Optional[tuple[list[int], Cell]]:
@@ -5014,6 +5044,8 @@ class MyAgent(Agent):
                 return (path, exit_node)
             for a, (dx, dy) in DIRS.items():
                 if dx == dy == 0:
+                    continue
+                if (pos, a) in self._sl_lethal_edges:
                     continue
                 if passable(pos[0], pos[1], dx, dy):
                     nxt = (pos[0] + dx * pitch, pos[1] + dy * pitch)

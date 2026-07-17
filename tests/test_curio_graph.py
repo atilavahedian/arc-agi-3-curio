@@ -54,5 +54,44 @@ class GraphResetEdgeTests(unittest.TestCase):
         self.assertEqual(agent._tried[1], {"2"})
 
 
+class SlideLethalEdgeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.agent_class = load_agent_class()
+
+    def test_game_over_records_physical_node_and_action(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_engaged = True
+        agent._prev_grid = [[0]]
+        agent._prev_action = "4"
+        agent._sl_lethal_edges = set()
+        lattice = (6, 2, 4, {(8, 10)}, 1, 2)
+        agent._sl_avatar_anchor = lambda _grid: ((7, 9), 5)
+        agent._sl_body_center = lambda _grid, _anchor, _lat=None: (8, 10)
+        agent._sl_lattice = lambda _grid, _center: lattice
+        agent._sl_node = lambda _cell, _lat: (8, 10)
+
+        agent._sl_note_lethal_edge()
+
+        self.assertEqual(agent._sl_lethal_edges, {((8, 10), 4)})
+
+    def test_route_will_not_replay_lethal_edge(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_dirmap = {}
+        agent._sl_lethal_edges = set()
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[1][2] = 1
+        lattice = (2, 1, 1, {(1, 1), (3, 1)}, 1, 2)
+        agent._sl_avatar_cells = lambda _grid, _start, _lat: set()
+        agent._sl_body_center = lambda _grid, _start, _lat=None: (1, 1)
+        agent._sl_node = lambda _cell, _lat: (1, 1)
+        agent._sl_exit_node = lambda _grid, _lat, _cells: (3, 1)
+
+        self.assertEqual(agent._sl_route(grid, (1, 1), lattice, 1), ([4], (3, 1)))
+
+        agent._sl_lethal_edges.add(((1, 1), 4))
+        self.assertIsNone(agent._sl_route(grid, (1, 1), lattice, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

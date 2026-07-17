@@ -299,6 +299,149 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertIsNone(agent._editor_policy(self._overlay_grid(), frame))
         self.assertFalse(agent._ed_engaged)
 
+    def test_symmetric_mask_isolates_touching_same_color_piece(self) -> None:
+        funcs = self.agent_class._ov_selected.__globals__
+        grid = [[7 for _x in range(64)] for _y in range(64)]
+        center = (30, 30)
+        grid[30][30] = 0
+        expected = set()
+        for dx in range(-5, 6):
+            if dx:
+                grid[30][30 + dx] = 13
+                expected.add((dx, 0))
+        # A touching same-colour body is connected to the right endpoint, but
+        # has no point-reflected partner around this selected hole.
+        for dy in range(1, 6):
+            grid[30 + dy][35] = 13
+
+        raw = funcs["piece_footprint"](grid, center, 13)
+        isolated = funcs["symmetric_piece_mask"](grid, center, 13)
+
+        self.assertGreater(len(raw), len(expected) + 1)
+        self.assertEqual(isolated, frozenset(expected))
+        self.assertNotIn((0, 0), isolated)
+
+    def test_symmetric_mask_recovers_hollow_body_without_center(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["symmetric_piece_mask"]
+        grid = [[7 for _x in range(64)] for _y in range(64)]
+        center = (30, 30)
+        grid[30][30] = 0
+        expected = {
+            (dx, dy) for dy in range(-5, 6) for dx in range(-5, 6)
+            if abs(dx) + abs(dy) == 5
+        }
+        for dx, dy in expected:
+            grid[30 + dy][30 + dx] = 13
+        # Symmetric singleton noise is closer than the ring, but it is not a
+        # valid whole component and must not beat the hollow body.
+        grid[28][30] = 13
+        grid[32][30] = 13
+
+        mask = func(grid, center, 13)
+
+        self.assertEqual(mask, frozenset(expected))
+        self.assertNotIn((0, 0), mask)
+
+    def test_joint_assignment_covers_all_same_color_anchors(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["assign_overlay_pieces"]
+        horizontal = frozenset({(-2, 0), (-1, 0), (1, 0), (2, 0)})
+        vertical = frozenset({(0, -2), (0, -1), (0, 1), (0, 2)})
+        pieces = [((10, 20), 9, horizontal), ((20, 20), 9, vertical)]
+        goals = (
+            (8, 10), (9, 10), (11, 10), (12, 10),
+            (20, 8), (20, 9), (20, 11), (20, 12),
+        )
+
+        first = func(pieces, {9: goals}, step=1)
+        second = func(pieces, {9: tuple(reversed(goals))}, step=1)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        covered = set().union(*(placement[3] for placement in first))
+        self.assertEqual(covered, set(goals))
+        self.assertTrue(all((0, 0) not in placement[1] for placement in first))
+
+    def test_joint_assignment_rejects_partial_and_color_mismatch(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["assign_overlay_pieces"]
+        mask = frozenset({(-1, 0), (1, 0)})
+        pieces = [((2, 2), 9, mask), ((4, 4), 9, mask)]
+
+        self.assertIsNone(func(pieces, {9: ((0, 0),)}, step=2))
+        self.assertIsNone(func(pieces, {10: ((3, 2),)}, step=1))
+        too_many = tuple((x + 10, 10) for x in range(17))
+        self.assertIsNone(func(pieces, {9: too_many}, step=1))
+
+    def test_hidden_hole_midplan_cannot_emit_select(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        agent._ov_level = 0
+        agent._ov_cached_outline = 4
+        agent._ov_cached_anchors = {9: ((10, 10), (20, 20), (30, 30), (40, 40))}
+        agent._ov_select = GameAction.ACTION5.value
+        agent._ov_target = (30, 30)
+        agent._ov_plan = deque([1, 1])
+        agent._ov_deltas[1][(0, -3)] = 3
+        grid = [[8 for _x in range(64)] for _y in range(64)]
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(grid, frame)
+
+        self.assertIs(action, GameAction.ACTION1)
+        self.assertIsNot(action, GameAction.ACTION5)
+        self.assertEqual(list(agent._ov_plan), [1])
+
+    def test_hidden_hole_during_select_cycle_keeps_ordinal(self) -> None:
+        mask = frozenset({(-1, 0), (1, 0)})
+        for state in ("catalog", "assignment"):
+            with self.subTest(state=state), patch.dict(
+                os.environ, {"CURIO_EXPLORER": "graph"}
+            ):
+                agent = self.agent_class(
+                    card_id="test",
+                    game_id="overlay-test",
+                    agent_name="curio",
+                    ROOT_URL="",
+                    record=False,
+                    arc_env=None,
+                )
+            agent._ov_level = 0
+            agent._ov_cached_outline = 4
+            agent._ov_cached_anchors = {
+                9: ((10, 10), (20, 20), (30, 30), (40, 40))
+            }
+            agent._ov_select = GameAction.ACTION5.value
+            agent._ov_deltas[1][(0, -3)] = 3
+            if state == "catalog":
+                agent._ov_catalog = [((20, 20), 9, mask)]
+            else:
+                agent._ov_assignment = deque([
+                    (9, mask, (20, 20), frozenset({(19, 20), (21, 20)}))
+                ])
+            grid = [[8 for _x in range(64)] for _y in range(64)]
+            frame = FrameData(
+                frame=[grid],
+                state=GameState.NOT_FINISHED,
+                levels_completed=0,
+                available_actions=[1, 2, 3, 4, 5],
+            )
+
+            action = agent._overlay_policy(grid, frame)
+
+            self.assertIs(action, GameAction.ACTION1)
+            self.assertIsNot(action, GameAction.ACTION5)
+
 
 if __name__ == "__main__":
     unittest.main()

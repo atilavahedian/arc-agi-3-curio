@@ -232,6 +232,9 @@ OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
 OV_ARM_RADIUS = 9       # concentric selected-arm search/fallback cap for
                         # sparse or hollow pieces separated from their centre
+OV_CATALOG_CAP = 8      # maximum unambiguous SELECT-cycle inventory
+OV_ASSIGN_GOAL_CAP = 16  # bound coverage-DP width on a gated rich overlay
+OV_ASSIGN_STATE_CAP = 4096  # hard ceiling for reachable coverage masks
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
@@ -852,6 +855,180 @@ def cover_centers(
     return best[1] if best else None
 
 
+def symmetric_piece_mask(
+    grid: Grid, center: Cell, arm_color: int
+) -> Optional[frozenset[Cell]]:
+    """Relative arm pixels of one centrally-symmetric selected piece.
+
+    Same-colour pieces can touch, making an ordinary colour flood merge their
+    bodies.  A selected piece is point-symmetric around its unique hole, so a
+    pixel belongs to its candidate mask only when its reflected partner has
+    the same arm colour.  The hole is a temporary flood seed, never a coverage
+    pixel.  Hollow bodies use the nearest whole component that is itself
+    symmetric; ties are rejected instead of guessing.
+    """
+    cx, cy = center
+    paired: set[Cell] = set()
+    for y, row in enumerate(grid):
+        for x, value in enumerate(row):
+            if value != arm_color:
+                continue
+            rx, ry = 2 * cx - x, 2 * cy - y
+            if 0 <= rx < GRID and 0 <= ry < GRID \
+                    and grid[ry][rx] == arm_color:
+                paired.add((x, y))
+
+    allowed = paired | {center}
+    seen = {center}
+    stack = [center]
+    while stack:
+        x, y = stack.pop()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nxt = (x + dx, y + dy)
+                if nxt in allowed and nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+    attached = seen - {center}
+    if attached:
+        return frozenset((x - cx, y - cy) for x, y in attached)
+
+    remaining = set(paired)
+    candidates: list[tuple[tuple[int, int], frozenset[Cell]]] = []
+    while remaining:
+        seed = min(remaining, key=lambda p: (p[1], p[0]))
+        remaining.remove(seed)
+        comp = {seed}
+        todo = [seed]
+        while todo:
+            x, y = todo.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nxt = (x + dx, y + dy)
+                    if nxt in remaining:
+                        remaining.remove(nxt)
+                        comp.add(nxt)
+                        todo.append(nxt)
+        if len(comp) < 4:
+            continue
+        reflected = {(2 * cx - x, 2 * cy - y) for x, y in comp}
+        if reflected != comp:
+            continue
+        distance = min(max(abs(x - cx), abs(y - cy)) for x, y in comp)
+        candidates.append(((distance, -len(comp)), frozenset(comp)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
+    chosen = candidates[0][1]
+    return frozenset((x - cx, y - cy) for x, y in chosen)
+
+
+def assign_overlay_pieces(
+    pieces: list[tuple[Cell, int, frozenset[Cell]]],
+    anchors: dict[int, tuple[Cell, ...]],
+    step: int,
+) -> Optional[list[tuple[int, frozenset[Cell], Cell, frozenset[Cell]]]]:
+    """Jointly assign one reachable target to every catalogued piece.
+
+    Candidate centres come only from aligning observed relative arm pixels to
+    same-colour observed anchors.  Dynamic programming covers the complete
+    anchor bitmask while minimizing movement, then redundant coverage and
+    deterministic relative displacements.  The returned order matches the
+    SELECT cycle; no game identity or absolute target is encoded here.
+    """
+    if step <= 0 or not (2 <= len(pieces) <= OV_CATALOG_CAP):
+        return None
+    piece_colors = {color for _center, color, _mask in pieces}
+    anchor_colors = {color for color, cells in anchors.items() if cells}
+    if piece_colors != anchor_colors:
+        return None
+    color_counts = Counter(color for _center, color, _mask in pieces)
+    if not any(color_counts[color] >= 2 for color in anchor_colors):
+        return None
+
+    goals = sorted(
+        (color, cell) for color, cells in anchors.items() for cell in cells
+    )
+    if not goals or len(goals) > OV_ASSIGN_GOAL_CAP:
+        return None
+    goal_bit = {goal: 1 << index for index, goal in enumerate(goals)}
+    full_mask = (1 << len(goals)) - 1
+
+    rows: list[list[tuple[int, int, Cell, frozenset[Cell], Cell]]] = []
+    for origin, color, rel_mask in pieces:
+        if not rel_mask:
+            return None
+        same = tuple(anchors.get(color, ()))
+        targets = {origin}
+        for ax, ay in same:
+            for rx, ry in rel_mask:
+                target = (ax - rx, ay - ry)
+                if not (0 <= target[0] < GRID and 0 <= target[1] < GRID):
+                    continue
+                if (target[0] - origin[0]) % step == 0 \
+                        and (target[1] - origin[1]) % step == 0:
+                    targets.add(target)
+
+        # One cheapest target per identical coverage mask.  A zero-coverage
+        # stay lets surplus pieces remain harmlessly in their observed place.
+        compressed: dict[
+            int, tuple[int, int, int, Cell, frozenset[Cell], Cell]
+        ] = {0: (0, 0, 0, origin, frozenset(), (0, 0))}
+        for target in targets:
+            tx, ty = target
+            hits = frozenset(
+                cell for cell in same
+                if (cell[0] - tx, cell[1] - ty) in rel_mask
+            )
+            mask = 0
+            for cell in hits:
+                mask |= goal_bit[(color, cell)]
+            dx, dy = tx - origin[0], ty - origin[1]
+            moves = (abs(dx) + abs(dy)) // step
+            candidate = (moves, dy, dx, target, hits, (dy, dx))
+            old = compressed.get(mask)
+            if old is None or candidate[:3] < old[:3]:
+                compressed[mask] = candidate
+        rows.append([
+            (mask, candidate[0], candidate[3], candidate[4], candidate[5])
+            for mask, candidate in sorted(compressed.items())
+        ])
+
+    # covered_mask -> (moves, overlap, max_piece_moves, displacements,
+    #                  ordered placements)
+    dp: dict[int, tuple[int, int, int, tuple[Cell, ...], tuple]] = {
+        0: (0, 0, 0, tuple(), tuple())
+    }
+    for (origin, color, rel_mask), options in zip(pieces, rows):
+        nxt: dict[int, tuple[int, int, int, tuple[Cell, ...], tuple]] = {}
+        for covered, state in dp.items():
+            total, overlap, max_moves, disps, placements = state
+            for mask, moves, target, hits, disp in options:
+                merged = covered | mask
+                redundant = mask.bit_count() - (mask & ~covered).bit_count()
+                candidate = (
+                    total + moves,
+                    overlap + redundant,
+                    max(max_moves, moves),
+                    disps + (disp,),
+                    placements + ((color, rel_mask, target, hits),),
+                )
+                old = nxt.get(merged)
+                if old is None or candidate[:4] < old[:4]:
+                    nxt[merged] = candidate
+        dp = nxt
+        if not dp or len(dp) > OV_ASSIGN_STATE_CAP:
+            return None
+    solved = dp.get(full_mask)
+    return list(solved[4]) if solved is not None else None
+
+
 def canon_window(grid: Grid, x: int, y: int, p: int) -> tuple:
     """Rotation-canonical pixel tuple of a p x p window: the same card
     appearance hashes equal wherever it sits and however it is rotated
@@ -1022,6 +1199,18 @@ class MyAgent(Agent):
         self._ov_solved: set[int] = set()           # colours already covered
         self._ov_plan: deque[int] = deque()         # queued MOVE action ids
         self._ov_target: Optional[Cell] = None      # centre we are driving to
+        # Same-colour multi-piece overlays are catalogued by one full SELECT
+        # cycle, then executed in that observed ordinal order.
+        self._ov_catalog: list[
+            tuple[Cell, int, frozenset[Cell]]
+        ] = []
+        self._ov_catalog_first: Optional[
+            tuple[Cell, int, frozenset[Cell]]
+        ] = None
+        self._ov_assignment: deque[
+            tuple[int, frozenset[Cell], Cell, frozenset[Cell]]
+        ] = deque()
+        self._ov_assigned_anchors: set[tuple[int, Cell]] = set()
         self._ov_strikes = 0
         self._ov_benched: Optional[int] = None
         self._ov_last_center: Optional[Cell] = None  # progress watchdog
@@ -1263,6 +1452,10 @@ class MyAgent(Agent):
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_catalog.clear()
+            self._ov_catalog_first = None
+            self._ov_assignment.clear()
+            self._ov_assigned_anchors.clear()
             self._ov_strikes = 0
             self._ov_benched = None
             self._ov_last_center = None
@@ -1419,6 +1612,10 @@ class MyAgent(Agent):
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_catalog.clear()
+            self._ov_catalog_first = None
+            self._ov_assignment.clear()
+            self._ov_assigned_anchors.clear()
             self._ov_strikes = 0
             self._ov_benched = None
             self._ov_last_center = None
@@ -3066,6 +3263,10 @@ class MyAgent(Agent):
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_catalog.clear()
+            self._ov_catalog_first = None
+            self._ov_assignment.clear()
+            self._ov_assigned_anchors.clear()
             self._ov_idprobe = 0
         # CONFIDENCE GATE (round 6 tighten): the genuine re86 static overlay is
         # a RICH anchor structure — the dominant outline alone exposes 3-4
@@ -3080,6 +3281,29 @@ class MyAgent(Agent):
         outline, anchors = goal
         sel = self._ov_selected(grid, outline)
         if sel is None:
+            # A moving selected body can briefly paint over its own hole while
+            # crossing another piece/overlay.  Falling through to novelty may
+            # emit SELECT and silently advance the catalog ordinal mid-plan.
+            # Keep the ordinal stable with the next queued movement (or any
+            # learned movement once the queue is empty).  If an animation
+            # ignores an input, the target-relative planner restores the
+            # missing step from the next readable centre.
+            if self._ov_target is not None \
+                    or self._ov_catalog or self._ov_assignment:
+                if self._ov_target is not None and self._ov_plan:
+                    action = self._ov_plan.popleft()
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(action))
+                moves = [
+                    action for action in sorted(avail)
+                    if action != self._ov_select
+                    and action != GameAction.RESET.value
+                    and not GameAction.from_id(action).is_complex()
+                    and self._ov_deltas[action]
+                ]
+                if moves:
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(moves[0]))
             return None  # transient frame with no clean selection hole
         center, arm = sel
         # LEARN MOVE DELTAS the head's own way: the generic move-vote path caps
@@ -3138,6 +3362,40 @@ class MyAgent(Agent):
             u = (0, -1) if d[1] < 0 else (0, 1) if d[1] > 0 \
                 else (-1, 0) if d[0] < 0 else (1, 0)
             dir_act[u] = a
+        # A cover-all failure can mean several same-colour pieces must divide
+        # their colour's anchors.  Inventory one complete SELECT cycle before
+        # moving anything.  Identity includes observed centre and symmetric
+        # relative mask, so identical shapes at different sites remain
+        # distinct instances and an intermediate duplicate is ambiguous.
+        if self._ov_catalog:
+            rel_mask = symmetric_piece_mask(grid, center, arm)
+            if rel_mask is None:
+                self._ov_catalog.clear()
+                self._ov_catalog_first = None
+                self._ov_benched = level
+                return None
+            key = (center, arm, rel_mask)
+            if key == self._ov_catalog_first:
+                assignment = assign_overlay_pieces(
+                    self._ov_catalog, anchors, step
+                ) if len(self._ov_catalog) >= 2 else None
+                self._ov_catalog.clear()
+                self._ov_catalog_first = None
+                if assignment is None:
+                    self._ov_benched = level
+                    return None
+                self._ov_assignment = deque(assignment)
+                self._ov_assigned_anchors.clear()
+            elif key in self._ov_catalog \
+                    or len(self._ov_catalog) >= OV_CATALOG_CAP:
+                self._ov_catalog.clear()
+                self._ov_catalog_first = None
+                self._ov_benched = level
+                return None
+            else:
+                self._ov_catalog.append(key)
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
         # progress watchdog: an in-flight plan that left the centre unmoved
         # means the piece bounced a wall (re86 clamps at the camera edge) —
         # strike and re-plan
@@ -3155,16 +3413,89 @@ class MyAgent(Agent):
             act = self._ov_plan.popleft()
             self._ov_last_center = center
             return self._step(GameAction.from_id(act))
-        # target reached (or no plan): this colour is placed — mark it solved
+        # Target reached.  A joint assignment advances one SELECT-cycle
+        # instance and records only the anchors proved for that placement;
+        # the ordinary one-piece path retains its colour-level solved flag.
         if self._ov_target is not None and center == self._ov_target:
-            self._ov_solved.add(arm)
             self._ov_target = None
             self._ov_plan.clear()
+            if self._ov_assignment:
+                expected_arm, _mask, _target, hits = \
+                    self._ov_assignment.popleft()
+                if expected_arm != arm:
+                    self._ov_assignment.clear()
+                    self._ov_benched = level
+                    return None
+                self._ov_assigned_anchors.update(
+                    (expected_arm, cell) for cell in hits
+                )
+                if not self._ov_assignment:
+                    required = {
+                        (color, cell) for color, cells in anchors.items()
+                        for cell in cells
+                    }
+                    if not required <= self._ov_assigned_anchors:
+                        self._ov_benched = level
+                        return None
+                    self._ov_solved.update(anchors)
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
+            self._ov_solved.add(arm)
+
+        # Execute the globally proved placement for the current selection
+        # ordinal.  Re-read its symmetric signature before the first move;
+        # once in flight, centre progress is guarded by the watchdog above.
+        if self._ov_assignment:
+            expected_arm, expected_mask, tgt, hits = self._ov_assignment[0]
+            observed_mask = symmetric_piece_mask(grid, center, arm)
+            if arm != expected_arm or observed_mask != expected_mask:
+                self._ov_assignment.clear()
+                self._ov_benched = level
+                return None
+            if tgt == center:
+                self._ov_assignment.popleft()
+                self._ov_assigned_anchors.update(
+                    (expected_arm, cell) for cell in hits
+                )
+                if not self._ov_assignment:
+                    required = {
+                        (color, cell) for color, cells in anchors.items()
+                        for cell in cells
+                    }
+                    if not required <= self._ov_assigned_anchors:
+                        self._ov_benched = level
+                        return None
+                    self._ov_solved.update(anchors)
+                self._ov_last_center = None
+                return self._step(GameAction.from_id(select))
+            tx, ty = tgt
+            dx, dy = tx - center[0], ty - center[1]
+            nx = abs(dx) // step
+            ny = abs(dy) // step
+            ax = dir_act[(1, 0)] if dx > 0 else dir_act[(-1, 0)]
+            ay = dir_act[(0, 1)] if dy > 0 else dir_act[(0, -1)]
+            plan: list[int] = []
+            if dx and ax is not None:
+                plan += [ax] * nx
+            if dy and ay is not None:
+                plan += [ay] * ny
+            if not plan:
+                self._ov_assignment.clear()
+                self._ov_benched = level
+                return None
+            self._ov_target = tgt
+            self._ov_plan = deque(plan)
+            act = self._ov_plan.popleft()
+            self._ov_last_center = center
+            return self._step(GameAction.from_id(act))
+
         # plan the selected colour's cover if it still has unsolved anchors
         my_anchors = anchors.get(arm, [])
         if my_anchors and arm not in self._ov_solved:
-            tgt = cover_centers(frozenset(piece_footprint(grid, center, arm)),
-                                center, my_anchors, step, center)
+            footprint = frozenset(piece_footprint(grid, center, arm))
+            tgt = cover_centers(
+                footprint, center, my_anchors, step, center
+            )
             if tgt is not None and tgt != center:
                 plan: list[int] = []
                 tx, ty = tgt
@@ -3183,6 +3514,14 @@ class MyAgent(Agent):
                     act = self._ov_plan.popleft()
                     self._ov_last_center = center
                     return self._step(GameAction.from_id(act))
+            if tgt is None:
+                rel_mask = symmetric_piece_mask(grid, center, arm)
+                if rel_mask is not None:
+                    first = (center, arm, rel_mask)
+                    self._ov_catalog = [first]
+                    self._ov_catalog_first = first
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(select))
             # this colour is placed already (tgt == center) or uncoverable
             # (tgt is None — a non-axis shape this head defers): mark it done
             # so SELECT advances instead of looping on it

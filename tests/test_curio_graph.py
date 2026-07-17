@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import unittest
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from arcengine import FrameData, GameAction, GameState
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -232,6 +236,204 @@ class HudIdentityTests(unittest.TestCase):
         self.assertEqual(agent._transitions, {(expected, "probe"): expected})
         self.assertEqual(agent._tried[expected], {"probe"})
         self.assertNotIn((12345, "probe"), agent._transitions)
+
+
+class ClickInstanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.agent_class = load_agent_class()
+
+    def _agent(self):
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._gx_instance_effects = {}
+        agent._gx_lethal_sig = set()
+        agent._click_effects = {}
+        agent._gx_nodes = {}
+        agent._tried = defaultdict(set)
+        return agent
+
+    @staticmethod
+    def _twin_grid():
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[5][63] = 1
+        grid[20][63] = 1
+        return grid
+
+    @staticmethod
+    def _dense_twin_grid():
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        for i in range(17):
+            grid[2 * (i // 8) + 1][2 * (i % 8) + 1] = 1
+        return grid
+
+    def test_identical_components_are_both_candidates(self) -> None:
+        agent = self._agent()
+
+        self.assertEqual(
+            agent._gx_click_targets(self._twin_grid()),
+            [(63, 5), (63, 20)],
+        )
+
+    def test_mixed_action_board_preserves_class_dedupe(self) -> None:
+        agent = self._agent()
+
+        self.assertEqual(len(agent._gx_click_targets(
+            self._twin_grid(), {GameAction.ACTION1.value,
+                                GameAction.ACTION6.value})), 1)
+
+    def test_dense_board_preserves_one_candidate_per_class(self) -> None:
+        agent = self._agent()
+
+        self.assertEqual(len(agent._gx_click_targets(
+            self._dense_twin_grid())), 1)
+
+    def test_dense_board_preserves_global_dead_class_pruning(self) -> None:
+        agent = self._agent()
+        grid = self._dense_twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(1, 1)}))
+        agent._click_effects[sig] = [0, 4]
+
+        self.assertEqual(agent._gx_click_targets(grid), [])
+
+    def test_unknown_twins_are_exposed_one_at_a_time(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        node = agent._gx_node(99, grid, {GameAction.ACTION6.value})
+
+        first = agent._gx_untried(99, node)
+        self.assertEqual(len(first), 1)
+        agent._tried[99].add(first[0])
+        second = agent._gx_untried(99, node)
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first, second)
+
+    def test_fresh_twin_beats_partially_inert_twin(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(63, 5)}))
+        agent._gx_note_instance(sig, (63, 5), changed=False)
+        node = agent._gx_node(99, grid, {GameAction.ACTION6.value})
+
+        self.assertEqual(agent._gx_untried(99, node), ["6:63,20"])
+
+    def test_cached_node_refreshes_instance_salience(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        node = agent._gx_node(99, grid, {GameAction.ACTION6.value})
+        sig = node["sig"]["6:63,5"]
+        for _ in range(4):
+            agent._gx_note_instance(sig, (63, 5), changed=False)
+
+        self.assertEqual(agent._gx_untried(99, node), ["6:63,20"])
+
+    def test_productive_class_exposes_all_twins(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(63, 5)}))
+        agent._click_effects[sig] = [3, 3]
+        node = agent._gx_node(99, grid, {GameAction.ACTION6.value})
+
+        self.assertEqual(len(agent._gx_untried(99, node)), 2)
+
+    def test_global_negative_history_does_not_hide_fresh_instances(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(63, 5)}))
+        agent._click_effects[sig] = [0, 4]
+
+        self.assertEqual(
+            agent._gx_click_targets(grid), [(63, 5), (63, 20)])
+
+    def test_inert_instance_does_not_suppress_its_twin(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(63, 5)}))
+        for _ in range(4):
+            agent._gx_note_instance(sig, (63, 5), changed=False)
+
+        self.assertEqual(agent._gx_click_targets(grid), [(63, 20)])
+
+    def test_all_inert_instances_do_not_fall_back_to_background(self) -> None:
+        agent = self._agent()
+        grid = self._twin_grid()
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(63, 5)}))
+        for coords in ((63, 5), (63, 20)):
+            for _ in range(4):
+                agent._gx_note_instance(sig, coords, changed=False)
+
+        self.assertEqual(agent._gx_click_targets(grid), [])
+
+    def test_noncentroid_click_updates_canonical_instance(self) -> None:
+        agent = self._agent()
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        for x, y in ((62, 5), (63, 5), (62, 6),
+                     (62, 20), (63, 20), (62, 21)):
+            grid[y][x] = 1
+        comps = agent._gx_instance_key.__globals__["components"](grid)
+        sig = agent._gx_instance_key.__globals__["signature_under"](
+            comps, (63, 5))
+        for _ in range(4):
+            agent._gx_note_instance(
+                sig, (63, 5), changed=False, comps=comps)
+
+        self.assertEqual(agent._gx_click_targets(grid), [(62, 20)])
+
+    def test_level_up_clears_instance_evidence(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="click-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        agent._gx_instance_effects[(123, 5, 5)] = [0, 4]
+        agent._policy = lambda _grid, _frame: GameAction.ACTION1
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=1,
+            available_actions=[GameAction.ACTION1.value],
+        )
+
+        agent.choose_action([], frame)
+
+        self.assertEqual(agent._gx_instance_effects, {})
+
+    def test_lethal_only_board_falls_back_to_reset_not_click(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="click-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[5][9] = 1
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(9, 5)}))
+        agent._gx_lethal_sig.add(sig)
+        agent._hud_identity_ready = True
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            available_actions=[GameAction.ACTION6.value],
+        )
+
+        action = agent._graph_explore_policy(grid, frame)
+
+        self.assertIs(action, GameAction.RESET)
+        self.assertEqual(agent._prev_action, "0")
 
 
 if __name__ == "__main__":

@@ -580,9 +580,10 @@ class MyAgent(Agent):
             # (state, action-key) the explorer just issued as a RESET-inducing
             # action; confirmed and turned into a start edge on the next start
             self._gx_pending_reset: Optional[tuple[int, str]] = None
-            # appearance signatures of clicks exhausted ANYWHERE (cross-state
-            # pruning); appearance is physics, so this persists across levels
-            self._gx_global_tried_sig: set[int] = set()
+            # Per-level, per-instance click evidence.  Global class evidence
+            # remains a soft ranking prior; negative evidence can only hard-
+            # suppress the exact instance that earned it on this level.
+            self._gx_instance_effects: dict[tuple[int, int, int], list[int]] = {}
             # LETHAL-CLICK MEMORY (win-speed lever): appearance signatures of
             # sprites whose click was the last action before a GAME_OVER.  A
             # death restarts the CURRENT level (confirmed empirically — these
@@ -1023,9 +1024,10 @@ class MyAgent(Agent):
             self._steps_since_novelty = 0
             if self._gx_on:
                 # graph geography has the same per-level lifetime as _tried;
-                # appearance-keyed _gx_global_tried_sig persists (it's physics)
+                # exact click instances are level geography, not physics
                 self._gx_nodes.clear()
                 self._gx_route.clear()
+                self._gx_instance_effects.clear()
                 self._gx_route_dest = None
                 self._gx_resets = 0
                 self._gx_start = None
@@ -1223,13 +1225,20 @@ class MyAgent(Agent):
                     eff = self._click_effects.setdefault(sig, [0, 0])
                     eff[0] += 1
                     eff[1] += 1
+                    if self._gx_on:
+                        self._gx_note_instance(
+                            sig, (x, y), changed=True, comps=comps_prev)
                     self._sw_plan.clear()
                     self._plan.clear()
                     return
                 eff = self._click_effects.setdefault(sig, [0, 0])
-                if not self._same_unmasked(self._prev_grid, grid):
+                changed = not self._same_unmasked(self._prev_grid, grid)
+                if changed:
                     eff[0] += 1
                 eff[1] += 1
+                if self._gx_on:
+                    self._gx_note_instance(
+                        sig, (x, y), changed=changed, comps=comps_prev)
                 self._learn_click_fx(grid, (x, y), comps_prev, leveled)
                 if not leveled:
                     # SWITCH: record what this click repainted away from
@@ -5697,13 +5706,58 @@ class MyAgent(Agent):
         return [o if o[2] is not None else next(fill) for o in untried]
 
     # ── graph explorer (CURIO_EXPLORER=graph) ───────────────────────────
+    def _gx_instance_key(
+        self, sig: int, coords: Cell
+    ) -> tuple[int, int, int]:
+        return (sig, coords[0], coords[1])
+
+    def _gx_note_instance(
+        self, sig: int, coords: Cell, *, changed: bool,
+        comps: Optional[list[tuple[int, frozenset[Cell]]]] = None,
+    ) -> None:
+        if comps is not None:
+            coords = self._gx_instance_target(comps, coords)
+        rec = self._gx_instance_effects.setdefault(
+            self._gx_instance_key(sig, coords), [0, 0])
+        rec[0] += int(changed)
+        rec[1] += 1
+
+    @staticmethod
+    def _gx_component_target(cells: frozenset[Cell]) -> Cell:
+        """Canonical click coordinate for one physical component."""
+        xs = [c[0] for c in cells]
+        ys = [c[1] for c in cells]
+        cx, cy = sum(xs) // len(xs), sum(ys) // len(ys)
+        if (cx, cy) not in cells:
+            cx, cy = min(
+                cells, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+        return (cx, cy)
+
+    def _gx_instance_target(
+        self, comps: list[tuple[int, frozenset[Cell]]], coords: Cell
+    ) -> Cell:
+        """Map any clicked pixel to its component's canonical target."""
+        for _color, cells in comps:
+            if coords in cells:
+                return self._gx_component_target(cells)
+        return coords
+
+    def _gx_instance_dead(self, sig: int, coords: Cell) -> bool:
+        """Hard negative evidence scoped to one instance on this level."""
+        changed, tries = self._gx_instance_effects.get(
+            self._gx_instance_key(sig, coords), (0, 0))
+        if tries >= CLICK_PROBES and changed == 0:
+            return True
+        return tries >= 2 * CLICK_PROBES \
+            and (changed + 1) / (tries + 2) < 2 * CLICK_DEAD
+
     def _gx_options(
         self, grid: Optional[Grid], avail: set[int]
     ) -> list[tuple[str, GameAction, Optional[Cell]]]:
         """Candidate (action-key, action, coords) for a state — same
         primitives and key format as _novelty_policy so _tried/_transitions
         interoperate.  ACTION6 enumerates over the explorer's own tamed
-        target set (component-centroid + signature-dedup)."""
+        target set (one component centroid per physical instance)."""
         options: list[tuple[str, GameAction, Optional[Cell]]] = []
         for action in GameAction:
             if action is GameAction.RESET:
@@ -5711,7 +5765,7 @@ class MyAgent(Agent):
             if avail and action.value not in avail:
                 continue
             if action.is_complex():
-                for x, y in self._gx_click_targets(grid):
+                for x, y in self._gx_click_targets(grid, avail):
                     options.append((f"6:{x},{y}", action, (x, y)))
             else:
                 options.append((str(action.value), action, None))
@@ -5719,7 +5773,7 @@ class MyAgent(Agent):
 
     def _gx_tier(
         self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
-        opt: tuple[str, GameAction, Optional[Cell]]
+        opt: tuple[str, GameAction, Optional[Cell]], *, instance_sigs: set[int],
     ) -> int:
         """Salience tier for an untried option (higher = explore first).
         -1 dead (excluded); 0 known-rule moves / background clicks;
@@ -5736,16 +5790,87 @@ class MyAgent(Agent):
                 return 1                         # still learning: high info
             return 0
         sig = signature_under(comps, coords)
+        return (self._gx_click_tier(sig, coords) if sig in instance_sigs
+                else self._gx_class_click_tier(sig))
+
+    def _gx_class_click_tier(self, sig: int) -> int:
+        """Original graph salience for dense class-deduped boards."""
+        if sig == 0:
+            return 0
+        if self._click_dead(sig) or sig in self._gx_lethal_sig:
+            return -1
+        changed, tries = self._click_effects.get(sig, (0, 0))
+        if tries == 0:
+            return 3
+        if (changed + 1) / (tries + 2) > 0.5:
+            return 2
+        return 0
+
+    def _gx_click_tier(self, sig: int, coords: Cell) -> int:
+        """Live salience for one click instance.
+
+        Nodes cache their candidate geometry, but evidence changes after each
+        action.  Recomputing this tiny score prevents an old tier-3 value from
+        keeping an inert or lethal instance at the front of the graph.
+        """
         if sig == 0:
             return 0                             # background click
-        if self._click_dead(sig) or sig in self._gx_lethal_sig:
-            return -1                            # proven dead / lethal: exclude
+        if self._gx_instance_dead(sig, coords) or sig in self._gx_lethal_sig:
+            return -1                            # this instance / class is unsafe
         changed, tries = self._click_effects.get(sig, (0, 0))
-        if tries == 0 and sig not in self._gx_global_tried_sig:
-            return 3                             # unseen salient class: top
+        inst_tries = self._gx_instance_effects.get(
+            self._gx_instance_key(sig, coords), (0, 0))[1]
+        if inst_tries == 0:
+            return 3                             # unseen salient instance: top
         if tries > 0 and (changed + 1) / (tries + 2) > (1.0 / 2.0):
             return 2                             # known-productive class
         return 0
+
+    def _gx_live_tier(self, node: dict[str, Any], akey: str) -> int:
+        opt = node["optmap"][akey]
+        coords = opt[2]
+        if coords is None:
+            return node["salience"].get(akey, 0)
+        sig = node.get("sig", {}).get(akey, 0)
+        if sig in node.get("instance_sigs", set()):
+            return self._gx_click_tier(sig, coords)
+        return self._gx_class_click_tier(sig)
+
+    @staticmethod
+    def _gx_instance_sigs(
+        comps: list[tuple[int, frozenset[Cell]]], avail: Optional[set[int]],
+    ) -> set[int]:
+        """Duplicate classes whose physical instances deserve expansion.
+
+        A compact same-edge group on a click-only board is a strong signal
+        that each identical object is a separate control.  Mixed-action and
+        interior/dense boards retain the proven one-representative-per-class
+        frontier, avoiding lattice and switch branching regressions.
+        """
+        if avail is not None and avail != {GameAction.ACTION6.value}:
+            return set()
+        groups: dict[int, list[frozenset[Cell]]] = defaultdict(list)
+        for color, cells in comps:
+            groups[shape_signature(color, cells)].append(cells)
+        expanded: set[int] = set()
+        for sig, group in groups.items():
+            if not 2 <= len(group) <= 8:
+                continue
+            common_sides = {"left", "right", "top", "bottom"}
+            for cells in group:
+                sides: set[str] = set()
+                if any(x == 0 for x, _y in cells):
+                    sides.add("left")
+                if any(x == GRID - 1 for x, _y in cells):
+                    sides.add("right")
+                if any(y == 0 for _x, y in cells):
+                    sides.add("top")
+                if any(y == GRID - 1 for _x, y in cells):
+                    sides.add("bottom")
+                common_sides &= sides
+            if common_sides:
+                expanded.add(sig)
+        return expanded
 
     def _gx_node(
         self, key: int, grid: Optional[Grid], avail: set[int]
@@ -5756,14 +5881,17 @@ class MyAgent(Agent):
         is pruned live against _tried)."""
         node = self._gx_nodes.get(key)
         if node is None:
-            options = self._gx_options(grid, avail)
             comps = components(grid) if grid is not None else []
+            instance_sigs = self._gx_instance_sigs(comps, avail)
+            options = self._gx_options(grid, avail)
             salience: dict[str, int] = {}
             actions: list[str] = []
             optmap: dict[str, tuple[str, GameAction, Optional[Cell]]] = {}
             sigmap: dict[str, int] = {}
             for opt in options:
-                tier = self._gx_tier(grid, comps, opt) if grid is not None else 0
+                tier = (self._gx_tier(
+                    grid, comps, opt, instance_sigs=instance_sigs)
+                    if grid is not None else 0)
                 if tier < 0:
                     continue                     # dead signature: never offer
                 actions.append(opt[0])
@@ -5772,32 +5900,44 @@ class MyAgent(Agent):
                 if opt[2] is not None:
                     sigmap[opt[0]] = signature_under(comps, opt[2])
             node = {"actions": actions, "salience": salience,
-                    "optmap": optmap, "sig": sigmap}
+                    "optmap": optmap, "sig": sigmap,
+                    "instance_sigs": instance_sigs}
             self._gx_nodes[key] = node
         return node
 
     def _gx_untried(self, key: int, node: dict[str, Any]) -> list[str]:
-        """Action-keys at this node not yet tried (per-state) and not
-        globally exhausted by signature; sorted highest-salience first,
-        ties lexicographic (deterministic BFS/route reproduction)."""
+        """Action-keys at this node not yet tried, exposed hierarchically.
+
+        Unknown/inert twins reveal one live instance at a time; once a class
+        proves productive, all of its distinct instances become frontier.
+        """
         tried = self._tried[key]
         out: list[str] = []
+        unknown: dict[int, list[tuple[int, int, str]]] = defaultdict(list)
         for akey in node["actions"]:
             if akey in tried:
                 continue
             opt = node["optmap"][akey]
             if opt[2] is not None:
                 sig = node.get("sig", {}).get(akey)
-                # cross-state pruning: a click whose class is globally
-                # exhausted (proven dead anywhere) or proven lethal is never
-                # re-offered
-                if sig is not None and (
-                        sig in self._gx_global_tried_sig
-                        or self._click_dead(sig)
-                        or sig in self._gx_lethal_sig):
-                    continue
+                if sig is not None:
+                    tier = self._gx_live_tier(node, akey)
+                    if tier < 0:
+                        continue
+                    if sig in node.get("instance_sigs", set()):
+                        changed, tries = self._click_effects.get(sig, (0, 0))
+                        productive = tries > 0 \
+                            and (changed + 1) / (tries + 2) > 0.5
+                        if not productive:
+                            inst_tries = self._gx_instance_effects.get(
+                                self._gx_instance_key(sig, opt[2]), (0, 0))[1]
+                            # One active frontier per unknown class. Prefer its
+                            # freshest/highest-information physical instance.
+                            unknown[sig].append((-tier, inst_tries, akey))
+                            continue
             out.append(akey)
-        out.sort(key=lambda a: (-node["salience"].get(a, 0), a))
+        out.extend(min(candidates)[2] for candidates in unknown.values())
+        out.sort(key=lambda a: (-self._gx_live_tier(node, a), a))
         return out
 
     def _gx_bfs(self, cur: int) -> Optional[tuple[list[str], int]]:
@@ -5826,7 +5966,8 @@ class MyAgent(Agent):
             if node_key != cur and node_key in self._gx_nodes:
                 ut = self._gx_untried(node_key, self._gx_nodes[node_key])
                 if ut:
-                    tier = self._gx_nodes[node_key]["salience"].get(ut[0], 0)
+                    tier = self._gx_live_tier(
+                        self._gx_nodes[node_key], ut[0])
                     cost = len(path) - 0.25 * tier  # salience bonus
                     if best is None or cost < best[0]:
                         best = (cost, path, node_key)
@@ -5843,7 +5984,7 @@ class MyAgent(Agent):
     def _gx_emit(
         self, key: int, choice: tuple[str, GameAction, Optional[Cell]]
     ) -> GameAction:
-        """Mark an option tried (per-state + global-signature) and emit it."""
+        """Mark an option tried in this state and emit it."""
         akey, action, coords = choice
         self._tried[key].add(akey)
         if coords is not None:
@@ -5869,11 +6010,10 @@ class MyAgent(Agent):
         # Arm only after the identity epoch is stable: HUD-free games need one
         # observation; HUD games need the same non-empty candidate twice.
         if not self._hud_identity_ready:
-            return self._novelty_body(grid, latest_frame)
+            return self._gx_safe_novelty_body(grid, latest_frame)
         node = self._gx_node(key, grid, avail)
         if not node["actions"]:
-            self._prev_action = "0"
-            return GameAction.RESET
+            return self._gx_safe_novelty_body(grid, latest_frame)
 
         # 1. LOCAL FRONTIER: highest-salience untried action in this state.
         untried = self._gx_untried(key, node)
@@ -5936,7 +6076,7 @@ class MyAgent(Agent):
 
         # 5. Graph genuinely exhausted (or RESET unavailable / capped):
         # defer to the v7 revisit-ranker so behavior degrades gracefully.
-        return self._novelty_body(grid, latest_frame)
+        return self._gx_safe_novelty_body(grid, latest_frame)
 
     def _gx_key_to_action(
         self, akey: str
@@ -5956,31 +6096,53 @@ class MyAgent(Agent):
         proven heuristics."""
         if grid is None:
             return untried[0]
-        top_tier = node["salience"].get(untried[0], 0)
-        top = [a for a in untried if node["salience"].get(a, 0) == top_tier]
+        top_tier = self._gx_live_tier(node, untried[0])
+        top = [a for a in untried
+               if self._gx_live_tier(node, a) == top_tier]
         if len(top) == 1:
             return top[0]
         opts = [node["optmap"][a] for a in top]
-        # any clicks in the tier: rank by affordance; else balance simples.
-        # _afford_rank drops click options whose LIVE signature is dead (the
-        # grid can differ from the node's first-visit frame under HUD masking),
-        # so the reordered list may be shorter or empty — fall back to top[0].
+        # Any clicks in the tier get soft class+instance affordance ranking;
+        # negative evidence never drops a whole appearance class here.
         if any(o[2] is not None for o in opts):
-            opts = self._afford_rank(grid, opts)
+            opts = self._gx_afford_rank(grid, opts)
         opts = self._use_balance(opts)
         return opts[0][0] if opts else top[0]
 
-    def _gx_click_targets(self, grid: Optional[Grid]) -> list[Cell]:
-        """Tamed ACTION6 candidates for the graph explorer: ONE click per
-        connected-component centroid (snapped onto the component when the raw
-        centroid falls off-color), deduped to at most one representative per
-        distinct shape_signature per state (we only need to learn what a
-        CLASS does — that transfers), and pruned of dead / globally-exhausted
-        signatures.  This collapses a grid of identical tiles from dozens of
-        redundant clicks to a handful of class-reps, shrinking per-node
-        branching so the BFS frontier stays tractable.  Ordering preserves
-        rarest-color / smallest-component first (smallest comps first), so the
-        salience tiering lines up with the legacy enumeration's intuition.
+    def _gx_afford_rank(
+        self, grid: Grid,
+        opts: list[tuple[str, GameAction, Optional[Cell]]],
+    ) -> list[tuple[str, GameAction, Optional[Cell]]]:
+        """Soft click ranking that never hard-vetoes a whole shape class."""
+        comps = components(grid)
+        scored: list[tuple[float, tuple[str, GameAction, Optional[Cell]]]] = []
+        for opt in opts:
+            coords = opt[2]
+            if coords is None:
+                continue
+            sig = signature_under(comps, coords)
+            ich, itr = self._gx_instance_effects.get(
+                self._gx_instance_key(sig, coords), (0, 0))
+            instance_score = (ich + 2) / (itr + 3)
+            changed, tries = self._click_effects.get(sig, (0, 0))
+            class_score = (changed + 2) / (tries + 3)
+            # Fresh instances retain the optimistic prior even when another
+            # same-looking object was inert on an earlier level.
+            scored.append((max(instance_score, class_score), opt))
+        scored.sort(key=lambda so: -so[0])
+        fill = iter(opt for _score, opt in scored)
+        return [opt if opt[2] is None else next(fill) for opt in opts]
+
+    def _gx_click_targets(
+        self, grid: Optional[Grid], avail: Optional[set[int]] = None,
+    ) -> list[Cell]:
+        """Per-instance controls or class-level graph candidates.
+
+        Centroids are snapped onto concave/ring components.  Exact instances
+        proven inert on this level are pruned for compact same-edge duplicate
+        groups on click-only boards.  Every other signature preserves the
+        original one-representative-per-class behavior and global dead-class
+        pruning. Ordering remains rarest-color / smallest-component first.
 
         Separate from _click_targets so legacy novelty / lp85's exact
         rarest-color enumeration is untouched."""
@@ -5993,28 +6155,26 @@ class MyAgent(Agent):
         color_count: Counter[int] = Counter(c for c, _cells in comps)
         ordered = sorted(
             comps, key=lambda c: (color_count[c[0]], len(c[1])))
+        instance_sigs = self._gx_instance_sigs(comps, avail)
         out: list[Cell] = []
         seen_sig: set[int] = set()
         for color, cells in ordered:
             sig = shape_signature(color, cells)
-            if sig in seen_sig:
-                continue                          # one rep per class per state
-            seen_sig.add(sig)
-            if sig in self._gx_global_tried_sig or self._click_dead(sig) \
-                    or sig in self._gx_lethal_sig:
-                continue                          # spent/dead/lethal: skip
-            xs = [c[0] for c in cells]
-            ys = [c[1] for c in cells]
-            cx, cy = sum(xs) // len(xs), sum(ys) // len(ys)
-            if (cx, cy) not in cells:
-                # centroid fell off the component (concave/ring shapes):
-                # snap to the nearest on-component cell (deterministic min)
-                cx, cy = min(cells, key=lambda p: (p[0]-cx)**2 + (p[1]-cy)**2)
-            out.append((cx, cy))
+            if sig not in instance_sigs:
+                if sig in seen_sig:
+                    continue
+                seen_sig.add(sig)
+                if self._click_dead(sig) or sig in self._gx_lethal_sig:
+                    continue
+            target = self._gx_component_target(cells)
+            if sig in instance_sigs and (self._gx_instance_dead(sig, target)
+                                        or sig in self._gx_lethal_sig):
+                continue
+            out.append(target)
         # dedup coords, keep order
         s: set[Cell] = set()
         deduped = [t for t in out if not (t in s or s.add(t))]
-        return deduped or [(32, 32)]
+        return deduped
 
     def _novelty_body(
         self, grid: Optional[Grid], latest_frame: FrameData
@@ -6022,6 +6182,30 @@ class MyAgent(Agent):
         """The verbatim v7 novelty fallback, callable when the graph
         explorer defers (graph not yet armed, or no reachable frontier)."""
         return self._novelty_policy_impl(grid, latest_frame)
+
+    def _gx_safe_novelty_body(
+        self, grid: Optional[Grid], latest_frame: FrameData
+    ) -> GameAction:
+        """Legacy revisit logic over graph-safe click candidates only."""
+        return self._novelty_policy_impl(
+            grid, latest_frame, graph_safe=True)
+
+    def _gx_fallback_targets(self, grid: Optional[Grid]) -> list[Cell]:
+        """Legacy target order with graph-proven unsafe instances removed."""
+        targets = self._click_targets(grid)
+        if grid is None:
+            return targets
+        comps = components(grid)
+        safe: list[Cell] = []
+        for coords in targets:
+            sig = signature_under(comps, coords)
+            if sig != 0:
+                canonical = self._gx_instance_target(comps, coords)
+                if self._gx_instance_dead(sig, canonical) \
+                        or sig in self._gx_lethal_sig:
+                    continue
+            safe.append(coords)
+        return safe
 
     def _novelty_policy(
         self, grid: Optional[Grid], latest_frame: FrameData
@@ -6034,7 +6218,8 @@ class MyAgent(Agent):
         return self._novelty_policy_impl(grid, latest_frame)
 
     def _novelty_policy_impl(
-        self, grid: Optional[Grid], latest_frame: FrameData
+        self, grid: Optional[Grid], latest_frame: FrameData, *,
+        graph_safe: bool = False,
     ) -> GameAction:
         key = self._masked_hash(grid)
         avail = set(latest_frame.available_actions or [])
@@ -6045,7 +6230,9 @@ class MyAgent(Agent):
             if avail and action.value not in avail:
                 continue
             if action.is_complex():
-                for x, y in self._click_targets(grid):
+                targets = (self._gx_fallback_targets(grid) if graph_safe
+                           else self._click_targets(grid))
+                for x, y in targets:
                     options.append((f"6:{x},{y}", action, (x, y)))
             else:
                 options.append((str(action.value), action, None))
@@ -6072,7 +6259,8 @@ class MyAgent(Agent):
         else:
             # all options tried in this state: revisit, but never spend a
             # click on a signature the library has proven dead
-            if grid is not None and any(o[2] is not None for o in options):
+            if not graph_safe and grid is not None \
+                    and any(o[2] is not None for o in options):
                 comps = components(grid)
                 live = [o for o in options if o[2] is None
                         or not self._click_dead(

@@ -8,21 +8,20 @@ Most entries start from random action search. Curio instead **learns a world
 model at play time** — figuring out what it controls, what each action does,
 where the walls are, and what the goal is — then plans toward it.
 
-## Results
+## Current evidence
 
-Measured locally against the public game set (the offline `arc-agi` engine,
-which mirrors the Kaggle scoring metric), 3 seeds, fixed action budget:
+The latest competition submission scored **0.18**. Source-hash and timestamp
+auditing tied that run to commit `29e278a`; it predates the current solver by
+seven capability commits. The current head has not yet received a leaderboard
+score.
 
-| Metric | Value |
-|---|---|
-| Public games with progress | 13 of 25 |
-| Games fully won | `ft09` — all 6 levels, **below the human action baseline** |
-| All-25 efficiency scorecard | 8.74 |
-| Held-out generalization (8 never-tuned games) | 0.087 (first non-zero) |
+The current source has independently verified complete local wins on four
+official campaigns: `cn04` (328 actions), `ft09` (124), `tr87` (242), and
+`sc25` (147). These checks prove those implementations against the official
+local environments; they do not predict hidden-game generalization.
 
 The scoring metric is `(baseline_actions / actions_taken)² × 100`, level-index
-weighted — so *fast* wins are worth far more than slow ones. `ft09` is solved
-exactly (via a GF(2) linear-algebra solver) rather than by search.
+weighted, so fast wins are worth much more than slow exploration.
 
 ## How it works
 
@@ -34,20 +33,22 @@ of cooperating capabilities, each added and verified independently:
   frame look novel.
 - **Control discovery** — rigid-group, multi-color avatar detection and
   movement-rule voting from frame diffs; soft-wall mapping; BFS route planning.
-- **Puzzle solvers** — a lattice/recolor model with an exact GF(2) solver
-  (constraint puzzles), attribute-state product-graph planning (lock-and-key
-  games), and a cursor/editor model with analogy-based goal inference.
+- **Puzzle solvers** — a lattice/recolor model with an exact GF(2) solver,
+  attribute-state product-graph planning, structural port assembly, typed
+  editor-rule synthesis, and visual spell-program execution.
 - **Memory & efficiency** — a persistent click-affordance library and
   first-discovery speed tuning, because the metric squares efficiency.
+- **Graph exploration** — a state graph with salience-ranked action frontiers,
+  learned transition edges, safe click-instance pruning, and reset-aware
+  backtracking for games that do not match a proved solver.
 
 ## Honest status
 
-This is a mid-field research project with one top-tier component (`ft09`) and a
-clearly measured gap: capabilities built by studying public games don't yet
-generalize to unseen ones (held-out score 0.087). The roadmap to a competitive
-score is in [`ROADMAP_0.6.md`](ROADMAP_0.6.md) — it centers on rebuilding the
-game-agnostic exploration core, the only component whose gains transfer to the
-hidden evaluation set, with an honest probability assessment.
+The 0.18 result is far below the goal. Public-game solvers are useful regression
+proofs, but the main research gap is still unseen-game generalization. Current
+work therefore combines narrowly gated exact solvers with an original generic
+online-learning and graph-planning core. No external solver notebook, model,
+dataset, or kernel is part of the Curio candidate.
 
 ## Layout
 
@@ -57,7 +58,7 @@ scripts/bench.sh      3-seed benchmark across a fixed game set
 scripts/bench_scorecard.py   per-level efficiency scoring (the Kaggle metric)
 scripts/             per-game probe/analysis tooling
 backups/             verified capability checkpoints (the agent's evolution)
-ROADMAP_0.6.md       engineering + research roadmap
+submissions/curio-graph-v16/ generated original Kaggle candidate
 ```
 
 ## Credit

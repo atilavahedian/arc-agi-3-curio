@@ -236,6 +236,7 @@ OV_CATALOG_CAP = 8      # maximum unambiguous SELECT-cycle inventory
 OV_ASSIGN_GOAL_CAP = 16  # bound coverage-DP width on a gated rich overlay
 OV_ASSIGN_STATE_CAP = 4096  # hard ceiling for reachable coverage masks
 OV_RECOLOR_STATE_CAP = 16384  # bounded (centre x current-colour) pad-route BFS
+OV_DEFORM_STATE_CAP = 65536  # bounded obstacle/shape product-graph BFS
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
@@ -1015,6 +1016,328 @@ def overlay_paint_pads(
     return tuple(sorted(pads, key=lambda item: (item[1][1], item[1][0], item[0])))
 
 
+def overlay_deform_obstacles(
+    grid: Grid, outline_color: int, anchor_colors: set[int],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+) -> tuple[tuple[frozenset[Cell], tuple[int, int, int, int]], ...]:
+    """Compact symmetric obstacle components that can reshape a piece.
+
+    Goal rings, goal/piece colours, framed paint pads, edge UI and the
+    dominant background are excluded first.  The remaining component must
+    be a dense, centrally symmetric 5..16 pixel interior object.  This is a
+    deliberately structural gate: neither a game id nor a particular colour
+    or coordinate participates in detection.
+    """
+    counts: Counter[int] = Counter()
+    for row in grid:
+        counts.update(row)
+    background = counts.most_common(1)[0][0]
+    excluded = set(anchor_colors) | {background, outline_color, 0}
+    pad_boxes = tuple(box for _fill, box in pads)
+    out: list[tuple[frozenset[Cell], tuple[int, int, int, int]]] = []
+    for color, cells in components(grid):
+        if color in excluded or not cells:
+            continue
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if not (5 <= width <= 16 and 5 <= height <= 16):
+            continue
+        if x0 < HUD_BAND or y0 < HUD_BAND \
+                or x1 >= GRID - HUD_BAND or y1 >= GRID - HUD_BAND:
+            continue
+        if len(cells) * 3 < width * height:
+            continue
+        if any(x0 >= px0 and y0 >= py0 and x1 <= px1 and y1 <= py1
+               for px0, py0, px1, py1 in pad_boxes):
+            continue
+        reflected = {
+            (x0 + x1 - x, y0 + y1 - y) for x, y in cells
+        }
+        if reflected != set(cells):
+            continue
+        out.append((cells, (x0, y0, x1, y1)))
+    return tuple(sorted(out, key=lambda item: item[1]))
+
+
+def _overlay_deform_cells(
+    state: tuple[str, int, int, int, int, int, int, bool],
+) -> frozenset[Cell]:
+    """Absolute arm cells for one compressed deformable-piece state."""
+    kind, x, y, width, height, bar_x, bar_y, _changed = state
+    if kind == "frame":
+        return frozenset(
+            (x + dx, y + dy)
+            for dy in range(height) for dx in range(width)
+            if dx in (0, width - 1) or dy in (0, height - 1)
+        )
+    hole = (width // 2, height // 2)
+    return frozenset(
+        (x + dx, y + dy)
+        for dy in range(height) for dx in range(width)
+        if (dx == bar_x or dy == bar_y) and (dx, dy) != hole
+    )
+
+
+def _overlay_deform_start(
+    center: Cell, rel_mask: frozenset[Cell],
+) -> Optional[tuple[str, int, int, int, int, int, int, bool]]:
+    """Parse an exact hollow frame or row/column cross selected shape."""
+    if not rel_mask:
+        return None
+    absolute = {(center[0] + dx, center[1] + dy) for dx, dy in rel_mask}
+    x0 = min(x for x, _y in absolute)
+    x1 = max(x for x, _y in absolute)
+    y0 = min(y for _x, y in absolute)
+    y1 = max(y for _x, y in absolute)
+    width, height = x1 - x0 + 1, y1 - y0 + 1
+    hole = (center[0] - x0, center[1] - y0)
+    if hole != (width // 2, height // 2) or min(width, height) < 5:
+        return None
+    local = {(x - x0, y - y0) for x, y in absolute}
+    perimeter = {
+        (x, y) for y in range(height) for x in range(width)
+        if x in (0, width - 1) or y in (0, height - 1)
+    }
+    if local == perimeter:
+        return ("frame", x0, y0, width, height, 0, 0, False)
+    opaque = local | {hole}
+    full_columns = [
+        x for x in range(width)
+        if all((x, y) in opaque for y in range(height))
+    ]
+    full_rows = [
+        y for y in range(height)
+        if all((x, y) in opaque for x in range(width))
+    ]
+    if len(full_columns) != 1 or len(full_rows) != 1:
+        return None
+    bar_x, bar_y = full_columns[0], full_rows[0]
+    cross = {
+        (x, y) for y in range(height) for x in range(width)
+        if (x == bar_x or y == bar_y) and (x, y) != hole
+    }
+    if local != cross:
+        return None
+    return ("cross", x0, y0, width, height,
+            bar_x, bar_y, False)
+
+
+def _overlay_deform_step(
+    state: tuple[str, int, int, int, int, int, int, bool],
+    delta: Cell,
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+    step: int,
+) -> tuple[str, int, int, int, int, int, int, bool]:
+    """Simulate one learned axis move in the obstacle/shape model."""
+    kind, x, y, width, height, bar_x, bar_y, changed = state
+    dx, dy = delta
+    nx, ny = x + dx, y + dy
+    hole = (nx + width // 2, ny + height // 2)
+    if not (0 <= hole[0] < GRID and 0 <= hole[1] < GRID):
+        return state
+    moved = (kind, nx, ny, width, height, bar_x, bar_y, changed)
+    opaque = set(_overlay_deform_cells(moved)) | {hole}
+    hit = next((obstacle for obstacle in obstacles
+                if opaque & obstacle[0]), None)
+    if hit is None:
+        return moved
+    _occupied, (ox0, oy0, ox1, oy1) = hit
+
+    if kind == "frame":
+        if dx:
+            if width <= 2 * step:
+                return state
+            new_width, new_height = width - step, height + step
+            nx = x if dx < 0 else nx
+            ny += height // 2 - new_height // 2
+            ny = round(ny / step) * step
+        else:
+            if height <= 2 * step:
+                return state
+            new_width, new_height = width + step, height - step
+            ny = y if dy < 0 else ny
+            nx += width // 2 - new_width // 2
+            nx = round(nx / step) * step
+        nhole = (nx + new_width // 2, ny + new_height // 2)
+        if not (0 <= nhole[0] < GRID and 0 <= nhole[1] < GRID):
+            return state
+        return (kind, nx, ny, new_width, new_height,
+                0, 0, True)
+
+    vertical_in = ox0 <= nx + bar_x <= ox1
+    horizontal_in = oy0 <= ny + bar_y <= oy1
+    if vertical_in and horizontal_in:
+        return state
+    if dx:
+        sign = 1 if dx > 0 else -1
+        if vertical_in:
+            new_bar = bar_x - sign * step
+            if 0 <= new_bar < width:
+                return (kind, nx, ny, width, height,
+                        new_bar, bar_y, True)
+            return state
+        if horizontal_in:
+            new_bar = bar_x + sign * step
+            if 0 <= new_bar < width:
+                return (kind, x, y, width, height,
+                        new_bar, bar_y, True)
+            return state
+        return state
+    sign = 1 if dy > 0 else -1
+    if horizontal_in:
+        new_bar = bar_y - sign * step
+        if 0 <= new_bar < height:
+            return (kind, nx, ny, width, height,
+                    bar_x, new_bar, True)
+        return state
+    if vertical_in:
+        new_bar = bar_y + sign * step
+        if 0 <= new_bar < height:
+            return (kind, x, y, width, height,
+                    bar_x, new_bar, True)
+    return state
+
+
+def overlay_deform_options(
+    origin: Cell, rel_mask: frozenset[Cell], color: int,
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+    goal_bit: dict[tuple[int, Cell], int],
+) -> list[
+    tuple[int, int, int, Cell, frozenset[Cell], tuple[int, ...], bool]
+]:
+    """Cheapest obstacle route for each anchor mask/deformation flag."""
+    start = _overlay_deform_start(origin, rel_mask)
+    if start is None or not deltas or not obstacles:
+        return []
+    magnitudes = {abs(dx) + abs(dy) for dx, dy in deltas.values()}
+    if len(magnitudes) != 1:
+        return []
+    step = next(iter(magnitudes))
+    queue = deque([start])
+    parent: dict[tuple, Optional[tuple]] = {start: None}
+    via: dict[tuple, int] = {}
+    distance = {start: 0}
+    best: dict[
+        tuple[int, bool],
+        tuple[tuple, Cell, frozenset[Cell], tuple[int, ...]]
+    ] = {}
+
+    def route(state: tuple) -> tuple[int, ...]:
+        actions: list[int] = []
+        cur = state
+        while parent[cur] is not None:
+            actions.append(via[cur])
+            cur = parent[cur]
+        actions.reverse()
+        return tuple(actions)
+
+    same = anchors.get(color, tuple())
+    while queue:
+        state = queue.popleft()
+        cells = _overlay_deform_cells(state)
+        hits = frozenset(cell for cell in same if cell in cells)
+        if hits:
+            mask = 0
+            for cell in hits:
+                mask |= goal_bit[(color, cell)]
+            actions = route(state)
+            _kind, x, y, width, height, _a, _b, used = state
+            target = (x + width // 2, y + height // 2)
+            rank = (distance[state], target[1], target[0], actions)
+            key = (mask, used)
+            old = best.get(key)
+            if old is None or rank < old[0]:
+                best[key] = (rank, target, hits, actions)
+        for action, delta in sorted(deltas.items()):
+            nxt = _overlay_deform_step(state, delta, obstacles, step)
+            if nxt == state or nxt in parent:
+                continue
+            if len(parent) >= OV_DEFORM_STATE_CAP:
+                return []
+            parent[nxt] = state
+            via[nxt] = action
+            distance[nxt] = distance[state] + 1
+            queue.append(nxt)
+    return [
+        (mask, item[0][0], color, item[1], item[2], item[3], used)
+        for (mask, used), item in sorted(best.items())
+    ]
+
+
+def assign_overlay_deform_pieces(
+    pieces: list[tuple[Cell, int, frozenset[Cell]]],
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+) -> Optional[list[
+    tuple[
+        int, frozenset[Cell], Cell, int, Cell, frozenset[Cell],
+        tuple[int, ...],
+    ]
+]]:
+    """Joint assignment over obstacle-driven cross/frame transformations."""
+    if not (1 <= len(pieces) <= OV_CATALOG_CAP) or not anchors \
+            or not obstacles:
+        return None
+    goals = sorted(
+        (color, cell) for color, cells in anchors.items() for cell in cells
+    )
+    if not goals or len(goals) > OV_ASSIGN_GOAL_CAP:
+        return None
+    goal_bit = {goal: 1 << index for index, goal in enumerate(goals)}
+    full_mask = (1 << len(goals)) - 1
+    rows = [
+        overlay_deform_options(
+            origin, rel_mask, color, anchors, deltas, obstacles, goal_bit
+        ) for origin, color, rel_mask in pieces
+    ]
+    if any(not row for row in rows):
+        return None
+
+    # (covered, used-deformation) -> ranked ordered placements
+    dp: dict[tuple[int, bool], tuple[int, int, int, tuple, tuple]] = {
+        (0, False): (0, 0, 0, tuple(), tuple())
+    }
+    for (origin, source, rel_mask), options in zip(pieces, rows):
+        nxt: dict[tuple[int, bool], tuple[int, int, int, tuple, tuple]] = {}
+        for (covered, used_before), state in dp.items():
+            total, overlap, max_moves, ties, placements = state
+            for mask, moves, goal_color, target, hits, actions, used in options:
+                merged = covered | mask
+                redundant = mask.bit_count() - (mask & ~covered).bit_count()
+                disp = (target[1] - origin[1], target[0] - origin[0])
+                tie = (goal_color, disp, actions)
+                placement = (
+                    source, rel_mask, origin, goal_color, target, hits, actions
+                )
+                candidate = (
+                    total + moves,
+                    overlap + redundant,
+                    max(max_moves, moves),
+                    ties + (tie,),
+                    placements + (placement,),
+                )
+                key = (merged, used_before or used)
+                old = nxt.get(key)
+                if old is None or candidate[:4] < old[:4]:
+                    if old is None and len(nxt) >= OV_ASSIGN_STATE_CAP:
+                        return None
+                    nxt[key] = candidate
+        dp = nxt
+        if not dp:
+            return None
+    solved = dp.get((full_mask, True))
+    return list(solved[4]) if solved is not None else None
+
+
 def overlay_shape_targets(
     rel_mask: frozenset[Cell], anchors: dict[int, tuple[Cell, ...]],
     origin: Cell, step: int,
@@ -1531,7 +1854,11 @@ class MyAgent(Agent):
         self._ov_pads: tuple[
             tuple[int, tuple[int, int, int, int]], ...
         ] = tuple()
+        self._ov_obstacles: tuple[
+            tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+        ] = tuple()
         self._ov_expected_arm: Optional[int] = None
+        self._ov_deform_route = False
         # Same-colour multi-piece overlays are catalogued by one full SELECT
         # cycle, then executed in that observed ordinal order.
         self._ov_catalog: list[
@@ -1795,6 +2122,7 @@ class MyAgent(Agent):
             self._ov_plan.clear()
             self._ov_target = None
             self._ov_expected_arm = None
+            self._ov_deform_route = False
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_catalog_recolor = False
@@ -1957,10 +2285,12 @@ class MyAgent(Agent):
             self._ov_cached_outline = None
             self._ov_cached_anchors.clear()
             self._ov_pads = tuple()
+            self._ov_obstacles = tuple()
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
             self._ov_expected_arm = None
+            self._ov_deform_route = False
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_catalog_recolor = False
@@ -3522,6 +3852,9 @@ class MyAgent(Agent):
             color: tuple(cells) for color, cells in anchors.items()
         }
         self._ov_pads = overlay_paint_pads(grid)
+        self._ov_obstacles = overlay_deform_obstacles(
+            grid, outline, set(self._ov_cached_anchors), self._ov_pads
+        )
         return outline, self._ov_cached_anchors
 
     def _ov_selected(
@@ -3615,10 +3948,12 @@ class MyAgent(Agent):
             self._ov_cached_outline = None
             self._ov_cached_anchors.clear()
             self._ov_pads = tuple()
+            self._ov_obstacles = tuple()
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
             self._ov_expected_arm = None
+            self._ov_deform_route = False
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_catalog_recolor = False
@@ -3669,6 +4004,7 @@ class MyAgent(Agent):
                         if goal_color != self._ov_expected_arm:
                             self._ov_recolor_assignment.clear()
                             self._ov_recolor_required = frozenset()
+                            self._ov_deform_route = False
                             self._ov_benched = level
                             return None
                         self._ov_assigned_anchors.update(
@@ -3678,6 +4014,7 @@ class MyAgent(Agent):
                             if not self._ov_recolor_required \
                                     <= self._ov_assigned_anchors:
                                 self._ov_recolor_required = frozenset()
+                                self._ov_deform_route = False
                                 self._ov_benched = level
                                 return None
                             self._ov_solved.update(
@@ -3685,6 +4022,7 @@ class MyAgent(Agent):
                                 in self._ov_recolor_required
                             )
                             self._ov_recolor_required = frozenset()
+                            self._ov_deform_route = False
                     else:
                         self._ov_solved.add(self._ov_expected_arm)
                     self._ov_expected_arm = None
@@ -3791,6 +4129,7 @@ class MyAgent(Agent):
                         catalog, pending, axis, self._ov_pads
                     ) if len(catalog) >= 2 else None
                     if assignment is not None:
+                        self._ov_deform_route = False
                         self._ov_recolor_assignment = deque(assignment)
                         self._ov_recolor_required = frozenset(
                             (color, cell) for color, cells in pending.items()
@@ -3805,8 +4144,22 @@ class MyAgent(Agent):
                         catalog, anchors, step
                     ) if len(catalog) >= 2 else None
                     if assignment is not None:
+                        self._ov_deform_route = False
                         self._ov_assignment = deque(assignment)
                         self._ov_assigned_anchors.clear()
+                    elif self._ov_obstacles:
+                        assignment = assign_overlay_deform_pieces(
+                            catalog, anchors, axis, self._ov_obstacles
+                        )
+                        if assignment is not None:
+                            self._ov_deform_route = True
+                            self._ov_recolor_assignment = deque(assignment)
+                            self._ov_recolor_required = frozenset(
+                                (color, cell)
+                                for color, cells in anchors.items()
+                                for cell in cells
+                            )
+                            self._ov_assigned_anchors.clear()
                 if assignment is None and (not recolor_mode or len(catalog) >= 2):
                     self._ov_benched = level
                     return None
@@ -3825,7 +4178,8 @@ class MyAgent(Agent):
         # means the piece bounced a wall (re86 clamps at the camera edge) —
         # strike and re-plan
         if self._ov_plan and self._ov_last_center is not None \
-                and center == self._ov_last_center:
+                and center == self._ov_last_center \
+                and not self._ov_deform_route:
             self._ov_plan.clear()
             self._ov_target = None
             self._ov_expected_arm = None
@@ -3833,6 +4187,7 @@ class MyAgent(Agent):
             if self._ov_recolor_assignment:
                 self._ov_recolor_assignment.clear()
                 self._ov_recolor_required = frozenset()
+                self._ov_deform_route = False
                 self._ov_benched = level
                 return None
             if self._ov_strikes >= OV_STRIKES:
@@ -3880,6 +4235,7 @@ class MyAgent(Agent):
                 if arm != goal_color or expected_arm != goal_color:
                     self._ov_recolor_assignment.clear()
                     self._ov_recolor_required = frozenset()
+                    self._ov_deform_route = False
                     self._ov_benched = level
                     return None
                 self._ov_assigned_anchors.update(
@@ -3889,12 +4245,14 @@ class MyAgent(Agent):
                     if not self._ov_recolor_required \
                             <= self._ov_assigned_anchors:
                         self._ov_recolor_required = frozenset()
+                        self._ov_deform_route = False
                         self._ov_benched = level
                         return None
                     self._ov_solved.update(
                         color for color, _cell in self._ov_recolor_required
                     )
                     self._ov_recolor_required = frozenset()
+                    self._ov_deform_route = False
                 self._ov_last_center = None
                 return self._step(GameAction.from_id(select))
             if self._ov_expected_arm is not None:
@@ -3977,12 +4335,14 @@ class MyAgent(Agent):
             if center != origin or arm != source or not visible_match:
                 self._ov_recolor_assignment.clear()
                 self._ov_recolor_required = frozenset()
+                self._ov_deform_route = False
                 self._ov_benched = level
                 return None
             if not actions:
                 if center != tgt or arm != goal_color:
                     self._ov_recolor_assignment.clear()
                     self._ov_recolor_required = frozenset()
+                    self._ov_deform_route = False
                     self._ov_benched = level
                     return None
                 self._ov_recolor_assignment.popleft()
@@ -3993,12 +4353,14 @@ class MyAgent(Agent):
                     if not self._ov_recolor_required \
                             <= self._ov_assigned_anchors:
                         self._ov_recolor_required = frozenset()
+                        self._ov_deform_route = False
                         self._ov_benched = level
                         return None
                     self._ov_solved.update(
                         color for color, _cell in self._ov_recolor_required
                     )
                     self._ov_recolor_required = frozenset()
+                    self._ov_deform_route = False
                 self._ov_last_center = None
                 return self._step(GameAction.from_id(select))
             self._ov_target = tgt

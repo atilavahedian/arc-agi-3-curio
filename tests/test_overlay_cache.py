@@ -146,6 +146,9 @@ class OverlayGoalCacheTests(unittest.TestCase):
             )
         agent._ov_cached_outline = 3
         agent._ov_cached_anchors = {9: ((12, 12),)}
+        obstacle = self._deform_obstacle()
+        agent._ov_obstacles = (obstacle,)
+        agent._ov_deform_route = True
         frame = FrameData(
             frame=[self._overlay_grid()],
             state=GameState.GAME_OVER,
@@ -158,6 +161,8 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertIs(action, GameAction.RESET)
         self.assertEqual(agent._ov_cached_outline, 3)
         self.assertEqual(agent._ov_cached_anchors, {9: ((12, 12),)})
+        self.assertEqual(agent._ov_obstacles, (obstacle,))
+        self.assertFalse(agent._ov_deform_route)
 
     def test_level_up_clears_snapshot(self) -> None:
         with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
@@ -171,6 +176,8 @@ class OverlayGoalCacheTests(unittest.TestCase):
             )
         agent._ov_cached_outline = 3
         agent._ov_cached_anchors = {9: ((12, 12),)}
+        agent._ov_obstacles = (self._deform_obstacle(),)
+        agent._ov_deform_route = True
         agent._ov_catalog_recolor = True
         agent._ov_recolor_cataloged = True
         agent._ov_recolor_required = frozenset({(9, (12, 12))})
@@ -191,6 +198,8 @@ class OverlayGoalCacheTests(unittest.TestCase):
 
         self.assertIsNone(agent._ov_cached_outline)
         self.assertEqual(agent._ov_cached_anchors, {})
+        self.assertEqual(agent._ov_obstacles, tuple())
+        self.assertFalse(agent._ov_deform_route)
         self.assertFalse(agent._ov_catalog_recolor)
         self.assertFalse(agent._ov_recolor_cataloged)
         self.assertEqual(len(agent._ov_recolor_assignment), 0)
@@ -397,6 +406,109 @@ class OverlayGoalCacheTests(unittest.TestCase):
             (10, (4, 4, 9, 9)),
             (12, (28, 4, 33, 9)),
             (14, (52, 52, 57, 57)),
+        ))
+
+    @staticmethod
+    def _deform_obstacle() -> tuple[
+        frozenset[tuple[int, int]], tuple[int, int, int, int]
+    ]:
+        rows = (
+            range(8), (0, 1, 2, 5, 6, 7), (0, 1, 6, 7), (0, 7),
+            (0, 7), (0, 1, 6, 7), (0, 1, 2, 5, 6, 7), range(8),
+        )
+        cells = frozenset(
+            (28 + x, 28 + y) for y, xs in enumerate(rows) for x in xs
+        )
+        return cells, (28, 28, 35, 35)
+
+    def test_deform_obstacle_reader_is_structural(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "overlay_deform_obstacles"
+        ]
+        grid = self._overlay_grid()
+        obstacle = self._deform_obstacle()
+        for x, y in obstacle[0]:
+            grid[y][x] = 1
+        # A dense edge component is HUD-like and must not join the tool set.
+        for y in range(8):
+            for x in range(8):
+                grid[y][x] = 2
+
+        found = func(grid, 3, {9, 11}, tuple())
+
+        self.assertEqual(found, (obstacle,))
+
+    def test_joint_deformation_finds_cross_and_frame_routes(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_deform_pieces"
+        ]
+        cross = frozenset(
+            (dx, dy) for dy in range(-12, 13) for dx in range(-12, 13)
+            if (dx == 0 or dy == 0) and (dx, dy) != (0, 0)
+        )
+        frame = frozenset(
+            (dx, dy) for dy in range(-9, 10) for dx in range(-9, 10)
+            if abs(dx) == 9 or abs(dy) == 9
+        )
+        pieces = [((15, 48), 11, frame), ((48, 15), 9, cross)]
+        anchors = {
+            9: ((12, 6), (9, 9), (30, 9), (12, 27)),
+            11: ((45, 30), (54, 30), (45, 57), (54, 57)),
+        }
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+        obstacles = (self._deform_obstacle(),)
+        frame_route = (
+            1, 1, 4, 4, 2, 4, 2, 4, 4, 4,
+            4, 4, 4, 4, 1, 3, 4, 4, 4,
+        )
+        cross_route = (
+            2, 2, 2, 2, 2, 3, 3, 1, 3, 2, 2, 1, 1,
+            1, 1, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        )
+
+        first = func(pieces, anchors, deltas, obstacles)
+        second = func(
+            pieces,
+            {color: tuple(reversed(cells))
+             for color, cells in reversed(tuple(anchors.items()))},
+            deltas,
+            tuple(reversed(obstacles)),
+        )
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual([item[6] for item in first],
+                         [frame_route, cross_route])
+        self.assertEqual([item[4] for item in first],
+                         [(50, 44), (18, 15)])
+        self.assertEqual(sum(len(item[6]) for item in first), 45)
+        covered = {
+            (item[3], cell) for item in first for cell in item[5]
+        }
+        required = {
+            (color, cell) for color, cells in anchors.items() for cell in cells
+        }
+        self.assertEqual(covered, required)
+
+    def test_deformation_rejects_arbitrary_shapes_and_partial_goals(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_deform_pieces"
+        ]
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+        obstacles = (self._deform_obstacle(),)
+        arbitrary = frozenset({(-2, 0), (-1, 0), (1, 0), (2, 1)})
+
+        self.assertIsNone(func(
+            [((15, 15), 9, arbitrary)], {9: ((20, 20),)},
+            deltas, obstacles,
+        ))
+        frame = frozenset(
+            (dx, dy) for dy in range(-3, 4) for dx in range(-3, 4)
+            if abs(dx) == 3 or abs(dy) == 3
+        )
+        self.assertIsNone(func(
+            [((15, 15), 9, frame)], {8: ((63, 63),)},
+            deltas, obstacles,
         ))
 
     def test_recolor_route_uses_geometry_and_avoids_late_overwrite(self) -> None:
@@ -622,6 +734,48 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertIs(action, GameAction.ACTION4)
         self.assertEqual(list(agent._ov_plan), [GameAction.ACTION3.value])
         self.assertEqual(len(agent._ov_recolor_assignment), 1)
+        self.assertIsNone(agent._ov_benched)
+
+    def test_deformation_can_change_shape_without_moving_hole(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        for action, delta in {
+            1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)
+        }.items():
+            agent._ov_deltas[action][delta] = 3
+        mask = frozenset({(-1, 0), (1, 0)})
+        agent._ov_level = 0
+        agent._ov_select = GameAction.ACTION5.value
+        agent._ov_target = (43, 40)
+        agent._ov_expected_arm = 13
+        agent._ov_plan = deque([GameAction.ACTION4.value])
+        agent._ov_last_center = (40, 40)
+        agent._ov_deform_route = True
+        agent._ov_recolor_assignment = deque([
+            (13, mask, (40, 40), 13, (43, 40),
+             frozenset({(12, 12)}), (GameAction.ACTION4.value,)),
+        ])
+        agent._ov_recolor_required = frozenset({(13, (12, 12))})
+        frame = FrameData(
+            frame=[self._overlay_grid()],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(self._overlay_grid(), frame)
+
+        self.assertIs(action, GameAction.ACTION4)
+        self.assertEqual(list(agent._ov_plan), [])
+        self.assertEqual(len(agent._ov_recolor_assignment), 1)
+        self.assertTrue(agent._ov_deform_route)
         self.assertIsNone(agent._ov_benched)
 
     def test_hidden_hole_during_select_cycle_keeps_ordinal(self) -> None:

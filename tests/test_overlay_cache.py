@@ -433,6 +433,37 @@ class OverlayGoalCacheTests(unittest.TestCase):
             (14, (52, 52, 57, 57)),
         ))
 
+    def test_paint_pad_reader_recovers_corroborated_edge_crop(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["overlay_paint_pads"]
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        # Complete 5x5 template establishes this board's pad vocabulary.
+        for y in range(10, 15):
+            for x in range(20, 25):
+                grid[y][x] = 2 if x in (20, 24) \
+                    or y in (10, 14) else 11
+        # Only the right two columns of a second exact pad are on-screen.
+        for y in range(28, 33):
+            for x in range(-3, 2):
+                if 0 <= x < 64:
+                    grid[y][x] = 2 if x in (-3, 1) \
+                        or y in (28, 32) else 10
+
+        self.assertEqual(func(grid), (
+            (11, (20, 10, 24, 14)),
+            (10, (-3, 28, 1, 32)),
+        ))
+
+    def test_paint_pad_reader_rejects_uncorroborated_edge_crop(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["overlay_paint_pads"]
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        for y in range(28, 33):
+            for x in range(-3, 2):
+                if 0 <= x < 64:
+                    grid[y][x] = 2 if x in (-3, 1) \
+                        or y in (28, 32) else 10
+
+        self.assertEqual(func(grid), tuple())
+
     @staticmethod
     def _deform_obstacle() -> tuple[
         frozenset[tuple[int, int]], tuple[int, int, int, int]
@@ -446,6 +477,17 @@ class OverlayGoalCacheTests(unittest.TestCase):
         )
         return cells, (28, 28, 35, 35)
 
+    @staticmethod
+    def _compact_obstacle(x0: int, y0: int) -> tuple[
+        frozenset[tuple[int, int]], tuple[int, int, int, int]
+    ]:
+        rows = (range(5), (0, 1, 3, 4), (0, 4),
+                (0, 1, 3, 4), range(5))
+        cells = frozenset(
+            (x0 + x, y0 + y) for y, xs in enumerate(rows) for x in xs
+        )
+        return cells, (x0, y0, x0 + 4, y0 + 4)
+
     def test_deform_obstacle_reader_is_structural(self) -> None:
         func = self.agent_class._ov_selected.__globals__[
             "overlay_deform_obstacles"
@@ -454,14 +496,21 @@ class OverlayGoalCacheTests(unittest.TestCase):
         obstacle = self._deform_obstacle()
         for x, y in obstacle[0]:
             grid[y][x] = 1
+        edge_tool = self._compact_obstacle(58, 1)
+        for x, y in edge_tool[0]:
+            grid[y][x] = 1
         # A dense edge component is HUD-like and must not join the tool set.
         for y in range(8):
             for x in range(8):
                 grid[y][x] = 2
 
         found = func(grid, 3, {9, 11}, tuple())
+        rich_found = func(
+            grid, 3, {9, 11}, tuple(), allow_edge_hud=True
+        )
 
         self.assertEqual(found, (obstacle,))
+        self.assertEqual(rich_found, (obstacle, edge_tool))
 
     def test_joint_deformation_finds_cross_and_frame_routes(self) -> None:
         func = self.agent_class._ov_selected.__globals__[
@@ -535,6 +584,162 @@ class OverlayGoalCacheTests(unittest.TestCase):
             [((15, 15), 9, frame)], {8: ((63, 63),)},
             deltas, obstacles,
         ))
+
+    def test_transform_step_orders_obstacle_before_paint(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "_overlay_transform_step"
+        ]
+        shape = ("frame", 15, 21, 13, 13, 0, 0, False)
+        state = (shape, 12)
+        obstacle = self._deform_obstacle()
+        paint = ((9, (18, 18, 22, 22)),)
+
+        transformed = func(state, (3, 0), (obstacle,), paint, 3)
+        recolored = func(state, (3, 0), tuple(), paint, 3)
+        ambiguous = func(
+            state, (3, 0), tuple(),
+            paint + ((11, (26, 21, 30, 25)),), 3,
+        )
+
+        self.assertIsNotNone(transformed)
+        self.assertEqual(transformed[1], 12)
+        self.assertNotEqual(transformed[0][2:5], shape[2:5])
+        self.assertIsNotNone(recolored)
+        self.assertEqual(recolored[1], 9)
+        self.assertIsNone(ambiguous)
+
+    def test_cross_transform_can_paint_in_the_same_action(self) -> None:
+        funcs = self.agent_class._ov_selected.__globals__
+        step_func = funcs["_overlay_transform_step"]
+        deform_func = funcs["_overlay_deform_step"]
+        shape = ("cross", 15, 22, 13, 13, 6, 6, False)
+        state = (shape, 12)
+        obstacle = self._deform_obstacle()
+        paint = ((9, (18, 26, 22, 30)),)
+
+        transformed = step_func(state, (3, 0), (obstacle,), paint, 3)
+        two_tools = deform_func(
+            shape, (3, 0),
+            (obstacle, (frozenset({(20, 28)}), (18, 26, 22, 30))),
+            3,
+        )
+
+        self.assertIsNotNone(transformed)
+        self.assertEqual(transformed[1], 9)
+        self.assertEqual(transformed[0][5], 9)
+        # Both cross tools are processed without applying the move twice.
+        self.assertEqual((two_tools[1], two_tools[5]), (12, 12))
+
+    def test_transform_geometry_ignores_plain_translation(self) -> None:
+        geometry = self.agent_class._ov_selected.__globals__[
+            "_overlay_intrinsic_geometry"
+        ]
+        start = ("frame", 15, 21, 13, 13, 0, 0, False)
+        moved = ("frame", 18, 21, 13, 13, 0, 0, False)
+        transformed = ("frame", 18, 18, 10, 16, 0, 0, False)
+
+        self.assertEqual(geometry(start), geometry(moved))
+        self.assertNotEqual(geometry(start), geometry(transformed))
+
+    def test_joint_transform_solves_level7_geometry(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_transform_pieces"
+        ]
+        cross10 = frozenset(
+            (dx, dy) for dy in range(-9, 10) for dx in range(-9, 10)
+            if (dx == 0 or dy == 0) and (dx, dy) != (0, 0)
+        )
+        frame12 = frozenset(
+            (dx, dy) for dy in range(-6, 7) for dx in range(-6, 7)
+            if abs(dx) == 6 or abs(dy) == 6
+        )
+        cross7 = frozenset(
+            (dx, dy) for dy in range(-9, 10) for dx in range(-18, 19)
+            if (dx == 0 or dy == 0) and (dx, dy) != (0, 0)
+        )
+        pieces = [
+            ((12, 48), 10, cross10),
+            ((21, 51), 12, frame12),
+            ((24, 54), 7, cross7),
+        ]
+        anchors = {
+            8: ((9, 9), (3, 15), (36, 15), (9, 27)),
+            9: ((57, 18), (39, 24)),
+            11: ((45, 30), (39, 48), (51, 48)),
+        }
+        pads = (
+            (9, (15, 2, 19, 6)), (11, (25, 2, 29, 6)),
+            (8, (35, 2, 39, 6)), (14, (45, 2, 49, 6)),
+            (6, (55, 2, 59, 6)),
+        )
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+
+        assignment = func(
+            pieces, anchors, deltas, (self._deform_obstacle(),), pads
+        )
+
+        self.assertIsNotNone(assignment)
+        self.assertEqual(
+            [(item[0], item[3], item[4], len(item[6]))
+             for item in assignment],
+            [(10, 11, (45, 39), 32),
+             (12, 9, (48, 21), 29),
+             (7, 8, (21, 18), 38)],
+        )
+        self.assertEqual(sum(len(item[6]) for item in assignment), 99)
+        covered = {
+            (item[3], cell) for item in assignment for cell in item[5]
+        }
+        required = {
+            (color, cell) for color, cells in anchors.items() for cell in cells
+        }
+        self.assertEqual(covered, required)
+
+    def test_joint_transform_solves_level8_geometry(self) -> None:
+        func = self.agent_class._ov_selected.__globals__[
+            "assign_overlay_transform_pieces"
+        ]
+        frame = frozenset(
+            (dx, dy) for dy in range(-6, 7) for dx in range(-6, 7)
+            if abs(dx) == 6 or abs(dy) == 6
+        )
+        pieces = [((51, 48), 12, frame), ((54, 45), 10, frame)]
+        anchors = {
+            11: ((9, 39), (15, 39), (9, 57), (15, 57)),
+            6: ((6, 45), (21, 45), (6, 54), (21, 54)),
+        }
+        pads = (
+            (8, (28, 1, 32, 5)), (11, (5, 5, 9, 9)),
+            (9, (28, 8, 32, 12)), (6, (5, 20, 9, 24)),
+            (12, (28, 21, 32, 25)), (8, (4, 28, 8, 32)),
+            (10, (-3, 28, 1, 32)),
+            (14, (11, 28, 15, 32)), (12, (18, 28, 22, 32)),
+            (9, (25, 28, 29, 32)), (14, (32, 28, 36, 32)),
+            (8, (39, 28, 43, 32)), (10, (50, 28, 54, 32)),
+            (14, (57, 28, 61, 32)),
+        )
+        obstacles = (
+            self._compact_obstacle(34, 55),
+            self._compact_obstacle(58, 1),
+        )
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+
+        assignment = func(pieces, anchors, deltas, obstacles, pads)
+
+        self.assertIsNotNone(assignment)
+        self.assertEqual(
+            [(item[0], item[3], item[4], len(item[6]))
+             for item in assignment],
+            [(12, 11, (12, 48), 87), (10, 6, (14, 50), 80)],
+        )
+        self.assertEqual(sum(len(item[6]) for item in assignment), 167)
+        covered = {
+            (item[3], cell) for item in assignment for cell in item[5]
+        }
+        required = {
+            (color, cell) for color, cells in anchors.items() for cell in cells
+        }
+        self.assertEqual(covered, required)
 
     def test_recolor_route_uses_geometry_and_avoids_late_overwrite(self) -> None:
         funcs = self.agent_class._ov_selected.__globals__
@@ -922,6 +1127,47 @@ class OverlayGoalCacheTests(unittest.TestCase):
         )
         self.assertNotIn(9, agent._ov_solved)
         self.assertEqual(len(agent._ov_recolor_required), 4)
+
+    def test_hidden_combined_route_rejects_uncovered_hits(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        mask = frozenset({(-1, 0), (1, 0), (0, -1), (0, 1)})
+        hits = frozenset({(10, 10), (20, 10)})
+        agent._ov_level = 0
+        agent._ov_cached_outline = 4
+        agent._ov_cached_anchors = {
+            9: ((10, 10), (20, 10), (10, 20), (20, 20))
+        }
+        agent._ov_select = GameAction.ACTION5.value
+        agent._ov_target = (15, 10)
+        agent._ov_expected_arm = 9
+        agent._ov_deform_route = True
+        agent._ov_recolor_required = frozenset((9, cell) for cell in hits)
+        agent._ov_recolor_assignment = deque([
+            (11, mask, (15, 30), 9, (15, 10), hits, (1,)),
+        ])
+        # No selection hole and neither planned anchor is visibly covered.
+        grid = [[8 for _x in range(64)] for _y in range(64)]
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(grid, frame)
+
+        self.assertIsNone(action)
+        self.assertEqual(agent._ov_benched, 0)
+        self.assertEqual(len(agent._ov_recolor_assignment), 0)
+        self.assertFalse(agent._ov_deform_route)
 
 
 if __name__ == "__main__":

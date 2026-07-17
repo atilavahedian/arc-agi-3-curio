@@ -237,6 +237,7 @@ OV_ASSIGN_GOAL_CAP = 16  # bound coverage-DP width on a gated rich overlay
 OV_ASSIGN_STATE_CAP = 4096  # hard ceiling for reachable coverage masks
 OV_RECOLOR_STATE_CAP = 16384  # bounded (centre x current-colour) pad-route BFS
 OV_DEFORM_STATE_CAP = 65536  # bounded obstacle/shape product-graph BFS
+OV_TRANSFORM_STATE_CAP = 100000  # joint shape x position x colour BFS
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
@@ -981,22 +982,97 @@ def clipped_symmetric_piece_mask(
     return frozenset(rel)
 
 
+def overlay_transform_piece_mask(
+    grid: Grid, center: Cell, arm_color: int,
+) -> Optional[frozenset[Cell]]:
+    """Recover an initial frame/cross whose body is partly occluded.
+
+    Transform levels begin with centred odd-sized frames or crosses, but their
+    sprite order can let another piece punch a few pixels out of the selected
+    body's rendering.  Enumerate only the two exact transform primitives and
+    require at least 85% of the predicted body to be visibly the selected
+    colour; every remaining pixel must be explained by non-background content
+    or the narrow edge HUD.  The largest valid primitive wins, preventing a
+    long cross from shrinking to an arbitrary fully-visible sub-arm.
+    """
+    cx, cy = center
+    counts: Counter[int] = Counter()
+    for row in grid:
+        counts.update(row)
+    background = counts.most_common(1)[0][0]
+    candidates: list[tuple[int, int, int, frozenset[Cell]]] = []
+    max_x = max(cx, GRID - 1 - cx)
+    max_y = max(cy, GRID - 1 - cy)
+    for half_y in range(2, max_y + 1):
+        for half_x in range(2, max_x + 1):
+            shapes = (
+                frozenset(
+                    (dx, dy)
+                    for dy in range(-half_y, half_y + 1)
+                    for dx in range(-half_x, half_x + 1)
+                    if abs(dx) == half_x or abs(dy) == half_y
+                ),
+                frozenset(
+                    (dx, dy)
+                    for dy in range(-half_y, half_y + 1)
+                    for dx in range(-half_x, half_x + 1)
+                    if (dx == 0 or dy == 0) and (dx, dy) != (0, 0)
+                ),
+            )
+            for kind_rank, rel in enumerate(shapes):
+                visible = 0
+                explained = True
+                for dx, dy in rel:
+                    x, y = cx + dx, cy + dy
+                    if not (0 <= x < GRID and 0 <= y < GRID):
+                        continue
+                    value = grid[y][x]
+                    if value == arm_color:
+                        visible += 1
+                    elif value == background or value == 0:
+                        in_hud = x < HUD_BAND or y < HUD_BAND \
+                            or x >= GRID - HUD_BAND \
+                            or y >= GRID - HUD_BAND
+                        if not in_hud:
+                            explained = False
+                            break
+                if not explained or visible < max(8, (len(rel) * 17 + 19) // 20):
+                    continue
+                candidate = _overlay_deform_start(center, rel)
+                if candidate is None:
+                    continue
+                candidates.append((len(rel), visible, -kind_rank, rel))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True, key=lambda item: item[:3])
+    best = candidates[0]
+    if len(candidates) > 1 and candidates[1][:3] == best[:3] \
+            and candidates[1][3] != best[3]:
+        return None
+    return best[3]
+
+
 def overlay_paint_pads(
     grid: Grid,
 ) -> tuple[tuple[int, tuple[int, int, int, int]], ...]:
     """Return exact 5x5/6x6 framed recolour pads as ``(fill, bbox)`` tuples.
 
     A pad is a complete monochrome square border surrounding a uniform
-    non-background fill.  Exact component geometry prevents a generic
-    rectangle or an overlay's 3x3 anchor ring from activating this mechanic.
-    Callers cache the result before moving pieces can cover pads.
+    non-background fill.  A square clipped by exactly one screen edge is also
+    recovered when its *entire visible projection* matches such a border and
+    exposes at least one uniform interior pixel.  Exact component geometry
+    prevents a generic rectangle, edge UI, or an overlay's 3x3 anchor ring
+    from activating this mechanic.  Callers cache the result before moving
+    pieces can cover pads.
     """
     counts: Counter[int] = Counter()
     for row in grid:
         counts.update(row)
     bg = counts.most_common(1)[0][0]
     pads: list[tuple[int, tuple[int, int, int, int]]] = []
-    for border_color, cells in components(grid):
+    complete_templates: set[tuple[int, int]] = set()
+    components_found = components(grid)
+    for border_color, cells in components_found:
         xs = [x for x, _y in cells]
         ys = [y for _x, y in cells]
         x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
@@ -1021,12 +1097,69 @@ def overlay_paint_pads(
         if fill_color in (bg, border_color, 0):
             continue
         pads.append((fill_color, (x0, y0, x1, y1)))
+        complete_templates.add((side, border_color))
+
+    # A partially off-screen pad has an incomplete component bbox, so recover
+    # it by projecting each possible 5x5/6x6 square back into the viewport.
+    # Requiring equality with the whole visible border component is important:
+    # it rejects arbitrary edge strokes and timer/HUD fragments.
+    for border_color, cells in components_found:
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        candidates: list[tuple[int, int, int]] = []
+        for side in (5, 6):
+            if min_x == 0 and max_y - min_y + 1 == side:
+                candidates.extend((x0, min_y, side)
+                                  for x0 in range(1 - side, 0))
+            if max_x == GRID - 1 and max_y - min_y + 1 == side:
+                candidates.extend((x0, min_y, side)
+                                  for x0 in range(GRID - side + 1, GRID))
+            if min_y == 0 and max_x - min_x + 1 == side:
+                candidates.extend((min_x, y0, side)
+                                  for y0 in range(1 - side, 0))
+            if max_y == GRID - 1 and max_x - min_x + 1 == side:
+                candidates.extend((min_x, y0, side)
+                                  for y0 in range(GRID - side + 1, GRID))
+        for x0, y0, side in candidates:
+            # A clipped edge motif is trusted only when this same board shows
+            # the complete pad vocabulary.  This keeps a structurally similar
+            # bottom-edge UI crop in another family from becoming a paint pad.
+            if (side, border_color) not in complete_templates:
+                continue
+            x1, y1 = x0 + side - 1, y0 + side - 1
+            clipped_edges = sum((x0 < 0, y0 < 0,
+                                 x1 >= GRID, y1 >= GRID))
+            if clipped_edges != 1:
+                continue
+            visible_border = frozenset(
+                (x, y) for y in range(max(0, y0), min(GRID - 1, y1) + 1)
+                for x in range(max(0, x0), min(GRID - 1, x1) + 1)
+                if x in (x0, x1) or y in (y0, y1)
+            )
+            if cells != visible_border:
+                continue
+            visible_interior = {
+                (x, y)
+                for y in range(max(0, y0 + 1), min(GRID - 1, y1 - 1) + 1)
+                for x in range(max(0, x0 + 1), min(GRID - 1, x1 - 1) + 1)
+            }
+            if not visible_interior:
+                continue
+            fill = {grid[y][x] for x, y in visible_interior}
+            if len(fill) != 1:
+                continue
+            fill_color = next(iter(fill))
+            if fill_color in (bg, border_color, 0):
+                continue
+            pads.append((fill_color, (x0, y0, x1, y1)))
     return tuple(sorted(pads, key=lambda item: (item[1][1], item[1][0], item[0])))
 
 
 def overlay_deform_obstacles(
     grid: Grid, outline_color: int, anchor_colors: set[int],
     pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+    allow_edge_hud: bool = False,
 ) -> tuple[tuple[frozenset[Cell], tuple[int, int, int, int]], ...]:
     """Compact symmetric obstacle components that can reshape a piece.
 
@@ -1052,8 +1185,16 @@ def overlay_deform_obstacles(
         width, height = x1 - x0 + 1, y1 - y0 + 1
         if not (5 <= width <= 16 and 5 <= height <= 16):
             continue
-        if x0 < HUD_BAND or y0 < HUD_BAND \
-                or x1 >= GRID - HUD_BAND or y1 >= GRID - HUD_BAND:
+        # Compact tools may legitimately sit inside the edge HUD band.  Only
+        # components actually clipped by the frame border are unsafe; the
+        # stricter transform gate later requires a square perimeter, cavity,
+        # and two-axis symmetry before any joint plan can use one.
+        if x0 == 0 or y0 == 0 or x1 == GRID - 1 or y1 == GRID - 1:
+            continue
+        if not allow_edge_hud and (
+            x0 < HUD_BAND or y0 < HUD_BAND
+            or x1 >= GRID - HUD_BAND or y1 >= GRID - HUD_BAND
+        ):
             continue
         if len(cells) * 3 < width * height:
             continue
@@ -1132,6 +1273,60 @@ def _overlay_deform_start(
             bar_x, bar_y, False)
 
 
+def _overlay_cross_obstacle_hit(
+    state: tuple[str, int, int, int, int, int, int, bool],
+    delta: Cell, bbox: tuple[int, int, int, int], step: int,
+) -> tuple[str, int, int, int, int, int, int, bool]:
+    """Apply one obstacle to an already-moved cross.
+
+    Cross tools are processed sequentially in display order.  Unlike a frame
+    collision, a cross collision does not end the action: it may shift one bar
+    and can then meet another tool or a paint pad.  Keeping this operation
+    separate avoids accidentally applying the physical move more than once.
+    """
+    kind, x, y, width, height, bar_x, bar_y, changed = state
+    dx, dy = delta
+    ox0, oy0, ox1, oy1 = bbox
+    vertical_in = ox0 <= x + bar_x <= ox1
+    horizontal_in = oy0 <= y + bar_y <= oy1
+
+    def backed() -> tuple[str, int, int, int, int, int, int, bool]:
+        return (kind, x - dx, y - dy, width, height,
+                bar_x, bar_y, changed)
+
+    if vertical_in and horizontal_in:
+        return backed()
+    if dx:
+        sign = 1 if dx > 0 else -1
+        if vertical_in:
+            new_bar = bar_x - sign * step
+            if 0 <= new_bar < width:
+                return (kind, x, y, width, height,
+                        new_bar, bar_y, True)
+            return backed()
+        if horizontal_in:
+            new_bar = bar_x + sign * step
+            if 0 <= new_bar < width:
+                return (kind, x - dx, y - dy, width, height,
+                        new_bar, bar_y, True)
+            return backed()
+        return state
+    sign = 1 if dy > 0 else -1
+    if horizontal_in:
+        new_bar = bar_y - sign * step
+        if 0 <= new_bar < height:
+            return (kind, x, y, width, height,
+                    bar_x, new_bar, True)
+        return backed()
+    if vertical_in:
+        new_bar = bar_y + sign * step
+        if 0 <= new_bar < height:
+            return (kind, x - dx, y - dy, width, height,
+                    bar_x, new_bar, True)
+        return backed()
+    return state
+
+
 def _overlay_deform_step(
     state: tuple[str, int, int, int, int, int, int, bool],
     delta: Cell,
@@ -1148,66 +1343,41 @@ def _overlay_deform_step(
     if not (0 <= hole[0] < GRID and 0 <= hole[1] < GRID):
         return state
     moved = (kind, nx, ny, width, height, bar_x, bar_y, changed)
+    if kind == "cross":
+        current = moved
+        for occupied, bbox in obstacles:
+            cx = current[1] + current[3] // 2
+            cy = current[2] + current[4] // 2
+            opaque = set(_overlay_deform_cells(current)) | {(cx, cy)}
+            if opaque & occupied:
+                current = _overlay_cross_obstacle_hit(
+                    current, delta, bbox, step
+                )
+        return current
+
     opaque = set(_overlay_deform_cells(moved)) | {hole}
     hit = next((obstacle for obstacle in obstacles
                 if opaque & obstacle[0]), None)
     if hit is None:
         return moved
-    _occupied, (ox0, oy0, ox1, oy1) = hit
-
-    if kind == "frame":
-        if dx:
-            if width <= 2 * step:
-                return state
-            new_width, new_height = width - step, height + step
-            nx = x if dx < 0 else nx
-            ny += height // 2 - new_height // 2
-            ny = round(ny / step) * step
-        else:
-            if height <= 2 * step:
-                return state
-            new_width, new_height = width + step, height - step
-            ny = y if dy < 0 else ny
-            nx += width // 2 - new_width // 2
-            nx = round(nx / step) * step
-        nhole = (nx + new_width // 2, ny + new_height // 2)
-        if not (0 <= nhole[0] < GRID and 0 <= nhole[1] < GRID):
-            return state
-        return (kind, nx, ny, new_width, new_height,
-                0, 0, True)
-
-    vertical_in = ox0 <= nx + bar_x <= ox1
-    horizontal_in = oy0 <= ny + bar_y <= oy1
-    if vertical_in and horizontal_in:
-        return state
     if dx:
-        sign = 1 if dx > 0 else -1
-        if vertical_in:
-            new_bar = bar_x - sign * step
-            if 0 <= new_bar < width:
-                return (kind, nx, ny, width, height,
-                        new_bar, bar_y, True)
+        if width <= 2 * step:
             return state
-        if horizontal_in:
-            new_bar = bar_x + sign * step
-            if 0 <= new_bar < width:
-                return (kind, x, y, width, height,
-                        new_bar, bar_y, True)
+        new_width, new_height = width - step, height + step
+        nx = x if dx < 0 else nx
+        ny += height // 2 - new_height // 2
+        ny = round(ny / step) * step
+    else:
+        if height <= 2 * step:
             return state
+        new_width, new_height = width + step, height - step
+        ny = y if dy < 0 else ny
+        nx += width // 2 - new_width // 2
+        nx = round(nx / step) * step
+    nhole = (nx + new_width // 2, ny + new_height // 2)
+    if not (0 <= nhole[0] < GRID and 0 <= nhole[1] < GRID):
         return state
-    sign = 1 if dy > 0 else -1
-    if horizontal_in:
-        new_bar = bar_y - sign * step
-        if 0 <= new_bar < height:
-            return (kind, nx, ny, width, height,
-                    bar_x, new_bar, True)
-        return state
-    if vertical_in:
-        new_bar = bar_y + sign * step
-        if 0 <= new_bar < height:
-            return (kind, x, y, width, height,
-                    bar_x, new_bar, True)
-    return state
+    return (kind, nx, ny, new_width, new_height, 0, 0, True)
 
 
 def overlay_deform_options(
@@ -1343,6 +1513,284 @@ def assign_overlay_deform_pieces(
         if not dp:
             return None
     solved = dp.get((full_mask, True))
+    return list(solved[4]) if solved is not None else None
+
+
+def _overlay_transform_step(
+    state: tuple[tuple[str, int, int, int, int, int, int, bool], int],
+    delta: Cell,
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+    step: int,
+) -> Optional[
+    tuple[tuple[str, int, int, int, int, int, int, bool], int]
+]:
+    """One exact obstacle-first move in the shape/position/colour graph.
+
+    A frame transformation ends the physical action before paint handling; a
+    cross transformation continues and may recolour in that same action.  Any
+    non-transparent piece cell (including the selection hole) can touch a pad.
+    Simultaneous differently-coloured pads are intentionally rejected because
+    their hidden priority is not observable from a static frame.
+    """
+    shape, color = state
+    kind, x, y, width, height, bar_x, bar_y, _changed = shape
+    dx, dy = delta
+    moved = (
+        kind, x + dx, y + dy, width, height, bar_x, bar_y, False
+    )
+    mx = moved[1] + moved[3] // 2
+    my = moved[2] + moved[4] // 2
+    moved_opaque = set(_overlay_deform_cells(moved)) | {(mx, my)}
+    obstacle_contact = any(
+        bool(moved_opaque & occupied) for occupied, _bbox in obstacles
+    )
+    raw_shape = _overlay_deform_step(shape, delta, obstacles, step)
+    if raw_shape == shape and not obstacle_contact:
+        return state
+    # The historical "changed" bit does not affect future physics.  Combined
+    # search derives deformation from final-vs-initial geometry instead, so
+    # canonicalising it prevents four equivalent history variants per state.
+    nxt_shape = raw_shape[:-1] + (False,)
+    if kind == "frame" and obstacle_contact:
+        return nxt_shape, color
+
+    _kind, nx, ny, nwidth, nheight, _a, _b, _used = nxt_shape
+    opaque = set(_overlay_deform_cells(nxt_shape))
+    opaque.add((nx + nwidth // 2, ny + nheight // 2))
+    px0 = min(px for px, _py in opaque)
+    px1 = max(px for px, _py in opaque)
+    py0 = min(py for _px, py in opaque)
+    py1 = max(py for _px, py in opaque)
+    touched: set[int] = set()
+    for fill, (x0, y0, x1, y1) in pads:
+        if x1 < px0 or x0 > px1 or y1 < py0 or y0 > py1:
+            continue
+        if any(x0 <= px <= x1 and y0 <= py <= y1
+               for px, py in opaque):
+            touched.add(fill)
+    # The official loop skips pads already matching the piece, so a contact
+    # with {current, X} deterministically paints X rather than being ambiguous.
+    touched.discard(color)
+    if len(touched) > 1:
+        return None
+    if touched:
+        fill = next(iter(touched))
+        return nxt_shape, fill
+    return nxt_shape, color
+
+
+def _overlay_intrinsic_geometry(
+    shape: tuple[str, int, int, int, int, int, int, bool],
+) -> tuple[str, int, int, int, int]:
+    """Translation-free geometry used to prove a real transformation."""
+    return shape[0], shape[3], shape[4], shape[5], shape[6]
+
+
+def overlay_goal_hits_visible(
+    grid: Grid, color: int, hits: frozenset[Cell],
+) -> bool:
+    """Every anchor credited to a combined route is visibly covered."""
+    return bool(hits) and all(
+        0 <= x < GRID and 0 <= y < GRID and grid[y][x] == color
+        for x, y in hits
+    )
+
+
+def overlay_transform_options(
+    origin: Cell, rel_mask: frozenset[Cell], source_color: int,
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+    goal_bit: dict[tuple[int, Cell], int],
+) -> list[
+    tuple[
+        int, int, int, Cell, frozenset[Cell], tuple[int, ...], bool, bool
+    ]
+]:
+    """Cheapest joint transform route for every safe goal-coverage mask."""
+    start_shape = _overlay_deform_start(origin, rel_mask)
+    if start_shape is None or not obstacles or len(pads) < 3 \
+            or len(deltas) != 4:
+        return []
+    magnitudes = {abs(dx) + abs(dy) for dx, dy in deltas.values()}
+    directions = {
+        (0 if dx == 0 else 1 if dx > 0 else -1,
+         0 if dy == 0 else 1 if dy > 0 else -1)
+        for dx, dy in deltas.values() if (dx == 0) != (dy == 0)
+    }
+    if len(magnitudes) != 1 or directions != {
+        (0, -1), (0, 1), (-1, 0), (1, 0)
+    }:
+        return []
+    step = next(iter(magnitudes))
+    start_shape = start_shape[:-1] + (False,)
+    start_geometry = _overlay_intrinsic_geometry(start_shape)
+    start = (start_shape, source_color)
+    queue = deque([start])
+    parent: dict[tuple, Optional[tuple]] = {start: None}
+    via: dict[tuple, int] = {}
+    distance = {start: 0}
+    best: dict[
+        tuple[int, bool, bool],
+        tuple[tuple, int, Cell, frozenset[Cell], tuple[int, ...]]
+    ] = {}
+    all_anchors = {
+        color: frozenset(cells) for color, cells in anchors.items()
+    }
+
+    def route(state: tuple) -> tuple[int, ...]:
+        actions: list[int] = []
+        cur = state
+        while parent[cur] is not None:
+            actions.append(via[cur])
+            cur = parent[cur]
+        actions.reverse()
+        return tuple(actions)
+
+    while queue:
+        state = queue.popleft()
+        shape, color = state
+        cells = _overlay_deform_cells(shape)
+        hits = frozenset(cell for cell in all_anchors.get(color, frozenset())
+                         if cell in cells)
+        wrong = any(
+            cells & goal_cells for goal_color, goal_cells in all_anchors.items()
+            if goal_color != color
+        )
+        if hits and not wrong:
+            mask = 0
+            for cell in hits:
+                mask |= goal_bit[(color, cell)]
+            actions = route(state)
+            _kind, x, y, width, height, _a, _b, _history = shape
+            used = _overlay_intrinsic_geometry(shape) != start_geometry
+            painted = color != source_color
+            target = (x + width // 2, y + height // 2)
+            rank = (distance[state], target[1], target[0], actions)
+            key = (mask, used, painted)
+            old = best.get(key)
+            if old is None or rank < old[0]:
+                best[key] = (rank, color, target, hits, actions)
+        for action, delta in sorted(deltas.items()):
+            nxt = _overlay_transform_step(
+                state, delta, obstacles, pads, step
+            )
+            if nxt is None or nxt == state or nxt in parent:
+                continue
+            if len(parent) >= OV_TRANSFORM_STATE_CAP:
+                # The prefix is still a sound set of exact routes.  Preserve
+                # its proved options instead of discarding them merely because
+                # exhaustive optimality hit the bounded-search ceiling.
+                queue.clear()
+                break
+            parent[nxt] = state
+            via[nxt] = action
+            distance[nxt] = distance[state] + 1
+            queue.append(nxt)
+    return [
+        (mask, item[0][0], item[1], item[2], item[3], item[4],
+         used, painted)
+        for (mask, used, painted), item in sorted(best.items())
+    ]
+
+
+def assign_overlay_transform_pieces(
+    pieces: list[tuple[Cell, int, frozenset[Cell]]],
+    anchors: dict[int, tuple[Cell, ...]], deltas: dict[int, Cell],
+    obstacles: tuple[
+        tuple[frozenset[Cell], tuple[int, int, int, int]], ...
+    ],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+) -> Optional[list[
+    tuple[
+        int, frozenset[Cell], Cell, int, Cell, frozenset[Cell],
+        tuple[int, ...],
+    ]
+]]:
+    """Joint assignment for obstacle deformation plus pad recolouring."""
+    if not (2 <= len(pieces) <= 3) or not anchors \
+            or not (1 <= len(obstacles) <= 2) or len(pads) < 3:
+        return None
+    source_colors = {color for _origin, color, _mask in pieces}
+    pad_colors = {color for color, _bbox in pads}
+    if not set(anchors) <= source_colors | pad_colors:
+        return None
+    if any(_overlay_deform_start(origin, rel_mask) is None
+           for origin, _color, rel_mask in pieces):
+        return None
+    for cells, (x0, y0, x1, y1) in obstacles:
+        side = x1 - x0 + 1
+        perimeter = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+            if x in (x0, x1) or y in (y0, y1)
+        }
+        horizontal = {(x0 + x1 - x, y) for x, y in cells}
+        vertical = {(x, y0 + y1 - y) for x, y in cells}
+        if side not in range(5, 9) or y1 - y0 + 1 != side \
+                or not perimeter <= cells or len(cells) >= side * side \
+                or horizontal != set(cells) or vertical != set(cells):
+            return None
+
+    goals = sorted(
+        (color, cell) for color, cells in anchors.items() for cell in cells
+    )
+    if not goals or len(goals) > OV_ASSIGN_GOAL_CAP:
+        return None
+    goal_bit = {goal: 1 << index for index, goal in enumerate(goals)}
+    full_mask = (1 << len(goals)) - 1
+    rows = [
+        overlay_transform_options(
+            origin, rel_mask, color, anchors, deltas, obstacles, pads,
+            goal_bit,
+        ) for origin, color, rel_mask in pieces
+    ]
+    if any(not row for row in rows):
+        return None
+
+    dp: dict[
+        tuple[int, bool, bool], tuple[int, int, int, tuple, tuple]
+    ] = {(0, False, False): (0, 0, 0, tuple(), tuple())}
+    for (origin, source, rel_mask), options in zip(pieces, rows):
+        nxt: dict[
+            tuple[int, bool, bool], tuple[int, int, int, tuple, tuple]
+        ] = {}
+        for (covered, deformed_before, painted_before), state in dp.items():
+            total, overlap, max_moves, ties, placements = state
+            for mask, moves, goal_color, target, hits, actions, deformed, \
+                    painted in options:
+                merged = covered | mask
+                redundant = mask.bit_count() - (mask & ~covered).bit_count()
+                disp = (target[1] - origin[1], target[0] - origin[0])
+                tie = (goal_color, disp, actions)
+                placement = (
+                    source, rel_mask, origin, goal_color, target, hits, actions
+                )
+                candidate = (
+                    total + moves,
+                    overlap + redundant,
+                    max(max_moves, moves),
+                    ties + (tie,),
+                    placements + (placement,),
+                )
+                key = (
+                    merged, deformed_before or deformed,
+                    painted_before or painted,
+                )
+                old = nxt.get(key)
+                if old is None or candidate[:4] < old[:4]:
+                    if old is None and len(nxt) >= OV_ASSIGN_STATE_CAP:
+                        return None
+                    nxt[key] = candidate
+        dp = nxt
+        if not dp:
+            return None
+    solved = dp.get((full_mask, True, True))
     return list(solved[4]) if solved is not None else None
 
 
@@ -3861,7 +4309,8 @@ class MyAgent(Agent):
         }
         self._ov_pads = overlay_paint_pads(grid)
         self._ov_obstacles = overlay_deform_obstacles(
-            grid, outline, set(self._ov_cached_anchors), self._ov_pads
+            grid, outline, set(self._ov_cached_anchors), self._ov_pads,
+            allow_edge_hud=len(self._ov_pads) >= 3,
         )
         return outline, self._ov_cached_anchors
 
@@ -4006,15 +4455,21 @@ class MyAgent(Agent):
                         and self._ov_expected_arm is not None \
                         and self._ov_select is not None:
                     if self._ov_recolor_assignment:
+                        entry = self._ov_recolor_assignment[0]
                         _source, _mask, _origin, goal_color, _tgt, hits, \
-                            _actions = \
-                            self._ov_recolor_assignment.popleft()
-                        if goal_color != self._ov_expected_arm:
+                            _actions = entry
+                        valid_hits = not self._ov_deform_route \
+                            or overlay_goal_hits_visible(
+                                grid, goal_color, hits
+                            )
+                        if goal_color != self._ov_expected_arm \
+                                or not valid_hits:
                             self._ov_recolor_assignment.clear()
                             self._ov_recolor_required = frozenset()
                             self._ov_deform_route = False
                             self._ov_benched = level
                             return None
+                        self._ov_recolor_assignment.popleft()
                         self._ov_assigned_anchors.update(
                             (goal_color, cell) for cell in hits
                         )
@@ -4111,9 +4566,12 @@ class MyAgent(Agent):
         # relative mask, so identical shapes at different sites remain
         # distinct instances and an intermediate duplicate is ambiguous.
         if self._ov_catalog:
-            rel_mask = clipped_symmetric_piece_mask(grid, center, arm) \
-                if self._ov_catalog_recolor \
-                else symmetric_piece_mask(grid, center, arm)
+            if self._ov_catalog_recolor and self._ov_obstacles:
+                rel_mask = overlay_transform_piece_mask(grid, center, arm)
+            elif self._ov_catalog_recolor:
+                rel_mask = clipped_symmetric_piece_mask(grid, center, arm)
+            else:
+                rel_mask = symmetric_piece_mask(grid, center, arm)
             if rel_mask is None:
                 self._ov_catalog.clear()
                 self._ov_catalog_first = None
@@ -4133,11 +4591,22 @@ class MyAgent(Agent):
                         color: cells for color, cells in anchors.items()
                         if color not in self._ov_solved
                     }
-                    assignment = assign_overlay_recolor_pieces(
-                        catalog, pending, axis, self._ov_pads
+                    # Obstacles and pads on the same strongly-gated board form
+                    # one mechanic: route geometry and colour jointly.  An
+                    # obstacle-blind recolour fallback could cross a tool and
+                    # silently change the piece shape, so only use the older
+                    # translation planner when no structural obstacle exists.
+                    combined = bool(self._ov_obstacles)
+                    assignment = (
+                        assign_overlay_transform_pieces(
+                            catalog, pending, axis, self._ov_obstacles,
+                            self._ov_pads,
+                        ) if combined else assign_overlay_recolor_pieces(
+                            catalog, pending, axis, self._ov_pads
+                        )
                     ) if len(catalog) >= 2 else None
                     if assignment is not None:
-                        self._ov_deform_route = False
+                        self._ov_deform_route = combined
                         self._ov_recolor_assignment = deque(assignment)
                         self._ov_recolor_required = frozenset(
                             (color, cell) for color, cells in pending.items()
@@ -4236,16 +4705,21 @@ class MyAgent(Agent):
                 self._ov_last_center = None
                 return self._step(GameAction.from_id(select))
             if self._ov_recolor_assignment:
+                entry = self._ov_recolor_assignment[0]
                 _source, _mask, _origin, goal_color, _target, hits, _actions = \
-                    self._ov_recolor_assignment.popleft()
+                    entry
                 expected_arm = self._ov_expected_arm
                 self._ov_expected_arm = None
-                if arm != goal_color or expected_arm != goal_color:
+                valid_hits = not self._ov_deform_route \
+                    or overlay_goal_hits_visible(grid, goal_color, hits)
+                if arm != goal_color or expected_arm != goal_color \
+                        or not valid_hits:
                     self._ov_recolor_assignment.clear()
                     self._ov_recolor_required = frozenset()
                     self._ov_deform_route = False
                     self._ov_benched = level
                     return None
+                self._ov_recolor_assignment.popleft()
                 self._ov_assigned_anchors.update(
                     (goal_color, cell) for cell in hits
                 )
@@ -4336,7 +4810,9 @@ class MyAgent(Agent):
         if self._ov_recolor_assignment:
             source, expected_mask, origin, goal_color, tgt, hits, actions = \
                 self._ov_recolor_assignment[0]
-            observed_mask = clipped_symmetric_piece_mask(grid, center, arm)
+            observed_mask = overlay_transform_piece_mask(grid, center, arm) \
+                if self._ov_deform_route and self._ov_pads \
+                else clipped_symmetric_piece_mask(grid, center, arm)
             visible_match = observed_mask is not None \
                 and observed_mask <= expected_mask \
                 and len(observed_mask) >= 4
@@ -4398,7 +4874,9 @@ class MyAgent(Agent):
             # that allocation without greedily consuming the wrong shape.
             if pending and set(pending) <= pad_colors \
                     and not self._ov_recolor_cataloged:
-                rel_mask = clipped_symmetric_piece_mask(grid, center, arm)
+                rel_mask = overlay_transform_piece_mask(grid, center, arm) \
+                    if self._ov_obstacles \
+                    else clipped_symmetric_piece_mask(grid, center, arm)
                 if rel_mask is None:
                     self._ov_benched = level
                     return None
@@ -5828,6 +6306,23 @@ class MyAgent(Agent):
             lattice = self._lattice_policy(grid, latest_frame)
             if lattice is not None:
                 return lattice
+            # Once the strongly-gated overlay head has a catalog or proved
+            # assignment in flight, it owns the simple-action stream.  Shape
+            # deformation resembles an editor's in-place mutation and could
+            # otherwise make that earlier probe steal several physical moves
+            # without consuming the overlay route queue.  Initial detection
+            # ordering is unchanged; this fast path exists only after overlay
+            # evidence has already engaged the family.
+            overlay_active = self._ov_level == latest_frame.levels_completed \
+                and bool(
+                    self._ov_catalog or self._ov_assignment
+                    or self._ov_recolor_assignment or self._ov_plan
+                    or self._ov_target is not None
+                )
+            if overlay_active:
+                overlay = self._overlay_policy(grid, latest_frame)
+                if overlay is not None:
+                    return overlay
             # Clue-to-selector macro: exact {1,2,3,4,6} action profile + a
             # framed 3x3 value lattice + a matching framed clue mask + a
             # remote compact body and larger same-palette socket.  Standard
@@ -5837,6 +6332,15 @@ class MyAgent(Agent):
             panel = self._panel_policy(grid, latest_frame)
             if panel is not None:
                 return panel
+            # Rich selected-piece overlays must claim their first clean frame
+            # before generic slide/editor probes can mistake a transform or a
+            # dense pad layout for their own mechanics.  The compound gate is
+            # exact and stronger than those probes: ACTION1..5 without click,
+            # a multi-ring static goal, and one selected-piece hole.  Click
+            # lattice/panel families above remain unaffected.
+            overlay = self._overlay_policy(grid, latest_frame)
+            if overlay is not None:
+                return overlay
             # directional node-maze solver (tu93 family).  Dispatched BEFORE
             # the editor: both share the [1,2,3,4] action set, but the slide
             # gate is far stricter (a clean binary corridor/wall lattice + a
@@ -5888,18 +6392,6 @@ class MyAgent(Agent):
             port = self._port_policy(grid, latest_frame)
             if port is not None:
                 return port
-            # overlay-align head (re86 family): a SELECTED piece (centre hole
-            # = 0) placed so its arm footprint covers a STATIC goal-overlay's
-            # anchor centres.  Gated inside on the [1,2,3,4,5]-no-ACTION6
-            # action set PLUS a static hollow-box overlay signature PLUS a
-            # cursor that JUMPS (not translates) on the 5th verb — the
-            # secondary gate is load-bearing: g50t shares the action set but
-            # has a scrolling obstacle and no box overlay, so it cannot reach
-            # the model.  Runs AFTER the port branch (re86 exposes no ACTION6,
-            # so the port gate already declined) and before warmup.
-            overlay = self._overlay_policy(grid, latest_frame)
-            if overlay is not None:
-                return overlay
             # remote-toggle switch planner (dc22 family), gated inside on
             # clicks + trusted movement rules + no register + no port
             # color + the readiness clause + SW_FRAMES diffed frames (so

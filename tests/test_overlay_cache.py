@@ -395,6 +395,9 @@ class OverlayGoalCacheTests(unittest.TestCase):
                 for x in range(x0, x0 + 6):
                     grid[y][x] = 2 if x in (x0, x0 + 5) \
                         or y in (y0, y0 + 5) else fill
+        for y in range(28, 33):
+            for x in range(52, 57):
+                grid[y][x] = 3 if x in (52, 56) or y in (28, 32) else 11
         # A visually similar 7x6 frame is not an exact pad.
         for y in range(28, 34):
             for x in range(4, 11):
@@ -405,6 +408,7 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertEqual(pads, (
             (10, (4, 4, 9, 9)),
             (12, (28, 4, 33, 9)),
+            (11, (52, 28, 56, 32)),
             (14, (52, 52, 57, 57)),
         ))
 

@@ -976,12 +976,12 @@ def clipped_symmetric_piece_mask(
 def overlay_paint_pads(
     grid: Grid,
 ) -> tuple[tuple[int, tuple[int, int, int, int]], ...]:
-    """Return exact 6x6 framed recolour pads as ``(fill, bbox)`` tuples.
+    """Return exact 5x5/6x6 framed recolour pads as ``(fill, bbox)`` tuples.
 
-    A pad is a complete 20-pixel monochrome border component surrounding a
-    uniform non-background 4x4 fill.  Exact component geometry prevents a
-    generic rectangle or an overlay's 3x3 anchor ring from activating this
-    mechanic.  Callers cache the result before moving pieces can cover pads.
+    A pad is a complete monochrome square border surrounding a uniform
+    non-background fill.  Exact component geometry prevents a generic
+    rectangle or an overlay's 3x3 anchor ring from activating this mechanic.
+    Callers cache the result before moving pieces can cover pads.
     """
     counts: Counter[int] = Counter()
     for row in grid:
@@ -989,12 +989,12 @@ def overlay_paint_pads(
     bg = counts.most_common(1)[0][0]
     pads: list[tuple[int, tuple[int, int, int, int]]] = []
     for border_color, cells in components(grid):
-        if len(cells) != 20:
-            continue
         xs = [x for x, _y in cells]
         ys = [y for _x, y in cells]
         x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        if x1 - x0 != 5 or y1 - y0 != 5:
+        side = x1 - x0 + 1
+        if side not in (5, 6) or y1 - y0 + 1 != side \
+                or len(cells) != 4 * side - 4:
             continue
         border = {
             (x, y) for y in range(y0, y1 + 1)

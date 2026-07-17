@@ -817,6 +817,21 @@ class MyAgent(Agent):
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return latest_frame.state is GameState.WIN
 
+    def _gx_commit_pending_reset(self, start_key: int) -> None:
+        """Record a confirmed death/RESET edge to the level-start node.
+
+        ``_gx_pending_reset`` is stored as ``(state_key, action_key)`` in the
+        GAME_OVER branch.  Keeping the unpacking here, next to the write, makes
+        that ordering explicit and prevents state/action keys from being
+        silently reversed in the explorer graph.
+        """
+        if self._gx_pending_reset is None:
+            return
+        state_key, action_key = self._gx_pending_reset
+        self._transitions[(state_key, action_key)] = start_key
+        self._tried[state_key].add(action_key)
+        self._gx_pending_reset = None
+
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
@@ -1096,10 +1111,7 @@ class MyAgent(Agent):
                     # the action that triggered this respawn was a confirmed
                     # reset-inducing action: record its edge to the start and
                     # mark it tried so the explorer never re-issues it as new
-                    rkey, rstate = self._gx_pending_reset
-                    self._transitions[(rstate, rkey)] = key
-                    self._tried[rstate].add(rkey)
-                    self._gx_pending_reset = None
+                    self._gx_commit_pending_reset(key)
 
         action: Optional[GameAction] = None
         if self._wp_replay is not None:

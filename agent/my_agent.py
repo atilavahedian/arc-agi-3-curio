@@ -235,6 +235,7 @@ OV_ARM_RADIUS = 9       # concentric selected-arm search/fallback cap for
 OV_CATALOG_CAP = 8      # maximum unambiguous SELECT-cycle inventory
 OV_ASSIGN_GOAL_CAP = 16  # bound coverage-DP width on a gated rich overlay
 OV_ASSIGN_STATE_CAP = 4096  # hard ceiling for reachable coverage masks
+OV_RECOLOR_STATE_CAP = 16384  # bounded (centre x current-colour) pad-route BFS
 PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
                         # selector-panel macro signature: four cardinal inputs
                         # plus click, with no extra verb or RESET
@@ -929,6 +930,172 @@ def symmetric_piece_mask(
     return frozenset((x - cx, y - cy) for x, y in chosen)
 
 
+def clipped_symmetric_piece_mask(
+    grid: Grid, center: Cell, arm_color: int
+) -> Optional[frozenset[Cell]]:
+    """A selected piece mask with only edge-clipped reflections restored.
+
+    ``symmetric_piece_mask`` deliberately requires every visible arm pixel to
+    have a visible point-reflected partner.  That isolates touching pieces,
+    but a genuine arm clipped by the 64x64 viewport loses its off-screen half.
+    Starting from the already-trusted symmetric core, extend only through
+    adjacent arm pixels whose reflected coordinate is outside the frame, and
+    add that virtual reflection.  Remote same-colour pads/noise cannot join the
+    core, while the restored mask describes the piece once it moves on-screen.
+    """
+    base = symmetric_piece_mask(grid, center, arm_color)
+    if base is None:
+        return None
+    cx, cy = center
+    visible = {(cx + dx, cy + dy) for dx, dy in base}
+    candidates = {
+        (x, y) for y, row in enumerate(grid) for x, value in enumerate(row)
+        if value == arm_color
+        and not (0 <= 2 * cx - x < GRID and 0 <= 2 * cy - y < GRID)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for cell in tuple(candidates):
+            x, y = cell
+            if any((x + dx, y + dy) in visible
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                   if (dx, dy) != (0, 0)):
+                candidates.remove(cell)
+                visible.add(cell)
+                changed = True
+    rel = {(x - cx, y - cy) for x, y in visible}
+    for dx, dy in tuple(rel):
+        rx, ry = cx - dx, cy - dy
+        if not (0 <= rx < GRID and 0 <= ry < GRID):
+            rel.add((-dx, -dy))
+    return frozenset(rel)
+
+
+def overlay_paint_pads(
+    grid: Grid,
+) -> tuple[tuple[int, tuple[int, int, int, int]], ...]:
+    """Return exact 6x6 framed recolour pads as ``(fill, bbox)`` tuples.
+
+    A pad is a complete 20-pixel monochrome border component surrounding a
+    uniform non-background 4x4 fill.  Exact component geometry prevents a
+    generic rectangle or an overlay's 3x3 anchor ring from activating this
+    mechanic.  Callers cache the result before moving pieces can cover pads.
+    """
+    counts: Counter[int] = Counter()
+    for row in grid:
+        counts.update(row)
+    bg = counts.most_common(1)[0][0]
+    pads: list[tuple[int, tuple[int, int, int, int]]] = []
+    for border_color, cells in components(grid):
+        if len(cells) != 20:
+            continue
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        if x1 - x0 != 5 or y1 - y0 != 5:
+            continue
+        border = {
+            (x, y) for y in range(y0, y1 + 1)
+            for x in range(x0, x1 + 1)
+            if x in (x0, x1) or y in (y0, y1)
+        }
+        if cells != border:
+            continue
+        fill = {
+            grid[y][x] for y in range(y0 + 1, y1)
+            for x in range(x0 + 1, x1)
+        }
+        if len(fill) != 1:
+            continue
+        fill_color = next(iter(fill))
+        if fill_color in (bg, border_color, 0):
+            continue
+        pads.append((fill_color, (x0, y0, x1, y1)))
+    return tuple(sorted(pads, key=lambda item: (item[1][1], item[1][0], item[0])))
+
+
+def overlay_shape_targets(
+    rel_mask: frozenset[Cell], anchors: dict[int, tuple[Cell, ...]],
+    origin: Cell, step: int,
+) -> tuple[tuple[int, Cell], ...]:
+    """All exact, reachable colour targets for a translation-only shape."""
+    if not rel_mask or step <= 0:
+        return tuple()
+    ox, oy = origin
+    out: set[tuple[int, Cell]] = set()
+    for color, cells in anchors.items():
+        if not cells:
+            continue
+        aset = set(cells)
+        ax, ay = cells[0]
+        for rx, ry in rel_mask:
+            target = (ax - rx, ay - ry)
+            tx, ty = target
+            if not (0 <= tx < GRID and 0 <= ty < GRID):
+                continue
+            if (tx - ox) % step or (ty - oy) % step:
+                continue
+            if all((gx - tx, gy - ty) in rel_mask for gx, gy in aset):
+                out.add((color, target))
+    return tuple(sorted(out, key=lambda item: (item[0], item[1][1], item[1][0])))
+
+
+def overlay_recolor_plan(
+    origin: Cell, current_color: int, rel_mask: frozenset[Cell],
+    target: Cell, target_color: int, deltas: dict[int, Cell],
+    pads: tuple[tuple[int, tuple[int, int, int, int]], ...],
+) -> Optional[list[int]]:
+    """Shortest deterministic route through paint pads to a coloured target.
+
+    The search state is ``(piece centre, current colour)``.  A move that makes
+    any arm pixel overlap one framed pad adopts that pad's fill colour; a move
+    simultaneously touching different-colour pads is rejected as ambiguous.
+    The bounded search uses only observed geometry and learned move deltas.
+    """
+    if not rel_mask or not deltas or not pads:
+        return None
+    start = (origin[0], origin[1], current_color)
+    goal = (target[0], target[1], target_color)
+    queue = deque([start])
+    parent: dict[tuple[int, int, int], Optional[tuple[int, int, int]]] = {
+        start: None
+    }
+    via: dict[tuple[int, int, int], int] = {}
+    while queue:
+        state = queue.popleft()
+        if state == goal:
+            actions: list[int] = []
+            cur = state
+            while parent[cur] is not None:
+                actions.append(via[cur])
+                cur = parent[cur]  # type: ignore[assignment]
+            actions.reverse()
+            return actions
+        x, y, color = state
+        for action, (dx, dy) in sorted(deltas.items()):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < GRID and 0 <= ny < GRID):
+                continue
+            touched: set[int] = set()
+            for fill, (x0, y0, x1, y1) in pads:
+                if any(x0 <= nx + rx <= x1 and y0 <= ny + ry <= y1
+                       for rx, ry in rel_mask):
+                    touched.add(fill)
+            if len(touched) > 1:
+                continue
+            ncolor = next(iter(touched)) if touched else color
+            nxt = (nx, ny, ncolor)
+            if nxt in parent:
+                continue
+            if len(parent) >= OV_RECOLOR_STATE_CAP:
+                return None
+            parent[nxt] = state
+            via[nxt] = action
+            queue.append(nxt)
+    return None
+
+
 def assign_overlay_pieces(
     pieces: list[tuple[Cell, int, frozenset[Cell]]],
     anchors: dict[int, tuple[Cell, ...]],
@@ -1199,6 +1366,12 @@ class MyAgent(Agent):
         self._ov_solved: set[int] = set()           # colours already covered
         self._ov_plan: deque[int] = deque()         # queued MOVE action ids
         self._ov_target: Optional[Cell] = None      # centre we are driving to
+        # Exact framed paint pads are immutable level geography.  A recolour
+        # plan also records the goal colour expected at its destination.
+        self._ov_pads: tuple[
+            tuple[int, tuple[int, int, int, int]], ...
+        ] = tuple()
+        self._ov_expected_arm: Optional[int] = None
         # Same-colour multi-piece overlays are catalogued by one full SELECT
         # cycle, then executed in that observed ordinal order.
         self._ov_catalog: list[
@@ -1452,6 +1625,7 @@ class MyAgent(Agent):
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_assignment.clear()
@@ -1609,9 +1783,11 @@ class MyAgent(Agent):
             # piece roster (outline colour and SELECT verb are physics).
             self._ov_cached_outline = None
             self._ov_cached_anchors.clear()
+            self._ov_pads = tuple()
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_assignment.clear()
@@ -3168,6 +3344,7 @@ class MyAgent(Agent):
         self._ov_cached_anchors = {
             color: tuple(cells) for color, cells in anchors.items()
         }
+        self._ov_pads = overlay_paint_pads(grid)
         return outline, self._ov_cached_anchors
 
     def _ov_selected(
@@ -3260,9 +3437,11 @@ class MyAgent(Agent):
             self._ov_level = level
             self._ov_cached_outline = None
             self._ov_cached_anchors.clear()
+            self._ov_pads = tuple()
             self._ov_solved.clear()
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_expected_arm = None
             self._ov_catalog.clear()
             self._ov_catalog_first = None
             self._ov_assignment.clear()
@@ -3294,6 +3473,18 @@ class MyAgent(Agent):
                     action = self._ov_plan.popleft()
                     self._ov_last_center = None
                     return self._step(GameAction.from_id(action))
+                # A correctly placed piece can have its selection hole covered
+                # by another piece.  For a proved recolour route whose final
+                # move was just consumed, advance SELECT explicitly instead of
+                # letting the generic hidden-hole fallback move it away.
+                if self._ov_target is not None \
+                        and self._ov_expected_arm is not None \
+                        and self._ov_select is not None:
+                    self._ov_solved.add(self._ov_expected_arm)
+                    self._ov_expected_arm = None
+                    self._ov_target = None
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(self._ov_select))
                 moves = [
                     action for action in sorted(avail)
                     if action != self._ov_select
@@ -3403,6 +3594,7 @@ class MyAgent(Agent):
                 and center == self._ov_last_center:
             self._ov_plan.clear()
             self._ov_target = None
+            self._ov_expected_arm = None
             self._ov_strikes += 1
             if self._ov_strikes >= OV_STRIKES:
                 self._ov_benched = level
@@ -3440,7 +3632,23 @@ class MyAgent(Agent):
                     self._ov_solved.update(anchors)
                 self._ov_last_center = None
                 return self._step(GameAction.from_id(select))
-            self._ov_solved.add(arm)
+            if self._ov_expected_arm is not None:
+                expected_arm = self._ov_expected_arm
+                self._ov_expected_arm = None
+                if arm != expected_arm:
+                    self._ov_strikes += 1
+                    if self._ov_strikes >= OV_STRIKES:
+                        self._ov_benched = level
+                        return None
+                else:
+                    self._ov_solved.add(expected_arm)
+                    # Preserve the proved placement.  Another unsolved colour
+                    # might accept the same geometry, but reusing this piece
+                    # would uncover the goal just completed.
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(select))
+            else:
+                self._ov_solved.add(arm)
 
         # Execute the globally proved placement for the current selection
         # ordinal.  Re-read its symmetric signature before the first move;
@@ -3489,6 +3697,46 @@ class MyAgent(Agent):
             self._ov_last_center = center
             return self._step(GameAction.from_id(act))
 
+        # Framed paint pads change a whole piece's colour when any arm pixel
+        # overlaps them.  On this strongly gated board, infer the destination
+        # colour solely from which unsolved anchor set the observed shape can
+        # cover, then search (centre x colour) so a later wrong pad cannot
+        # silently overwrite the required colour.  At least three exact pads
+        # keep incidental small frames from activating recolour planning.
+        if len(self._ov_pads) >= 3:
+            rel_mask = clipped_symmetric_piece_mask(grid, center, arm)
+            pending = {
+                color: cells for color, cells in anchors.items()
+                if color not in self._ov_solved
+            }
+            pad_colors = {color for color, _bbox in self._ov_pads}
+            targets = tuple(
+                target for target in overlay_shape_targets(
+                    rel_mask or frozenset(), pending, center, step
+                ) if target[0] in pad_colors
+            )
+            if len(targets) == 1 and rel_mask is not None:
+                goal_color, tgt = targets[0]
+                plan = overlay_recolor_plan(
+                    center, arm, rel_mask, tgt, goal_color, axis,
+                    self._ov_pads,
+                )
+                if plan is None:
+                    self._ov_strikes += 1
+                    if self._ov_strikes >= OV_STRIKES:
+                        self._ov_benched = level
+                    return None
+                if not plan:
+                    self._ov_solved.add(goal_color)
+                    self._ov_last_center = None
+                    return self._step(GameAction.from_id(select))
+                self._ov_target = tgt
+                self._ov_expected_arm = goal_color
+                self._ov_plan = deque(plan)
+                act = self._ov_plan.popleft()
+                self._ov_last_center = center
+                return self._step(GameAction.from_id(act))
+
         # plan the selected colour's cover if it still has unsolved anchors
         my_anchors = anchors.get(arm, [])
         if my_anchors and arm not in self._ov_solved:
@@ -3535,6 +3783,7 @@ class MyAgent(Agent):
             self._ov_strikes += 1
         self._ov_last_center = None
         self._ov_target = None
+        self._ov_expected_arm = None
         return self._step(GameAction.from_id(select))
 
     # ── editor model (tr87 family): cursor + in-place glyph cycling ─────

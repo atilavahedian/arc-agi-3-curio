@@ -342,6 +342,84 @@ class OverlayGoalCacheTests(unittest.TestCase):
         self.assertEqual(mask, frozenset(expected))
         self.assertNotIn((0, 0), mask)
 
+    def test_clipped_mask_restores_only_offscreen_arm(self) -> None:
+        funcs = self.agent_class._ov_selected.__globals__
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        center = (54, 36)
+        grid[36][54] = 0
+        # A radius-13 plus whose right arm is clipped by the viewport.
+        expected = set()
+        for distance in range(1, 14):
+            for dx, dy in ((distance, 0), (-distance, 0),
+                           (0, distance), (0, -distance)):
+                expected.add((dx, dy))
+                x, y = center[0] + dx, center[1] + dy
+                if 0 <= x < 64 and 0 <= y < 64:
+                    grid[y][x] = 6
+        # Remote same-colour paint fill must not be reflected into the piece.
+        for y in range(55, 59):
+            for x in range(29, 33):
+                grid[y][x] = 6
+
+        ordinary = funcs["symmetric_piece_mask"](grid, center, 6)
+        restored = funcs["clipped_symmetric_piece_mask"](grid, center, 6)
+
+        self.assertLess(len(ordinary), len(expected))
+        self.assertEqual(restored, frozenset(expected))
+
+    def test_paint_pad_reader_requires_exact_framed_components(self) -> None:
+        func = self.agent_class._ov_selected.__globals__["overlay_paint_pads"]
+        grid = [[5 for _x in range(64)] for _y in range(64)]
+        for fill, x0, y0 in ((10, 4, 4), (12, 28, 4), (14, 52, 52)):
+            for y in range(y0, y0 + 6):
+                for x in range(x0, x0 + 6):
+                    grid[y][x] = 2 if x in (x0, x0 + 5) \
+                        or y in (y0, y0 + 5) else fill
+        # A visually similar 7x6 frame is not an exact pad.
+        for y in range(28, 34):
+            for x in range(4, 11):
+                grid[y][x] = 3 if x in (4, 10) or y in (28, 33) else 11
+
+        pads = func(grid)
+
+        self.assertEqual(pads, (
+            (10, (4, 4, 9, 9)),
+            (12, (28, 4, 33, 9)),
+            (14, (52, 52, 57, 57)),
+        ))
+
+    def test_recolor_route_uses_geometry_and_avoids_late_overwrite(self) -> None:
+        funcs = self.agent_class._ov_selected.__globals__
+        cross = frozenset(
+            (dx, dy) for distance in range(1, 14)
+            for dx, dy in ((distance, 0), (-distance, 0),
+                           (0, distance), (0, -distance))
+        )
+        anchors = {
+            12: ((15, 18), (27, 30), (15, 43)),
+            14: ((48, 21), (33, 24), (30, 39)),
+        }
+        pads = tuple(
+            (color, (x0, y0, x0 + 5, y0 + 5))
+            for color, x0, y0 in (
+                (10, 4, 4), (11, 4, 54), (12, 28, 4),
+                (13, 52, 4), (6, 28, 54), (14, 52, 54),
+            )
+        )
+        deltas = {1: (0, -3), 2: (0, 3), 3: (-3, 0), 4: (3, 0)}
+
+        targets = funcs["overlay_shape_targets"](
+            cross, anchors, (54, 36), 3
+        )
+        plan = funcs["overlay_recolor_plan"](
+            (54, 36), 6, cross, (15, 30), 12, deltas, pads
+        )
+
+        self.assertEqual(targets, ((12, (15, 30)),))
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan), 21)
+        self.assertEqual(plan, [1] * 5 + [3] * 7 + [2] * 3 + [3] * 6)
+
     def test_joint_assignment_covers_all_same_color_anchors(self) -> None:
         func = self.agent_class._ov_selected.__globals__["assign_overlay_pieces"]
         horizontal = frozenset({(-2, 0), (-1, 0), (1, 0), (2, 0)})
@@ -441,6 +519,39 @@ class OverlayGoalCacheTests(unittest.TestCase):
 
             self.assertIs(action, GameAction.ACTION1)
             self.assertIsNot(action, GameAction.ACTION5)
+
+    def test_hidden_hole_after_recolor_target_advances_select(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="overlay-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        agent._ov_level = 0
+        agent._ov_cached_outline = 4
+        agent._ov_cached_anchors = {
+            12: ((10, 10), (20, 20), (30, 30), (40, 40))
+        }
+        agent._ov_select = GameAction.ACTION5.value
+        agent._ov_target = (30, 30)
+        agent._ov_expected_arm = 12
+        grid = [[8 for _x in range(64)] for _y in range(64)]
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[1, 2, 3, 4, 5],
+        )
+
+        action = agent._overlay_policy(grid, frame)
+
+        self.assertIs(action, GameAction.ACTION5)
+        self.assertIn(12, agent._ov_solved)
+        self.assertIsNone(agent._ov_target)
+        self.assertIsNone(agent._ov_expected_arm)
 
 
 if __name__ == "__main__":

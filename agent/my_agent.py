@@ -230,6 +230,9 @@ OV_MIN_TOTAL = 4        # total hollow-box anchor centres (summed across all
                         # while an incidental ring pair never reaches it.
 OV_STRIKES = 8          # dry/failed overlay plans before the head benches the
                         # level (mirrors PC_STRIKES — novelty takes over)
+PANEL_ACTIONS = frozenset({1, 2, 3, 4, 6})
+                        # selector-panel macro signature: four cardinal inputs
+                        # plus click, with no extra verb or RESET
 SORT_MIN_TARGETS = 4    # equal-size hollow boxes in a horizontal run before the
                         # sequence-match head trusts a target row.  Round 6
                         # tighten: raised 3->4 — a 3-box row is a plausible
@@ -392,6 +395,281 @@ def background_of(grid: Grid) -> int:
     for row in grid:
         counts.update(row)
     return counts.most_common(1)[0][0]
+
+
+def panel_actor(
+    grid: Grid, expected_colors: Optional[tuple[int, int]] = None,
+) -> Optional[dict[str, Any]]:
+    """Find a compact two-colour body and a larger same-palette socket.
+
+    Both objects must be solid rectangles assembled from one 4-connected
+    component of each colour, lie away from HUD edges, and share one travel
+    lane.  The smaller rectangle is the movable body; the larger is its goal.
+    """
+    comps = components(grid)
+    rectangles: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for i, (c1_raw, cells1) in enumerate(comps):
+        c1 = int(c1_raw)
+        for c2_raw, cells2 in comps[i + 1:]:
+            c2 = int(c2_raw)
+            if c1 == c2:
+                continue
+            colors = tuple(sorted((c1, c2)))
+            if expected_colors is not None and colors != expected_colors:
+                continue
+            cells = cells1 | cells2
+            xs = [x for x, _y in cells]
+            ys = [y for _x, y in cells]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            width, height = x1 - x0 + 1, y1 - y0 + 1
+            if width * height != len(cells) or max(width, height) > 12:
+                continue
+            if x0 < HUD_BAND or y0 < HUD_BAND \
+                    or x1 >= GRID - HUD_BAND or y1 >= GRID - HUD_BAND:
+                continue
+            rectangles[colors].append({
+                "cells": cells,
+                "pixels": len(cells),
+                "bbox": (x0, y0, x1, y1),
+                "center": ((x0 + x1) / 2, (y0 + y1) / 2),
+            })
+
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for colors, rects in rectangles.items():
+        if len(rects) < 2:
+            continue
+        ordered = sorted(rects, key=lambda r: r["pixels"])
+        for mover in ordered:
+            for socket in reversed(ordered):
+                if socket["pixels"] <= mover["pixels"]:
+                    continue
+                mx, my = mover["center"]
+                sx, sy = socket["center"]
+                mx0, my0, mx1, my1 = mover["bbox"]
+                sx0, sy0, sx1, sy1 = socket["bbox"]
+                same_lane = not (mx1 < sx0 or sx1 < mx0) \
+                    or not (my1 < sy0 or sy1 < my0)
+                if not same_lane or mover["cells"] & socket["cells"]:
+                    continue
+                separation = abs(mx - sx) + abs(my - sy)
+                if separation <= 0:
+                    continue
+                out = {
+                    "colors": colors,
+                    "mover": mover,
+                    "socket": socket,
+                }
+                candidates.append((separation + socket["pixels"]
+                                   - mover["pixels"], out))
+                break
+    if len(candidates) != 1:
+        return None
+    return candidates[0][1]
+
+
+def panel_macro_setup(
+    grid: Grid, available_actions: set[int],
+) -> Optional[dict[str, Any]]:
+    """Detect a 3x3 value panel whose chosen class count matches a clue.
+
+    The clue is four identical smaller squares in a cardinal arrangement.
+    Exactly four of the nine panel cells must share one value.  A separate
+    compact two-colour body/socket pair makes the remote selector effect
+    observable and prevents a decorative 3x3 tiling from arming the macro.
+    """
+    if frozenset(available_actions) != PANEL_ACTIONS:
+        return None
+    comps = components(grid)
+    squares: list[dict[str, Any]] = []
+    for color_raw, cells in comps:
+        xs = [x for x, _y in cells]
+        ys = [y for _x, y in cells]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        width, height = x1 - x0 + 1, y1 - y0 + 1
+        if width != height or not 2 <= width <= 6 \
+                or len(cells) != width * height:
+            continue
+        squares.append({
+            "color": int(color_raw),
+            "cells": cells,
+            "side": width,
+            "center": ((x0 + x1) // 2, (y0 + y1) // 2),
+            "bbox": (x0, y0, x1, y1),
+        })
+
+    matches: list[dict[str, Any]] = []
+    for side in sorted({s["side"] for s in squares}):
+        group = [s for s in squares if s["side"] == side]
+        if len(group) < 9:
+            continue
+        by_center: dict[Cell, list[dict[str, Any]]] = defaultdict(list)
+        for square in group:
+            by_center[square["center"]].append(square)
+        xs = sorted({x for x, _y in by_center})
+        ys = sorted({y for _x, y in by_center})
+        x_triples = [
+            (x0, x1, 2 * x1 - x0)
+            for x0 in xs for x1 in xs
+            if x1 > x0 and x1 - x0 > side and 2 * x1 - x0 in xs
+        ]
+        y_triples = [
+            (y0, y1, 2 * y1 - y0)
+            for y0 in ys for y1 in ys
+            if y1 > y0 and y1 - y0 > side and 2 * y1 - y0 in ys
+        ]
+        for x3 in x_triples:
+            for y3 in y_triples:
+                positions = [(x, y) for y in y3 for x in x3]
+                if any(len(by_center[pos]) != 1 for pos in positions):
+                    continue
+                panel = [by_center[pos][0] for pos in positions]
+                values = Counter(s["color"] for s in panel)
+                if len(values) != 2 or sorted(values.values()) != [4, 5]:
+                    continue
+                target_values = [color for color, n in values.items() if n == 4]
+                if len(target_values) != 1:
+                    continue
+                target_value = target_values[0]
+                base_value = next(color for color, n in values.items() if n == 5)
+                target_centers = {
+                    s["center"] for s in panel if s["color"] == target_value
+                }
+                cardinal_panel = {
+                    (x3[1], y3[0]), (x3[0], y3[1]),
+                    (x3[2], y3[1]), (x3[1], y3[2]),
+                }
+                if target_centers != cardinal_panel:
+                    continue
+                px0 = min(s["bbox"][0] for s in panel)
+                py0 = min(s["bbox"][1] for s in panel)
+                px1 = max(s["bbox"][2] for s in panel)
+                py1 = max(s["bbox"][3] for s in panel)
+                panel_cells = frozenset().union(
+                    *(s["cells"] for s in panel))
+                panel_frames: list[tuple[int, frozenset[Cell]]] = []
+                for frame_color_raw, frame_cells in comps:
+                    frame_color = int(frame_color_raw)
+                    if frame_color in values:
+                        continue
+                    fxs = [x for x, _y in frame_cells]
+                    fys = [y for _x, y in frame_cells]
+                    fx0, fx1 = min(fxs), max(fxs)
+                    fy0, fy1 = min(fys), max(fys)
+                    if not (fx0 <= px0 and fy0 <= py0
+                            and fx1 >= px1 and fy1 >= py1):
+                        continue
+                    filled = frame_cells | panel_cells
+                    if len(filled) == (fx1 - fx0 + 1) * (fy1 - fy0 + 1):
+                        panel_frames.append((frame_color, frame_cells))
+                if len(panel_frames) != 1:
+                    continue
+                scaffold_color, panel_frame = panel_frames[0]
+
+                clue_groups: dict[tuple[int, int], list[dict[str, Any]]] = \
+                    defaultdict(list)
+                for square in squares:
+                    if square["side"] >= side or square in panel:
+                        continue
+                    bx0, by0, bx1, by1 = square["bbox"]
+                    if not (bx1 < px0 or bx0 > px1 or by1 < py0 or by0 > py1):
+                        continue
+                    clue_groups[(square["color"], square["side"])].append(square)
+                for (clue_color, clue_side), clues in clue_groups.items():
+                    if len(clues) != 4 or clue_color in values:
+                        continue
+                    cxs = sorted({s["center"][0] for s in clues})
+                    cys = sorted({s["center"][1] for s in clues})
+                    if len(cxs) != 3 or len(cys) != 3 \
+                            or cxs[1] - cxs[0] != cxs[2] - cxs[1] \
+                            or cys[1] - cys[0] != cys[2] - cys[1]:
+                        continue
+                    cardinal = {
+                        (cxs[1], cys[0]), (cxs[0], cys[1]),
+                        (cxs[2], cys[1]), (cxs[1], cys[2]),
+                    }
+                    if {s["center"] for s in clues} != cardinal:
+                        continue
+                    clue_cells = frozenset().union(
+                        *(s["cells"] for s in clues))
+                    card_frames = []
+                    for card_color_raw, card_cells in comps:
+                        if int(card_color_raw) != scaffold_color \
+                                or card_cells == panel_frame:
+                            continue
+                        xs_card = [x for x, _y in card_cells]
+                        ys_card = [y for _x, y in card_cells]
+                        cx0, cx1 = min(xs_card), max(xs_card)
+                        cy0, cy1 = min(ys_card), max(ys_card)
+                        width = cx1 - cx0 + 1
+                        height = cy1 - cy0 + 1
+                        if width != height or width < 3:
+                            continue
+                        if not all(cx0 < x < cx1 and cy0 < y < cy1
+                                   for x, y in clue_cells):
+                            continue
+                        perimeter = frozenset(
+                            (x, y) for y in range(cy0, cy1 + 1)
+                            for x in range(cx0, cx1 + 1)
+                            if x in (cx0, cx1) or y in (cy0, cy1)
+                        )
+                        if card_cells != perimeter:
+                            continue
+                        interior = {
+                            (x, y) for y in range(cy0 + 1, cy1)
+                            for x in range(cx0 + 1, cx1)
+                        }
+                        if any(grid[y][x] != (clue_color if (x, y) in clue_cells
+                                              else base_value)
+                               for x, y in interior):
+                            continue
+                        card_frames.append(card_cells)
+                    if len(card_frames) != 1:
+                        continue
+                    targets = sorted(
+                        (s["center"] for s in panel
+                         if s["color"] == target_value),
+                        key=lambda p: (p[1], p[0]),
+                    )
+                    clue_click = min(
+                        (s["center"] for s in clues), key=lambda p: (p[1], p[0]))
+                    matches.append({
+                        "clicks": [clue_click, *targets],
+                        "panel_bbox": (px0, py0, px1, py1),
+                        "clue_side": clue_side,
+                    })
+    if len(matches) != 1:
+        return None
+    actor = panel_actor(grid)
+    if actor is None:
+        return None
+    mx0, my0, mx1, my1 = actor["mover"]["bbox"]
+    sx0, sy0, sx1, sy1 = actor["socket"]["bbox"]
+    if not (my1 < sy0 or sy1 < my0) and sx1 < mx0:
+        drive = GameAction.ACTION3.value
+        direction = (-1, 0)
+    elif not (my1 < sy0 or sy1 < my0) and sx0 > mx1:
+        drive = GameAction.ACTION4.value
+        direction = (1, 0)
+    elif not (mx1 < sx0 or sx1 < mx0) and sy1 < my0:
+        drive = GameAction.ACTION1.value
+        direction = (0, -1)
+    elif not (mx1 < sx0 or sx1 < mx0) and sy0 > my1:
+        drive = GameAction.ACTION2.value
+        direction = (0, 1)
+    else:
+        return None
+    setup = matches[0]
+    setup.update({
+        "actor_colors": actor["colors"],
+        "actor_pixels": actor["mover"]["pixels"],
+        "goal_center": actor["socket"]["center"],
+        "goal_pixels": actor["socket"]["pixels"],
+        "drive": drive,
+        "direction": direction,
+    })
+    return setup
 
 
 def pixel_blobs(pixels: frozenset[Cell]) -> list[list[Cell]]:
@@ -705,6 +983,24 @@ class MyAgent(Agent):
         self._ov_strikes = 0
         self._ov_benched: Optional[int] = None
         self._ov_last_center: Optional[Cell] = None  # progress watchdog
+        # ── selector-panel macro: a clue mask chooses cells in a 3x3
+        # panel, remotely rescaling a two-colour mover for a same-palette
+        # socket.  Every field is per-level geography; no game id or screen
+        # coordinate is baked into the policy.
+        self._panel_level = -1
+        self._panel_clicks: deque[Cell] = deque()
+        self._panel_colors: Optional[tuple[int, int]] = None
+        self._panel_initial_pixels = 0
+        self._panel_mover_pixels = 0
+        self._panel_goal: Optional[tuple[float, float]] = None
+        self._panel_goal_pixels = 0
+        self._panel_drive: Optional[int] = None
+        self._panel_last_dist: Optional[float] = None
+        self._panel_last_center: Optional[tuple[float, float]] = None
+        self._panel_direction: Optional[Cell] = None
+        self._panel_steps = 0
+        self._panel_engaged = False
+        self._panel_benched: Optional[int] = None
         # ── editor model (tr87 family): cursor + in-place glyph cycling ──
         # verb classifications, marker votes, step deltas and probe spend
         # are physics (what an action DOES looks the same on every level);
@@ -929,6 +1225,12 @@ class MyAgent(Agent):
             self._ov_benched = None
             self._ov_last_center = None
             self._ov_idprobe = 0
+            # A death contradicts this deterministic macro.  Clear its
+            # in-flight clicks/drive and bench the same level so a rare
+            # false-positive cannot become a death loop.
+            if self._panel_engaged:
+                self._panel_benched = latest_frame.levels_completed
+            self._panel_clear(level=latest_frame.levels_completed)
             # the editor's level replays deterministically too: keep the
             # mutate boxes and goal candidates, give a benched run a fresh
             # life (strikes die with the budget that earned them)
@@ -1079,6 +1381,8 @@ class MyAgent(Agent):
             self._ov_benched = None
             self._ov_last_center = None
             self._ov_idprobe = 0
+            self._panel_clear(level=latest_frame.levels_completed)
+            self._panel_benched = None
             # switch geography: masks, phase patches, fall bans and probe
             # spend are positional level data (footprint passability — the
             # _stepped/_block signature stores — is appearance physics)
@@ -1171,6 +1475,7 @@ class MyAgent(Agent):
             self._wp_log.clear()
             self._wp_replay = None
             self._wp_pending_start = True
+            self._panel_clear(level=latest_frame.levels_completed)
         elif self._prev_action is not None:
             self._wp_log.append((key, self._prev_action))
         self._prev_grid = grid
@@ -2439,6 +2744,121 @@ class MyAgent(Agent):
             if self._pc_strikes >= PC_STRIKES:
                 self._pc_benched = level
                 return None
+        return None
+
+    # ── selector-panel macro: clue mask -> remote body -> socket ────
+    def _panel_clear(self, *, level: Optional[int] = None) -> None:
+        """Clear selector runtime state without changing its keyed bench."""
+        if level is not None:
+            self._panel_level = level
+        self._panel_clicks.clear()
+        self._panel_colors = None
+        self._panel_initial_pixels = 0
+        self._panel_mover_pixels = 0
+        self._panel_goal = None
+        self._panel_goal_pixels = 0
+        self._panel_drive = None
+        self._panel_last_dist = None
+        self._panel_last_center = None
+        self._panel_direction = None
+        self._panel_steps = 0
+        self._panel_engaged = False
+
+    def _panel_fail(self, level: int) -> None:
+        self._panel_clear(level=level)
+        self._panel_benched = level
+
+    def _panel_policy(
+        self, grid: Optional[Grid], latest_frame: FrameData,
+    ) -> Optional[GameAction]:
+        """Execute a structurally proved clue/panel/remote-mover macro.
+
+        The standard cardinal action is chosen from body/socket geometry.
+        Every repeat must then re-prove a one-axis step with the same sign and
+        lower distance, so the macro cannot continue on stale geometry.
+        """
+        if grid is None:
+            return None
+        level = latest_frame.levels_completed
+        if self._panel_level != level:
+            self._panel_clear(level=level)
+            if self._panel_benched != level:
+                self._panel_benched = None
+        if self._panel_benched == level:
+            return None
+        avail = set(latest_frame.available_actions or [])
+        if frozenset(avail) != PANEL_ACTIONS:
+            if self._panel_engaged:
+                self._panel_fail(level)
+            return None
+
+        if not self._panel_engaged:
+            setup = panel_macro_setup(grid, avail)
+            if setup is None:
+                return None
+            self._panel_engaged = True
+            self._panel_clicks = deque(setup["clicks"])
+            self._panel_colors = setup["actor_colors"]
+            self._panel_initial_pixels = setup["actor_pixels"]
+            self._panel_goal = setup["goal_center"]
+            self._panel_goal_pixels = setup["goal_pixels"]
+            self._panel_drive = setup["drive"]
+            self._panel_direction = setup["direction"]
+
+        if self._panel_clicks:
+            x, y = self._panel_clicks.popleft()
+            action = GameAction.ACTION6
+            action.set_data({"x": x, "y": y})
+            action.reasoning = {"why": f"selector-panel cell {(x, y)}"}
+            self._prev_action = f"6:{x},{y}"
+            return action
+
+        if self._panel_colors is None or self._panel_goal is None:
+            self._panel_fail(level)
+            return None
+        actor = panel_actor(grid, self._panel_colors)
+        if actor is None \
+                or actor["socket"]["center"] != self._panel_goal \
+                or actor["socket"]["pixels"] != self._panel_goal_pixels:
+            self._panel_fail(level)
+            return None
+        mover = actor["mover"]
+        pixels = mover["pixels"]
+        if self._panel_mover_pixels == 0:
+            if pixels >= self._panel_initial_pixels:
+                self._panel_fail(level)
+                return None
+            self._panel_mover_pixels = pixels
+        elif pixels != self._panel_mover_pixels:
+            self._panel_fail(level)
+            return None
+
+        center = mover["center"]
+        gx, gy = self._panel_goal
+        dist = abs(center[0] - gx) + abs(center[1] - gy)
+        if self._panel_drive is not None:
+            if self._panel_drive not in avail or self._panel_steps >= 32:
+                self._panel_fail(level)
+                return None
+            if self._panel_last_center is not None \
+                    and self._panel_last_dist is not None:
+                dx = center[0] - self._panel_last_center[0]
+                dy = center[1] - self._panel_last_center[1]
+                direction = (
+                    0 if dx == 0 else (1 if dx > 0 else -1),
+                    0 if dy == 0 else (1 if dy > 0 else -1),
+                )
+                if (dx == 0) == (dy == 0) \
+                        or direction != self._panel_direction \
+                        or dist >= self._panel_last_dist:
+                    self._panel_fail(level)
+                    return None
+            self._panel_last_center = center
+            self._panel_last_dist = dist
+            self._panel_steps += 1
+            return self._step(GameAction.from_id(self._panel_drive))
+
+        self._panel_fail(level)
         return None
 
     # ── overlay-align head (re86 family): cover static goal anchors ────────
@@ -4054,6 +4474,15 @@ class MyAgent(Agent):
             lattice = self._lattice_policy(grid, latest_frame)
             if lattice is not None:
                 return lattice
+            # Clue-to-selector macro: exact {1,2,3,4,6} action profile + a
+            # framed 3x3 value lattice + a matching framed clue mask + a
+            # remote compact body and larger same-palette socket.  Standard
+            # cardinal input follows their geometry; every repeat revalidates
+            # motion toward the socket.  The compound gate is absent from
+            # ordinary click/movement games, so this runs before warmup.
+            panel = self._panel_policy(grid, latest_frame)
+            if panel is not None:
+                return panel
             # directional node-maze solver (tu93 family).  Dispatched BEFORE
             # the editor: both share the [1,2,3,4] action set, but the slide
             # gate is far stricter (a clean binary corridor/wall lattice + a

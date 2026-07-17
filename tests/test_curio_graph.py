@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -136,6 +136,102 @@ class SlideLethalEdgeTests(unittest.TestCase):
 
         self.assertIsNone(agent._slide_policy([], frame))
         self.assertEqual(agent._sl_benched, 2)
+
+
+class HudIdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.agent_class = load_agent_class()
+
+    def _agent(self, graph: bool = False):
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._frames_diffed = 32
+        agent._band_frames = defaultdict(int)
+        agent._hud_mask = frozenset()
+        agent._hud_identity_ready = False
+        agent._transitions = {(10, "1"): 11}
+        agent._tried = defaultdict(set, {10: {"1"}})
+        agent._state_visits = Counter({10: 2})
+        agent._steps_since_novelty = 9
+        agent._gx_on = graph
+        agent._click_effects = {77: [1, 2]}
+        agent._move_votes = defaultdict(Counter, {1: Counter({(1, 0): 3})})
+        if graph:
+            agent._gx_nodes = {10: {"actions": ["1"]}}
+            agent._gx_route = deque(["1"])
+            agent._gx_route_dest = 11
+            agent._gx_start = 10
+            agent._gx_pending_reset = (10, "1")
+        return agent
+
+    def test_hud_free_identity_is_ready_at_first_recompute(self) -> None:
+        agent = self._agent()
+
+        self.assertFalse(agent._recompute_hud_mask())
+        self.assertTrue(agent._hud_identity_ready)
+        self.assertEqual(agent._transitions, {(10, "1"): 11})
+
+    def test_nonempty_mask_requires_two_identical_candidates(self) -> None:
+        agent = self._agent()
+        agent._band_frames[(0, 0)] = (1 << 32) - 1
+
+        self.assertTrue(agent._recompute_hud_mask())
+        self.assertEqual(agent._hud_mask, frozenset({(0, 0)}))
+        self.assertFalse(agent._hud_identity_ready)
+
+        self.assertFalse(agent._recompute_hud_mask())
+        self.assertTrue(agent._hud_identity_ready)
+
+    def test_mask_change_invalidates_only_keyed_geography(self) -> None:
+        agent = self._agent(graph=True)
+        agent._band_frames[(0, 0)] = (1 << 32) - 1
+
+        agent._recompute_hud_mask()
+
+        self.assertEqual(agent._transitions, {})
+        self.assertEqual(agent._tried, {})
+        self.assertEqual(agent._state_visits, Counter())
+        self.assertEqual(agent._gx_nodes, {})
+        self.assertEqual(list(agent._gx_route), [])
+        self.assertIsNone(agent._gx_route_dest)
+        self.assertIsNone(agent._gx_start)
+        self.assertIsNone(agent._gx_pending_reset)
+        self.assertEqual(agent._click_effects, {77: [1, 2]})
+        self.assertEqual(agent._move_votes[1][(1, 0)], 3)
+
+    def test_level_repaint_neither_updates_hud_nor_records_edge(self) -> None:
+        agent = self._agent()
+        agent._last_move = None
+        agent._prev_grid = [[0]]
+        agent._prev_action = "1"
+        agent._prev_key = 10
+        agent._plan = deque(["stale"])
+        agent._update_hud_mask = lambda _grid: self.fail("HUD observed level repaint")
+
+        agent._learn([[1]], leveled=True)
+
+        self.assertEqual(agent._transitions, {(10, "1"): 11})
+        self.assertEqual(list(agent._plan), [])
+
+    def test_first_edge_after_mask_change_rehashes_source(self) -> None:
+        agent = self._agent()
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        agent._last_move = None
+        agent._prev_grid = grid
+        agent._prev_action = "probe"
+        agent._prev_key = 12345
+        agent._hud_mask = frozenset({(0, 0)})
+        agent._plan = deque()
+        agent._update_hud_mask = lambda _grid: True
+        agent._transitions.clear()
+        agent._tried.clear()
+        expected = agent._masked_hash(grid)
+
+        agent._learn(grid)
+
+        self.assertEqual(agent._transitions, {(expected, "probe"): expected})
+        self.assertEqual(agent._tried[expected], {"probe"})
+        self.assertNotIn((12345, "probe"), agent._transitions)
 
 
 if __name__ == "__main__":

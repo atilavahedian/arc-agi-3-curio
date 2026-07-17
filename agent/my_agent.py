@@ -818,6 +818,10 @@ class MyAgent(Agent):
         self._band_frames: dict[Cell, int] = defaultdict(int)  # cell → frame bitmask
         self._frames_diffed = 0
         self._hud_mask: frozenset[Cell] = frozenset()
+        # Graph hashes are safe only after one empty HUD observation or two
+        # consecutive identical non-empty mask candidates.  A later mask
+        # change invalidates all state keyed under the old identity epoch.
+        self._hud_identity_ready = False
 
     # ── framework contract ───────────────────────────────────────────────
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -1012,6 +1016,7 @@ class MyAgent(Agent):
             self._walls.clear()
             self._wall_bounces.clear()
             self._visited_anchors.clear()
+            self._transitions.clear()
             self._tried.clear()
             self._state_visits.clear()
             self._plan.clear()
@@ -1024,6 +1029,7 @@ class MyAgent(Agent):
                 self._gx_route_dest = None
                 self._gx_resets = 0
                 self._gx_start = None
+                self._gx_pending_reset = None
             # lattice geography: the palette and board are level data
             self._palette_next.clear()
             self._site_dead.clear()
@@ -1168,6 +1174,11 @@ class MyAgent(Agent):
         self._last_move = None  # this frame's clean translation, if any
         if self._prev_grid is None or grid is None or self._prev_action is None:
             return
+        if leveled:
+            # A level repaint is not action physics and must not train the HUD
+            # detector or create a traversable old-level -> new-level edge.
+            self._plan.clear()
+            return
         if flood_color(grid) != flood_color(self._prev_grid):
             # a color flooding in (death flash) or receding (respawn, level
             # redraw) makes this diff garbage — drop the plan, learn nothing.
@@ -1175,10 +1186,16 @@ class MyAgent(Agent):
             # background, so a bare flood check would disable learning there)
             self._plan.clear()
             return
-        self._update_hud_mask(grid)  # before the isdigit() gate: clicks feed it too
+        identity_changed = self._update_hud_mask(grid)
         if self._prev_key is not None:
-            self._transitions[(self._prev_key, self._prev_action)] = \
+            # A mask change alters the hash function.  Re-key the source under
+            # the new mask before recording this first edge of the new epoch.
+            source = (self._masked_hash(self._prev_grid)
+                      if identity_changed else self._prev_key)
+            self._transitions[(source, self._prev_action)] = \
                 self._masked_hash(grid)
+            if identity_changed:
+                self._tried[source].add(self._prev_action)
         if not self._prev_action.isdigit():
             if self._prev_action.startswith("6:"):
                 # AFFORD: log whether clicking this sprite class did anything
@@ -3252,7 +3269,7 @@ class MyAgent(Agent):
         known = set(self._palette_next) | set(self._palette_next.values())
         return ring if set(ring) == known else None
 
-    def _update_hud_mask(self, grid: Grid) -> None:
+    def _update_hud_mask(self, grid: Grid) -> bool:
         """Track cell change rates; mask high-churn border strips (HUD chrome).
 
         HUDs (step bars, pips, timers) repaint near the frame edge on almost
@@ -3260,9 +3277,14 @@ class MyAgent(Agent):
         novel.  The band restriction is the safety property: gameplay in the
         board interior can never be masked.  The mask FREEZES after
         HUD_FREEZE diffed frames so state keys stop churning mid-run.
+
+        Returns True when the mask changed and hash-keyed state was
+        invalidated.  At HUD_FREEZE the latest candidate becomes final and
+        identity is unconditionally safe to use.
         """
         if self._frames_diffed >= HUD_FREEZE:
-            return
+            self._hud_identity_ready = True
+            return False
         bit = 1 << self._frames_diffed
         for y in range(GRID):
             prow, row = self._prev_grid[y], grid[y]
@@ -3274,11 +3296,15 @@ class MyAgent(Agent):
                                 or y < HUD_BAND or y >= GRID - HUD_BAND:
                             self._band_frames[(x, y)] |= bit
         self._frames_diffed += 1
+        changed = False
         if self._frames_diffed >= HUD_WARMUP \
                 and self._frames_diffed % HUD_RECOMPUTE == 0:
-            self._recompute_hud_mask()
+            changed = self._recompute_hud_mask()
+        if self._frames_diffed >= HUD_FREEZE:
+            self._hud_identity_ready = True
+        return changed
 
-    def _recompute_hud_mask(self) -> None:
+    def _recompute_hud_mask(self) -> bool:
         """Mask contiguous border-band runs whose churn rate exceeds HUD_RATE.
 
         Step bars SWEEP: each cell flips only ~twice per life, but some cell
@@ -3314,7 +3340,34 @@ class MyAgent(Agent):
                             masked.update(cells)
                         run = []
                     run.append(p)
-        self._hud_mask = frozenset(masked)
+        candidate = frozenset(masked)
+        changed = candidate != self._hud_mask
+        if changed:
+            self._hud_mask = candidate
+            self._hud_identity_ready = False
+            self._invalidate_hud_identity()
+        else:
+            # Empty on the first recomputation means a HUD-free game; a
+            # non-empty candidate reaches here only after repeating unchanged.
+            self._hud_identity_ready = True
+        return changed
+
+    def _invalidate_hud_identity(self) -> None:
+        """Drop geography keyed under a superseded HUD mask.
+
+        Physics memories (movement votes, affordances, lethal classes, etc.)
+        intentionally survive; only rendered-state identities are stale.
+        """
+        self._transitions.clear()
+        self._tried.clear()
+        self._state_visits.clear()
+        self._steps_since_novelty = 0
+        if self._gx_on:
+            self._gx_nodes.clear()
+            self._gx_route.clear()
+            self._gx_route_dest = None
+            self._gx_start = None
+            self._gx_pending_reset = None
 
     def _masked_hash(self, grid: Optional[Grid]) -> int:
         """grid_hash with HUD cells zeroed; plain grid_hash while mask is empty."""
@@ -5813,9 +5866,9 @@ class MyAgent(Agent):
         level start; if even that is spent, defer to the v7 revisit-ranker."""
         key = self._masked_hash(grid)
         avail = set(latest_frame.available_actions or [])
-        # the HUD mask must be frozen for node identities to be stable;
-        # before that, defer to legacy novelty to avoid phantom edges
-        if self._frames_diffed < HUD_FREEZE and not self._hud_mask:
+        # Arm only after the identity epoch is stable: HUD-free games need one
+        # observation; HUD games need the same non-empty candidate twice.
+        if not self._hud_identity_ready:
             return self._novelty_body(grid, latest_frame)
         node = self._gx_node(key, grid, avail)
         if not node["actions"]:

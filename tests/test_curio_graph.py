@@ -58,6 +58,215 @@ class GraphResetEdgeTests(unittest.TestCase):
         self.assertEqual(agent._transitions, {(1, "2"): 3})
         self.assertEqual(agent._tried[1], {"2"})
 
+    @staticmethod
+    def _node(*actions: str) -> dict:
+        optmap = {
+            akey: (akey, GameAction.from_id(int(akey)), None)
+            for akey in actions
+        }
+        return {
+            "actions": list(actions),
+            "salience": {akey: 0 for akey in actions},
+            "optmap": optmap,
+            "sig": {},
+            "instance_sigs": set(),
+        }
+
+    def _policy_agent(self):
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._hud_identity_ready = True
+        agent._gx_nodes = {
+            10: self._node("1"),
+            20: self._node("2"),
+            30: self._node("7"),
+        }
+        agent._gx_route = deque()
+        agent._gx_route_dest = None
+        agent._gx_start = 10
+        agent._gx_resets = 0
+        agent._gx_pending_reset = None
+        agent._gx_lethal_edges = set()
+        agent._gx_instance_effects = {}
+        agent._gx_lethal_sig = set()
+        agent._click_effects = {}
+        agent._transitions = {(10, "1"): 20}
+        agent._tried = defaultdict(set, {10: {"1"}, 30: {"7"}})
+        agent._steps_since_novelty = 0
+        agent._masked_hash = lambda _grid: 30
+        return agent
+
+    def test_reset_reopens_remote_frontier_from_exhausted_start(self) -> None:
+        agent = self._policy_agent()
+        reset_stall = agent._gx_bfs.__globals__["GX_RESET_STALL"]
+        agent._steps_since_novelty = reset_stall + 1
+        frame = SimpleNamespace(
+            available_actions=[GameAction.ACTION7.value]
+        )
+
+        action = agent._graph_explore_policy([[0]], frame)
+
+        self.assertIs(action, GameAction.RESET)
+        self.assertEqual(agent._gx_resets, 1)
+        self.assertEqual(agent._gx_pending_reset, (30, "0"))
+
+    def test_remote_frontier_waits_for_a_real_stall_before_reset(self) -> None:
+        agent = self._policy_agent()
+        agent._gx_safe_novelty_body = lambda _grid, _frame: GameAction.ACTION7
+        frame = SimpleNamespace(available_actions=[GameAction.ACTION7.value])
+
+        action = agent._graph_explore_policy([[0]], frame)
+
+        self.assertIs(action, GameAction.ACTION7)
+        self.assertEqual(agent._gx_resets, 0)
+        self.assertIsNone(agent._gx_pending_reset)
+
+    def test_no_reset_when_start_reachable_graph_is_exhausted(self) -> None:
+        agent = self._policy_agent()
+        agent._tried[20].add("2")
+        agent._gx_safe_novelty_body = lambda _grid, _frame: GameAction.ACTION7
+        frame = SimpleNamespace(
+            available_actions=[GameAction.ACTION7.value]
+        )
+
+        action = agent._graph_explore_policy([[0]], frame)
+
+        self.assertIs(action, GameAction.ACTION7)
+        self.assertEqual(agent._gx_resets, 0)
+        self.assertIsNone(agent._gx_pending_reset)
+
+    def test_bfs_uses_longer_safe_route_instead_of_fatal_edge(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._gx_nodes = {
+            10: self._node("1", "2"),
+            11: self._node("3"),
+            20: self._node("4"),
+        }
+        agent._transitions = {
+            (10, "1"): 20,
+            (10, "2"): 11,
+            (11, "3"): 20,
+        }
+        agent._gx_lethal_edges = {(10, "1")}
+        agent._gx_instance_effects = {}
+        agent._gx_lethal_sig = set()
+        agent._click_effects = {}
+        agent._tried = defaultdict(
+            set, {10: {"1", "2"}, 11: {"3"}})
+
+        self.assertEqual(agent._gx_bfs(10), (["2", "3"], 20))
+
+    def test_graph_safe_fallback_filters_exact_fatal_actions(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._masked_hash = lambda _grid: 10
+        agent._click_targets = lambda _grid: [(2, 3)]
+        agent._gx_fallback_targets = lambda _grid: [(2, 3)]
+        agent._gx_lethal_edges = {(10, "1"), (10, "6:2,3")}
+        agent._tried = defaultdict(set)
+        agent._game_overs = 0
+        agent._click_effects = {}
+        agent._steps_since_novelty = 0
+        agent._use_balance = lambda options: options
+        agent._prev_action = None
+        agent._gx_start = 99
+        agent._gx_resets = 0
+        agent._gx_route = deque()
+        agent._gx_route_dest = None
+        agent._gx_pending_reset = None
+        frame = SimpleNamespace(available_actions=[1, 2, 6])
+
+        action = agent._novelty_policy_impl(
+            [[0]], frame, graph_safe=True)
+
+        self.assertIs(action, GameAction.ACTION2)
+        self.assertEqual(agent._prev_action, "2")
+
+        agent._gx_lethal_edges.add((10, "2"))
+        action = agent._novelty_policy_impl(
+            [[0]], frame, graph_safe=True)
+        self.assertIs(action, GameAction.RESET)
+        self.assertEqual(agent._prev_action, "0")
+        self.assertEqual(agent._gx_resets, 1)
+        self.assertEqual(agent._gx_pending_reset, (10, "0"))
+        self.assertIn("0", agent._tried[10])
+
+        reset_cap = agent._gx_bfs.__globals__["GX_RESET_CAP"]
+        agent._gx_resets = reset_cap
+        agent._gx_pending_reset = None
+        action = agent._novelty_policy_impl(
+            [[0]], frame, graph_safe=True)
+        self.assertIsNot(action, GameAction.RESET)
+        self.assertIsNone(agent._gx_pending_reset)
+
+    def test_repeated_game_over_confirms_exact_edge_and_retains_it(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="fatal-edge-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        agent._prev_grid = grid
+        agent._prev_key = 123
+        agent._prev_action = "2"
+        agent._gx_route = deque(["2"])
+        agent._gx_route_dest = 456
+        dead = FrameData(
+            frame=[grid],
+            state=GameState.GAME_OVER,
+            levels_completed=0,
+            available_actions=[GameAction.RESET.value],
+        )
+
+        self.assertIs(agent.choose_action([], dead), GameAction.RESET)
+        self.assertEqual(agent._gx_lethal_edge_hits[(123, "2")], 1)
+        self.assertEqual(agent._gx_lethal_edges, set())
+        self.assertEqual(list(agent._gx_route), ["2"])
+        self.assertEqual(agent._gx_route_dest, 456)
+
+        agent._policy = lambda _grid, _frame: GameAction.ACTION1
+        alive = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=0,
+            available_actions=[GameAction.ACTION1.value],
+        )
+        agent.choose_action([], alive)
+
+        self.assertEqual(agent._gx_lethal_edges, set())
+        self.assertIsNone(agent._gx_pending_reset)
+        self.assertEqual(
+            agent._transitions[(123, "2")], agent._gx_start)
+        self.assertIn("2", agent._tried[123])
+
+        edge_threshold = agent._gx_bfs.__globals__["GX_EDGE_LETHAL_HITS"]
+        agent._gx_lethal_edge_hits[(123, "2")] = edge_threshold - 1
+        agent._prev_grid = grid
+        agent._prev_key = 123
+        agent._prev_action = "2"
+        self.assertIs(agent.choose_action([], dead), GameAction.RESET)
+        self.assertEqual(
+            agent._gx_lethal_edge_hits[(123, "2")], edge_threshold)
+        self.assertEqual(agent._gx_lethal_edges, {(123, "2")})
+        self.assertEqual(list(agent._gx_route), [])
+        self.assertIsNone(agent._gx_route_dest)
+
+        agent.choose_action([], alive)
+        self.assertEqual(agent._gx_lethal_edges, {(123, "2")})
+        self.assertIsNone(agent._gx_pending_reset)
+
+        leveled = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            levels_completed=1,
+            available_actions=[GameAction.ACTION1.value],
+        )
+        agent.choose_action([], leveled)
+        self.assertEqual(agent._gx_lethal_edges, set())
+        self.assertEqual(agent._gx_lethal_edge_hits, Counter())
+
 
 class SlideLethalEdgeTests(unittest.TestCase):
     @classmethod
@@ -166,6 +375,8 @@ class HudIdentityTests(unittest.TestCase):
             agent._gx_route_dest = 11
             agent._gx_start = 10
             agent._gx_pending_reset = (10, "1")
+            agent._gx_lethal_edges = {(10, "1")}
+            agent._gx_lethal_edge_hits = Counter({(10, "1"): 2})
         return agent
 
     def test_hud_free_identity_is_ready_at_first_recompute(self) -> None:
@@ -200,6 +411,8 @@ class HudIdentityTests(unittest.TestCase):
         self.assertIsNone(agent._gx_route_dest)
         self.assertIsNone(agent._gx_start)
         self.assertIsNone(agent._gx_pending_reset)
+        self.assertEqual(agent._gx_lethal_edges, set())
+        self.assertEqual(agent._gx_lethal_edge_hits, Counter())
         self.assertEqual(agent._click_effects, {77: [1, 2]})
         self.assertEqual(agent._move_votes[1][(1, 0)], 3)
 
@@ -408,7 +621,7 @@ class ClickInstanceTests(unittest.TestCase):
 
         self.assertEqual(agent._gx_instance_effects, {})
 
-    def test_lethal_only_board_falls_back_to_reset_not_click(self) -> None:
+    def test_lethal_only_remote_board_uses_tracked_reset(self) -> None:
         with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
             agent = self.agent_class(
                 card_id="test",
@@ -424,6 +637,7 @@ class ClickInstanceTests(unittest.TestCase):
             1, frozenset({(9, 5)}))
         agent._gx_lethal_sig.add(sig)
         agent._hud_identity_ready = True
+        agent._gx_start = 999
         frame = FrameData(
             frame=[grid],
             state=GameState.NOT_FINISHED,
@@ -434,6 +648,40 @@ class ClickInstanceTests(unittest.TestCase):
 
         self.assertIs(action, GameAction.RESET)
         self.assertEqual(agent._prev_action, "0")
+        self.assertEqual(agent._gx_resets, 1)
+        self.assertEqual(
+            agent._gx_pending_reset,
+            (agent._masked_hash(grid), "0"),
+        )
+
+    def test_lethal_only_start_does_not_enter_reset_loop(self) -> None:
+        with patch.dict(os.environ, {"CURIO_EXPLORER": "graph"}):
+            agent = self.agent_class(
+                card_id="test",
+                game_id="click-test",
+                agent_name="curio",
+                ROOT_URL="",
+                record=False,
+                arc_env=None,
+            )
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[5][9] = 1
+        sig = agent._gx_instance_key.__globals__["shape_signature"](
+            1, frozenset({(9, 5)}))
+        agent._gx_lethal_sig.add(sig)
+        agent._hud_identity_ready = True
+        agent._gx_start = agent._masked_hash(grid)
+        frame = FrameData(
+            frame=[grid],
+            state=GameState.NOT_FINISHED,
+            available_actions=[GameAction.ACTION6.value],
+        )
+
+        action = agent._graph_explore_policy(grid, frame)
+
+        self.assertIs(action, GameAction.ACTION6)
+        self.assertEqual(agent._gx_resets, 0)
+        self.assertIsNone(agent._gx_pending_reset)
 
 
 if __name__ == "__main__":

@@ -136,6 +136,9 @@ LATTICE_BFS_CAP = 6000  # BFS state budget for neighborhood-mask boards
 GX_RESET_CAP = 4        # graph-explorer RESET-backtracks per level before it
                         # defers to novelty (analog of LATTICE_DEATH_CAP:
                         # bounds wasted opening re-walks; tuned on HELD-18)
+GX_RESET_STALL = 256   # prolonged state-graph stall before branch RESET;
+                        # RESET replays an opening, so require a much stronger
+                        # stall than ordinary random tie-breaking
 GX_LETHAL_HITS = 2      # deaths on the SAME click-class before the graph
                         # explorer bans it (avoids one-off coincident-hazard
                         # false positives, and gives the affordance library a
@@ -144,6 +147,8 @@ GX_LETHAL_HITS = 2      # deaths on the SAME click-class before the graph
                         # ban fires; HITS=1 measured worse: 0.0296 vs 0.0391 —
                         # premature bans on un-probed productive classes;
                         # appearance physics, persists)
+GX_EDGE_LETHAL_HITS = 4 # identical rendered-state/action deaths required
+                        # before an edge is treated as deterministically fatal
 ATTR_BBOX = 16          # attribute-register bbox cap (px): a HUD glyph box
                         # is compact; death repaints (lives pips + restored
                         # rings + glyph reset together) span the frame and
@@ -3130,6 +3135,12 @@ class MyAgent(Agent):
             # (state, action-key) the explorer just issued as a RESET-inducing
             # action; confirmed and turned into a start edge on the next start
             self._gx_pending_reset: Optional[tuple[int, str]] = None
+            # Exact state/action edges that ended a life on this level.  The
+            # transition to the start is still useful causal evidence, but it
+            # must never be traversed as an ordinary graph route or replayed
+            # by the legacy fallback.
+            self._gx_lethal_edges: set[tuple[int, str]] = set()
+            self._gx_lethal_edge_hits: Counter[tuple[int, str]] = Counter()
             # Per-level, per-instance click evidence.  Global class evidence
             # remains a soft ranking prior; negative evidence can only hard-
             # suppress the exact instance that earned it on this level.
@@ -3545,6 +3556,21 @@ class MyAgent(Agent):
                 if self._gx_on and self._prev_key is not None \
                         and self._prev_action is not None \
                         and self._gx_pending_reset is None:
+                    # A GAME_OVER transition is evidence of a teleport to the
+                    # level start, not a safe route.  Remember the exact edge
+                    # before the start frame arrives so neither BFS nor the
+                    # graph-safe fallback can deliberately repeat it.
+                    lethal_edge = (self._prev_key, self._prev_action)
+                    self._gx_lethal_edge_hits[lethal_edge] += 1
+                    # A single death can be caused by a timer or concurrent
+                    # hazard rather than the final action.  Require the same
+                    # rendered-state/action death repeatedly before declaring
+                    # the edge causal and non-traversable.
+                    if self._gx_lethal_edge_hits[lethal_edge] \
+                            >= GX_EDGE_LETHAL_HITS:
+                        self._gx_lethal_edges.add(lethal_edge)
+                        self._gx_route.clear()
+                        self._gx_route_dest = None
                     # CORRECT-RESET DETECTION: a death IS a reset-inducing
                     # event — the action that caused it teleports to the level
                     # start.  Stash it; the start edge is recorded on the next
@@ -3755,6 +3781,8 @@ class MyAgent(Agent):
                 self._gx_resets = 0
                 self._gx_start = None
                 self._gx_pending_reset = None
+                self._gx_lethal_edges.clear()
+                self._gx_lethal_edge_hits.clear()
             # lattice geography: the palette and board are level data
             self._palette_next.clear()
             self._site_dead.clear()
@@ -8057,6 +8085,8 @@ class MyAgent(Agent):
             self._gx_route_dest = None
             self._gx_start = None
             self._gx_pending_reset = None
+            self._gx_lethal_edges.clear()
+            self._gx_lethal_edge_hits.clear()
 
     def _masked_hash(self, grid: Optional[Grid]) -> int:
         """grid_hash with HUD cells zeroed; plain grid_hash while mask is empty."""
@@ -10669,7 +10699,11 @@ class MyAgent(Agent):
         # and turns the per-expansion edge scan into an O(1) dict lookup
         adj: dict[int, list[str]] = defaultdict(list)
         for (s, akey), dest in self._transitions.items():
-            if s in self._gx_nodes:
+            # Death edges and explicit RESET teleports are not ordinary
+            # traversable actions.  RESET has its own bounded policy below;
+            # fatal non-RESET actions must never be replayed as route steps.
+            if s in self._gx_nodes and akey != "0" \
+                    and (s, akey) not in self._gx_lethal_edges:
                 adj[s].append(akey)
         for s in adj:
             adj[s].sort()                        # deterministic expansion order
@@ -10710,6 +10744,18 @@ class MyAgent(Agent):
         else:
             action.reasoning = {"why": f"graph-explore action {action.value}"}
         self._prev_action = akey
+        return action
+
+    def _gx_emit_reset(self, key: int, why: str) -> GameAction:
+        """Emit one budgeted graph RESET with complete edge bookkeeping."""
+        self._gx_resets += 1
+        self._gx_route.clear()
+        self._gx_route_dest = None
+        self._tried[key].add("0")
+        self._gx_pending_reset = (key, "0")
+        action = GameAction.RESET
+        action.reasoning = {"why": why}
+        self._prev_action = "0"
         return action
 
     def _graph_explore_policy(
@@ -10774,22 +10820,24 @@ class MyAgent(Agent):
         # a known node instead of wandering by 1-step lookahead.  RESET is
         # only worthwhile when we are NOT already at the start and the start
         # node still has frontier to reach.
-        if avail and GameAction.RESET.value in avail \
+        # RESET is globally legal in ArcEngine but official environments do
+        # not advertise action 0 in ``available_actions``.  Therefore this
+        # gate must use active-state context, not membership in ``avail``.
+        if self._steps_since_novelty > GX_RESET_STALL \
                 and self._gx_start is not None and key != self._gx_start \
                 and self._gx_resets < GX_RESET_CAP:
             start_node = self._gx_nodes.get(self._gx_start)
-            start_has_frontier = start_node is None or bool(
+            # The start itself may be exhausted while a previously observed
+            # safe edge from it leads to an unfinished branch.  Search the
+            # entire start-reachable component before deciding RESET has no
+            # value; an unseen start node is itself fresh frontier.
+            start_local = start_node is None or bool(
                 self._gx_untried(self._gx_start, start_node))
-            if start_has_frontier:
-                self._gx_resets += 1
-                self._gx_route.clear()
-                self._gx_route_dest = None
-                self._tried[key].add("0")        # this RESET edge is spent
-                self._gx_pending_reset = (key, "0")
-                action = GameAction.RESET
-                action.reasoning = {"why": "graph-explore RESET-backtrack"}
-                self._prev_action = "0"
-                return action
+            start_remote = not start_local \
+                and self._gx_bfs(self._gx_start) is not None
+            if start_local or start_remote:
+                return self._gx_emit_reset(
+                    key, "graph-explore RESET-backtrack")
 
         # 5. Graph genuinely exhausted (or RESET unavailable / capped):
         # defer to the v7 revisit-ranker so behavior degrades gracefully.
@@ -10941,18 +10989,45 @@ class MyAgent(Agent):
         key = self._masked_hash(grid)
         avail = set(latest_frame.available_actions or [])
         options: list[tuple[str, GameAction, Optional[Cell]]] = []
+        unfiltered: list[tuple[str, GameAction, Optional[Cell]]] = []
         for action in GameAction:
             if action is GameAction.RESET:
                 continue
             if avail and action.value not in avail:
                 continue
             if action.is_complex():
+                raw_targets = self._click_targets(grid)
                 targets = (self._gx_fallback_targets(grid) if graph_safe
-                           else self._click_targets(grid))
+                           else raw_targets)
                 for x, y in targets:
                     options.append((f"6:{x},{y}", action, (x, y)))
+                for x, y in raw_targets:
+                    unfiltered.append((
+                        f"6:{x},{y}", action, (x, y)))
             else:
-                options.append((str(action.value), action, None))
+                opt = (str(action.value), action, None)
+                options.append(opt)
+                unfiltered.append(opt)
+        if graph_safe:
+            # Per-class click priors cannot express contextual hazards and
+            # say nothing about fatal simple actions.  Exact lethal edges are
+            # authoritative for this rendered state and must stay unavailable
+            # even after the graph frontier is exhausted.
+            options = [
+                opt for opt in options
+                if (key, opt[0]) not in self._gx_lethal_edges
+            ]
+            if not options and unfiltered:
+                # A remote exact state whose every known action proved fatal
+                # can still escape to the level start.  Use the same bounded
+                # RESET path and bookkeeping as graph backtracking.  At the
+                # start itself (or after the cap), restore the legacy choices
+                # instead of entering a no-progress RESET loop.
+                if self._gx_start is not None and key != self._gx_start \
+                        and self._gx_resets < GX_RESET_CAP:
+                    return self._gx_emit_reset(
+                        key, "graph-explore escape lethal state")
+                options = unfiltered
         if not options:
             self._prev_action = "0"
             return GameAction.RESET

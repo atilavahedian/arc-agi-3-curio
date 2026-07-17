@@ -7,6 +7,7 @@ import sys
 import unittest
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +112,30 @@ class SlideLethalEdgeTests(unittest.TestCase):
 
         self.assertEqual(agent._sl_blocked_edges, {((1, 1), 4)})
         self.assertIsNone(agent._sl_route(grid, (1, 1), lattice, 1))
+
+    def test_snapped_outcome_marks_noop_but_not_motion(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_blocked_edges = set()
+        agent._sl_node_at = lambda node: node
+        a, b = (1, 1), (3, 1)
+
+        agent._sl_note_outcome(a, b, 4)
+        self.assertEqual(agent._sl_blocked_edges, set())
+
+        agent._sl_note_outcome(b, b, 2)
+        self.assertEqual(agent._sl_blocked_edges, {(b, 2)})
+
+    def test_failed_life_cap_benches_slide_head_for_level(self) -> None:
+        agent = self.agent_class.__new__(self.agent_class)
+        agent._sl_benched = None
+        agent._sl_level = 2
+        agent._level_deaths = 4
+        agent._sl_deaths_at_engage = 0
+        frame = SimpleNamespace(
+            available_actions=[1, 2, 3, 4], levels_completed=2)
+
+        self.assertIsNone(agent._slide_policy([], frame))
+        self.assertEqual(agent._sl_benched, 2)
 
 
 if __name__ == "__main__":

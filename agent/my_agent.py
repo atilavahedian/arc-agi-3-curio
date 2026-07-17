@@ -207,6 +207,8 @@ SL_ACCENT_MAX = 4       # max pixels a node-maze avatar accent color may span
                         # marker, not a sprawling object)
 SL_STRIKES = 6          # dry/failed slide plans before the maze head benches
                         # the level (novelty search takes over)
+SL_DEATH_CAP = 4        # failed slide-maze lives before the head yields to the
+                        # generic explorer instead of replaying a bad route
 SL_PROBE_CAP = 1        # directional probes per action before the slide head
                         # trusts (or rejects) that action's unit step
 SL_MIN_NODES = 12       # lattice nodes a board must expose before the slide head
@@ -745,6 +747,8 @@ class MyAgent(Agent):
         self._sl_corridor: Optional[int] = None   # learned passable color
         self._sl_blocked_edges: set[tuple[Cell, int]] = set()
         self._sl_lethal_edges: set[tuple[Cell, int]] = set()
+        self._sl_level = -1
+        self._sl_deaths_at_engage = 0
         self._sl_strikes = 0
         self._sl_benched: Optional[int] = None
         # ── sequence-match assignment head (sb26 family) ──
@@ -931,7 +935,7 @@ class MyAgent(Agent):
             self._sw_nogoal = None
             # the slide maze level replays deterministically: refresh the
             # strikes/bench (board rewinds to its start), keep the engaged
-            # flag, direction map and lethal edges learned in this level.
+            # flag, direction map and edge memory learned in this level.
             # The head re-plans every step so there is no standing plan to
             # void.
             self._sl_strikes = 0
@@ -1087,6 +1091,8 @@ class MyAgent(Agent):
             self._sl_corridor = None
             self._sl_blocked_edges.clear()
             self._sl_lethal_edges.clear()
+            self._sl_level = -1
+            self._sl_deaths_at_engage = 0
             self._sl_strikes = 0
             self._sl_benched = None
             # sort geography: the new level has its own target row, palette
@@ -1265,8 +1271,8 @@ class MyAgent(Agent):
                 slide_delta = (ca[0][0] - pa[0][0],
                                ca[0][1] - pa[0][1])
                 self._slide_votes[act][slide_delta] += 1
-                if self._sl_engaged and slide_delta == (0, 0):
-                    self._sl_note_blocked_edge(self._prev_grid, act)
+                if self._sl_engaged:
+                    self._sl_note_outcome(self._prev_grid, grid, act)
         if len(groups) == 1:
             # all movers share one delta → one rigid group: avatar candidate.
             # Multi-color sprites (ls20's 12-over-9 player, cn04's selected
@@ -4993,6 +4999,11 @@ class MyAgent(Agent):
         """Physical slide-maze edge at ``grid`` for one simple action."""
         if action not in {1, 2, 3, 4}:
             return None
+        node = self._sl_node_at(grid)
+        return (node, action) if node is not None else None
+
+    def _sl_node_at(self, grid: Grid) -> Optional[Cell]:
+        """Avatar's snapped physical maze node, independent of HUD pixels."""
         accent = self._sl_avatar_anchor(grid)
         if accent is None:
             return None
@@ -5003,7 +5014,7 @@ class MyAgent(Agent):
         snode = self._sl_node(
             self._sl_body_center(grid, accent[0], lat), lat)
         if snode is not None and snode in lat[3]:
-            return (snode, action)
+            return snode
         return None
 
     def _sl_note_blocked_edge(self, grid: Grid, action: int) -> None:
@@ -5011,6 +5022,17 @@ class MyAgent(Agent):
         edge = self._sl_edge_at(grid, action)
         if edge is not None:
             self._sl_blocked_edges.add(edge)
+
+    def _sl_note_outcome(
+        self, before: Grid, after: Grid, action: int
+    ) -> None:
+        """Learn a blocked edge by comparing physical, HUD-free maze nodes."""
+        src = self._sl_node_at(before)
+        dest = self._sl_node_at(after)
+        if src is None or dest is None:
+            return
+        if src == dest:
+            self._sl_blocked_edges.add((src, action))
 
     def _sl_note_lethal_edge(self) -> None:
         """Remember the slide-maze edge whose action caused GAME_OVER.
@@ -5096,6 +5118,11 @@ class MyAgent(Agent):
         level = latest_frame.levels_completed
         if self._sl_benched == level:
             return None
+        if self._sl_level == level \
+                and self._level_deaths - self._sl_deaths_at_engage \
+                >= SL_DEATH_CAP:
+            self._sl_benched = level
+            return None
         # structural gate
         accent = self._sl_avatar_anchor(grid)
         if accent is None:
@@ -5171,6 +5198,9 @@ class MyAgent(Agent):
         # board capture the head; requiring a real route means a non-maze board
         # that cannot be routed falls through to baseline exploration instead.
         self._sl_engaged = True
+        if self._sl_level != level:
+            self._sl_level = level
+            self._sl_deaths_at_engage = self._level_deaths
         return self._step(GameAction.from_id(route[0][0]))
 
     def _sl_guess_corridor(self, grid: Grid, snode: Cell, lat: tuple) -> int:

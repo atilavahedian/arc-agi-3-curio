@@ -9,3 +9,4 @@ recordings/
 logs.log
 backups/*.log
 notebooks/submission.ipynb
+runs/*.log

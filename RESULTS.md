@@ -17,6 +17,58 @@ The existing generated notebook is intentionally considered stale until the
 next capability batch is finished. Rebuild and identity validation are required
 before the next Kaggle push.
 
+## Where the score actually is (measured 2026-07-25)
+
+`scripts/sweep.py` records per-level actions, baselines and scores, so score
+loss can be attributed instead of guessed.
+
+Full official set, seed 0, 10,000-action cap:
+
+| Configuration | Aggregate | Leaderboard estimate |
+|---|---:|---:|
+| current head | 28.9361 | 0.2894 |
+| `CURIO_GENERIC_ONLY=1` | 0.1433 | 0.0014 |
+
+Two facts follow, and they set the priorities.
+
+**Scoring is effectively binary.** Every win sits at the per-game cap of 100
+and every non-win scores under 3. The metric squares `baseline/actions`, so a
+level completed in 9,990 actions is worth ~0, and a game's score is also capped
+at `completed_weight/total_weight*100` — completing 1 of 8 levels caps that
+game at 2.8 no matter how fast it was. Partial progress cannot move the
+aggregate; only wins can.
+
+**The family heads carry the entire score.** The generic core wins zero games
+alone. A core worth 0.0014 cannot explain the 0.18 hidden leaderboard result,
+so the family heads are already firing on hidden games: the hidden set is
+variants of the public families. Robustness of those heads to layout variation
+is therefore the transferable work, and more generic search is not.
+
+## Generic-core exploration: measured dead ends
+
+Recorded so none of these is retried on intuition.
+
+The dominant visible symptom is a level-2 wall: 14 of 25 games clear level 1 at
+or below the human baseline, then spend ~9,900 actions on level 2. Instrumented
+with `scripts/diagnose_stall.py`, two mechanisms were confirmed and two fixes
+were measured and rejected.
+
+*Novelty trap.* On lp85 level 2 the explorer emits the click key `6:20,16` 610
+times from 134 distinct states. A click that reliably changes the board makes
+every successor state look novel, so per-state `_tried` never blocks the key and
+`_steps_since_novelty` never trips. Adding level-scoped click-repetition
+balancing to `_use_balance` (penalty zero below the cap, so orderings stay
+bit-identical) measured *worse*: 34.0154 against 34.0305 on a fixed 12-game
+subset. Reverted.
+
+*Frontier exhaustion.* `_gx_untried` returns 0 or 1 candidates in 88% of calls
+on a stalled level (4,429 empty of 7,963). The documented escape is
+RESET-backtracking, bounded by `GX_RESET_CAP`. Raising that bound from 4 to 32
+to 128 produced a bit-identical 34.0154 every time, because the branch never
+executes at all: instrumenting `_gx_emit_reset` over lp85, tn36 and s5i5 at
+3,000 actions each recorded `gx_resets=0` and no reset reasons on any of them.
+The stall gate is unreachable in practice, so tuning it cannot help.
+
 ## Clean 25-game sweep
 
 Source identity: commit `c6b7f9169851f2cf0f813e51a16e17dfb5c94a69`.

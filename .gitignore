@@ -10,3 +10,5 @@ logs.log
 backups/*.log
 notebooks/submission.ipynb
 runs/*.log
+runs/diag/
+runs/mx_*.json

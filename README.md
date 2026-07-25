@@ -10,7 +10,7 @@ where the walls are, and what the goal is — then plans toward it.
 
 ## Current evidence
 
-The latest competition submission scored **0.18**. Source-hash and timestamp
+The latest completed competition submission scored **0.18**. Source-hash and timestamp
 auditing tied that run to commit `29e278a`; it predates multiple later solver
 capabilities. The current head has not yet received a leaderboard score.
 
@@ -24,6 +24,13 @@ generalization.
 The scoring metric squares `human_baseline_actions / agent_actions`, caps the
 per-level value at 1.15, weights later levels more heavily, and averages across
 games. Fast wins are therefore worth much more than slow exploration.
+
+**The leaderboard maximum is 1.00.** A game's score is also capped at
+`completed_weight / total_weight * 100`, which is exactly 100 when every level
+is completed, and the leaderboard prints the cross-game mean over 100. In
+practice scoring is close to binary: a win scores ~100, and a game that
+completes a level or two scores under 3, because the squared efficiency term
+crushes anything slow. Only whole-game wins move the number.
 
 ## How it works
 
@@ -49,11 +56,28 @@ of cooperating capabilities, each added and verified independently:
 
 ## Honest status
 
-The 0.18 result is far below the goal. Public-game solvers are useful regression
-proofs, but the main research gap is still unseen-game generalization. Current
-work therefore combines narrowly gated exact solvers with an original generic
-online-learning and graph-planning core. No external solver notebook, model,
-dataset, or kernel is part of the Curio candidate.
+The 0.18 result is far below the goal, and the measurements in `RESULTS.md`
+explain why more precisely than "generalization is hard".
+
+Ablation settles which half of the agent matters. With every family head
+disabled (`CURIO_GENERIC_ONLY=1`) the agent scores 0.14 aggregate and wins
+nothing at all, against 29.49 for the full agent. A generic core worth 0.0014
+cannot produce a 0.18 hidden result, so the family heads are already firing on
+hidden games and the hidden set is variants of the public families. Making an
+existing head robust to layout variation therefore transfers; more novelty
+search does not, and two attempts to improve the generic explorer were measured
+and rejected.
+
+The remaining wall is not brittleness. Six heads were traced to their exact
+bail-out on the first level they fail, and the games stop on mechanics no head
+models — peg solitaire, conserved-transfer networks, remote manipulators.
+Because a game is capped at `completed_weight/total_weight*100`, partial
+progress cannot compensate: every remaining diagnosed fix together is worth
+about +0.0025 on the leaderboard. Further score requires new gated heads that
+win whole games.
+
+No external solver notebook, model, dataset, or kernel is part of the Curio
+candidate; `scripts/validate_curio_candidate.py` enforces that on every build.
 
 ## Layout
 

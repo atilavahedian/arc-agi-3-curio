@@ -26,8 +26,16 @@ Full official set, seed 0, 10,000-action cap:
 
 | Configuration | Aggregate | Leaderboard estimate |
 |---|---:|---:|
-| current head | 28.9361 | 0.2894 |
+| head before this work | 28.9361 | 0.2894 |
+| head after the sort-parser fix | 29.4916 | 0.2949 |
 | `CURIO_GENERIC_ONLY=1` | 0.1433 | 0.0014 |
+
+**The metric cannot exceed 1.00.** A per-game score is
+`min(weighted_level_avg, completed_weight/total_weight*100)`, and that cap is
+exactly 100 when every level is completed, so the aggregate — and the
+leaderboard number, which is the aggregate over 100 — tops out at 1.00. This is
+observed, not just derived: `ft09` beats the human baseline on all six levels
+(124 actions against 208) and still scores exactly 100.00.
 
 Two facts follow, and they set the priorities.
 
@@ -68,6 +76,32 @@ to 128 produced a bit-identical 34.0154 every time, because the branch never
 executes at all: instrumenting `_gx_emit_reset` over lp85, tn36 and s5i5 at
 3,000 actions each recorded `gx_resets=0` and no reset reasons on any of them.
 The stall gate is unreachable in practice, so tuning it cannot help.
+
+## Family-head robustness: what is and is not available
+
+Six heads were traced to the exact `return None` that fires on their first
+unsolved level, by `sys.settrace` restricted to each head's code object.
+
+Landed: the assignment head's welded-ring and border-named-door relaxations
+(sb26 2.78 -> 16.67, aggregate +0.5556, all seven wins byte-identical).
+
+Diagnosed, verified by prototype, not landed — each buys only capped partial
+credit:
+
+| Game | Head | Finding | Value if landed |
+|---|---|---|---:|
+| su15 | `_herd_policy` | movers are 1x1 sprites the blob parser misreads; HUD band not excluded | +0.18 |
+| ls20 | `_plan_attr_route` | wall rule records no-motion but not displacement | +0.07 |
+| dc22 | `_switch_policy` | level 5 is not a switch-planning problem at all | none |
+| vc33 | none fires | a conserved-transfer network; no head models it; levels 4-7 add swap gates | none |
+| lf52 | none fires | peg solitaire; no head models the verb | none |
+
+The pattern is consistent and worth stating plainly: these games stop on
+*unmodelled mechanics*, not on brittleness. Because a game is capped at
+`completed_weight/total_weight*100`, clearing 3 of 8 levels can never exceed
+16.67, so partial progress cannot move the aggregate materially. Landing every
+remaining item above is worth roughly +0.25 aggregate, i.e. +0.0025 on the
+leaderboard. Further score requires new gated heads that win *whole* games.
 
 ## Clean 25-game sweep
 

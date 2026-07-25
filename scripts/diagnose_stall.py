@@ -64,10 +64,14 @@ def instrument(AgentCls) -> None:
         before_states = len(getattr(self, "_state_visits", {}) or {})
         action = orig_choose(self, frames, latest_frame)
         after_states = len(getattr(self, "_state_visits", {}) or {})
-        data = getattr(action, "_data", None) or {}
+        # Clicks carry their target in `action_data`; without it every
+        # ACTION6 collapses to one key and a diverse click stream is
+        # indistinguishable from hammering a single pixel.
         key = str(action.value)
-        if data.get("x") is not None:
-            key = f"6:{data['x']},{data['y']}"
+        data = getattr(action, "action_data", None)
+        x, y = getattr(data, "x", None), getattr(data, "y", None)
+        if x is not None and y is not None:
+            key = f"6:{x},{y}"
         self._diag_log.append({
             "i": self.action_counter,
             "level": latest_frame.levels_completed,

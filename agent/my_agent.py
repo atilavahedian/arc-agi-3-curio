@@ -9000,7 +9000,8 @@ class MyAgent(Agent):
         target-row glyphs, the container walls and the nested-door frames —
         the whole sb26 board is built from hollow boxes."""
         out: list[tuple[int, int, int, int, int]] = []
-        for color, cells in components(grid):
+        comps = components(grid)
+        for color, cells in comps:
             xs = [x for x, _y in cells]
             ys = [y for _x, y in cells]
             x0, x1 = min(xs), max(xs)
@@ -9015,6 +9016,80 @@ class MyAgent(Agent):
             if all(x in (x0, x1) or y in (y0, y1) for x, y in cells) \
                     and abs(len(cells) - ring) <= 2:
                 out.append((color, x0, y0, x1, y1))
+        # WELDED RINGS.  The test above asks the component to BE a bare
+        # perimeter, so a ring joined to another same-colour glyph by a
+        # connector (a door frame tied to its container by a short tube)
+        # merges into one component that is no longer a perimeter and is lost
+        # -- with it, every slot inside that container.  Recover such rings by
+        # the same geometric definition, minus the extra demand that the
+        # component contain nothing else: a rectangle whose perimeter lies in
+        # the component and whose STRICT INTERIOR holds no cell of that
+        # colour.  Appended after the exact matches so existing ordering is
+        # untouched, and deduplicated against them.
+        seen = set(out)
+        for color, cells in comps:
+            for box in self._sort_welded_boxes(color, cells):
+                if box not in seen:
+                    seen.add(box)
+                    out.append(box)
+        return out
+
+    @staticmethod
+    def _sort_welded_boxes(
+        color: int, cells: frozenset[Cell]
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Rectangles whose perimeter lies inside ONE same-colour component.
+
+        Horizontal runs of at least 4 cells are the candidate top and bottom
+        edges; a pair of runs sharing both endpoints bounds a candidate
+        rectangle, kept when the two vertical edges are present and the strict
+        interior holds no cell of this colour.  The same +/-2 missing-cell
+        slack as the exact-ring test is allowed, so a door's mouth still
+        parses.
+        """
+        rows: dict[int, list[int]] = defaultdict(list)
+        for x, y in cells:
+            rows[y].append(x)
+        runs: dict[tuple[int, int], list[int]] = defaultdict(list)
+        total = 0
+        for y, xs in rows.items():
+            xs.sort()
+            start = prev = xs[0]
+            for x in xs[1:]:
+                if x == prev + 1:
+                    prev = x
+                    continue
+                if prev - start + 1 >= 4:
+                    runs[(start, prev)].append(y)
+                    total += 1
+                start = prev = x
+            if prev - start + 1 >= 4:
+                runs[(start, prev)].append(y)
+                total += 1
+        # A dense or noisy component can produce a quadratic number of run
+        # pairs; the exact-ring path above already covers ordinary boards, so
+        # bail rather than pay that on every frame.
+        if total > 128:
+            return []
+        out: list[tuple[int, int, int, int, int]] = []
+        for (x0, x1), ys in runs.items():
+            if len(ys) < 2:
+                continue
+            ys.sort()
+            for i, y0 in enumerate(ys):
+                for y1 in ys[i + 1:]:
+                    if y1 - y0 + 1 < 4:
+                        continue
+                    missing = sum(
+                        ((x0, y) not in cells) + ((x1, y) not in cells)
+                        for y in range(y0 + 1, y1))
+                    if missing > 2:
+                        continue
+                    if any((x, y) in cells
+                           for y in range(y0 + 1, y1)
+                           for x in range(x0 + 1, x1)):
+                        continue
+                    out.append((color, x0, y0, x1, y1))
         return out
 
     def _sort_solid_tiles(
@@ -9242,8 +9317,17 @@ class MyAgent(Agent):
                     continue
                 if cx0 < dx0 and dx1 < cx1 and cy0 < dy0 and dy1 < cy1:
                     interior = grid[(dy0 + dy1) // 2][(dx0 + dx1) // 2]
+                    target = None
                     if interior in cont_by_color and interior != cb[0]:
-                        doors_in[cb].append((interior,
+                        target = interior
+                    elif dc in cont_by_color and dc != cb[0]:
+                        # A door DRAWN in the destination container's colour
+                        # names it exactly as well as one filled with it.
+                        # Checked only after the interior test, so boards that
+                        # already parsed keep their existing door graph.
+                        target = dc
+                    if target is not None:
+                        doors_in[cb].append((target,
                                              ((dx0 + dx1) // 2,
                                               (dy0 + dy1) // 2)))
                     break

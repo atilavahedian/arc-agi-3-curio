@@ -4,7 +4,7 @@ This file records measured results for the original Curio agent. Local public
 environments are regression and development evidence; they are not a prediction
 of the hidden ARC-AGI-3 leaderboard score.
 
-Last updated: 2026-07-27.
+Last updated: 2026-07-28 UTC.
 
 ## Official Kaggle evidence
 
@@ -19,6 +19,16 @@ artifact. Submission `55042869` (the original thread-isolation and informative-
 frontier candidate) was still pending when this file was updated; it has no
 claimed score yet.
 
+The separate private kernel
+`atilavahedian/arc3-curio-v7-threadsafe-original`, Version 1, completed
+successfully. It embeds the frozen original v7 policy plus only the verified
+thread-local action-payload repair. Candidate validation reports zero external
+dataset, model, or kernel sources. A competition submission was attempted at
+2026-07-28T02:52Z but was not created: Kaggle returned
+`FAILED_PRECONDITION` because the team had used its one-submission daily UTC
+allowance on `55042869`. The v7 candidate remains queued for the next UTC
+allowance; no score is claimed.
+
 The account's historical **0.86** submission (`54768802`) is deliberately not
 treated as original-Curio evidence. Its pulled notebook is byte-identical to
 Git commit `80edbcc` (SHA-256
@@ -28,6 +38,24 @@ Tufa/Qwen/vLLM datasets. That artifact is excluded from this project and will
 not be restored, copied, or resubmitted. The highest completed original Curio
 score recorded so far is **0.22** (`53644546`, Curio v7); 0.86 remains an
 account-level target to beat with independently built code, not our baseline.
+
+## Switch-head safety promotion gate
+
+Commits `e3b371b` and `98da073` prevent the remote-switch head from probing an
+ambiguous action surface. The gate is structural: it requires all four
+cardinal actions plus click and rejects a separate ACTION5 transform verb. It
+contains no game IDs, coordinates, colors, or scripted paths.
+
+An exact base/candidate replay covered 18 non-winning public games, seeds
+0/7/42, and 2,000 actions per game (54 pairs). The mean moved from
+`2.094696828436336` to `2.094702529767386`. Fifty-one pairs were exactly
+unchanged; only `bp35` changed, with two gains and one smaller loss. All seven
+protected wins remained 100% at the exact previous action counts. The main
+suite passed 146/146 and exact Kaggle runtime parity passed. Full machine-
+readable evidence is in `runs/head_safety_governor.json`.
+
+This is a small positive local regression gate, not evidence or a prediction
+of a hidden leaderboard increase.
 
 ## Where the score actually is (measured 2026-07-25)
 

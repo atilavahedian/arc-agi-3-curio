@@ -6214,8 +6214,6 @@ class MyAgent(Agent):
         avail = set(latest_frame.available_actions or [])
         if GameAction.ACTION6.value not in avail:
             return None
-        if not switch_action_profile_safe(avail):
-            return None
         # port-mode rule hygiene: alignment needs the four axis moves of
         # one magnitude — collect, per direction, the best-voted act, and
         # DROP oddball deltas instead of letting them poison the gate (a
@@ -10559,6 +10557,8 @@ class MyAgent(Agent):
             return None
         avail = set(latest_frame.available_actions or [])
         if GameAction.ACTION6.value not in avail:
+            return None
+        if not switch_action_profile_safe(avail):
             return None
         rules = self._movement_rules()
         if len(rules) < 2:

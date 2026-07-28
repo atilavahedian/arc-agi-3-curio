@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,18 @@ class SwitchActionProfileTests(unittest.TestCase):
             AGENT.GameAction.ACTION4,
             AGENT.GameAction.ACTION6,
         ]))
+
+    def test_switch_dispatch_rejects_transform_before_model_access(self) -> None:
+        agent = AGENT.MyAgent.__new__(AGENT.MyAgent)
+
+        def unexpected_model_access():
+            self.fail("unsafe profile reached the switch world model")
+
+        agent._movement_rules = unexpected_model_access
+        frame = SimpleNamespace(available_actions=[1, 2, 3, 4, 5, 6])
+        grid = [[0] * AGENT.GRID for _ in range(AGENT.GRID)]
+
+        self.assertIsNone(agent._switch_policy(grid, frame))
 
 
 if __name__ == "__main__":

@@ -3974,6 +3974,9 @@ class MyAgent(Agent):
         self._transfer_shape_effects: dict[
             tuple[frozenset[int], tuple[Cell, ...]], list[int]
         ] = {}
+        self._completion_click_shapes: Counter[
+            tuple[frozenset[int], tuple[Cell, ...]]
+        ] = Counter()
         self._game_overs = 0
         # ── lattice recolor model (ft09 family): appearance → effect mask ──
         # what a sprite class DOES when clicked is physics (persists across
@@ -5030,12 +5033,9 @@ class MyAgent(Agent):
         )
         if key is not None:
             # The settled post-action pixels are a new-level repaint, so they
-            # cannot train ordinary effect size.  Level advancement itself is
-            # nevertheless direct evidence that this structural action was
-            # productive; record one binary success before snapshotting.
-            effect = self._click_shape_effects.setdefault(key, [0, 0])
-            effect[0] += 1
-            effect[1] += 1
+            # cannot train ordinary effect rates.  Keep completion as its own
+            # causal label instead of fabricating a within-level frame diff.
+            self._completion_click_shapes[key] += 1
 
     def _commit_shape_curriculum(self) -> None:
         """Snapshot only productive effects after a demonstrated success."""
@@ -12309,7 +12309,7 @@ class MyAgent(Agent):
             return -1
         if geometry_unique and geometry is not None \
                 and action_profile is not None \
-                and self._transfer_shape_effects.get(
+                and self._completion_click_shapes.get(
                     (action_profile, geometry)):
             return 4
         changed, tries = self._click_effects.get(sig, (0, 0))
@@ -12337,7 +12337,7 @@ class MyAgent(Agent):
             return -1                            # this instance / class is unsafe
         if geometry_unique and geometry is not None \
                 and action_profile is not None \
-                and self._transfer_shape_effects.get(
+                and self._completion_click_shapes.get(
                     (action_profile, geometry)):
             return 4                             # demonstrated prior success
         changed, tries = self._click_effects.get(sig, (0, 0))
@@ -12712,6 +12712,7 @@ class MyAgent(Agent):
             rich_reversible = profile == STRUCTURAL_CURRICULUM_ACTIONS
             shape_source = (self._click_shape_effects
                             if self._transfer_shape_effects
+                            or self._completion_click_shapes
                             or rich_reversible else {})
             shape_changed, shape_tries = shape_source.get(
                 shape_key, (0, 0)) if shape_key is not None else (0, 0)

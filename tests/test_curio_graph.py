@@ -662,6 +662,7 @@ class ClickInstanceTests(unittest.TestCase):
         agent._click_effects = {}
         agent._click_shape_effects = {}
         agent._transfer_shape_effects = {}
+        agent._completion_click_shapes = Counter()
         agent._avail = {GameAction.ACTION6.value}
         agent._move_votes = defaultdict(Counter)
         agent._act_uses = Counter()
@@ -726,6 +727,11 @@ class ClickInstanceTests(unittest.TestCase):
         previous[7][11] = previous[8][11] = 3
         agent._prev_grid = previous
         agent._prev_action = "6:11,7"
+        previous_comps = self.agent_class._gx_node.__globals__["components"](
+            previous)
+        effect_key = agent._shape_effect_key(
+            previous_comps, (11, 7), {GameAction.ACTION6.value})
+        agent._click_shape_effects[effect_key] = [3, 3]
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
         agent._commit_shape_curriculum()
 
@@ -803,9 +809,10 @@ class ClickInstanceTests(unittest.TestCase):
             comps, (11, 7))
         profile = frozenset({GameAction.ACTION6.value})
         agent._click_effects[signature] = [0, 4]
-        agent._transfer_shape_effects[(profile, geometry)] = [3, 3]
+        agent._completion_click_shapes[(profile, geometry)] = 1
 
-        self.assertEqual(agent._gx_class_click_tier(signature), -1)
+        self.assertEqual(agent._gx_class_click_tier(
+            signature, geometry, profile, True), -1)
 
     def test_single_pixel_completion_is_too_ambiguous_to_transfer(self) -> None:
         agent = self._agent()
@@ -818,6 +825,7 @@ class ClickInstanceTests(unittest.TestCase):
         agent._commit_shape_curriculum()
 
         self.assertEqual(agent._transfer_shape_effects, {})
+        self.assertEqual(agent._completion_click_shapes, Counter())
 
     def test_failed_level_effects_are_not_banked_as_curriculum(self) -> None:
         agent = self._agent()

@@ -660,7 +660,8 @@ class ClickInstanceTests(unittest.TestCase):
         agent._gx_instance_effects = {}
         agent._gx_lethal_sig = set()
         agent._click_effects = {}
-        agent._completion_click_shapes = Counter()
+        agent._click_shape_effects = {}
+        agent._transfer_shape_effects = {}
         agent._avail = {GameAction.ACTION6.value}
         agent._move_votes = defaultdict(Counter)
         agent._act_uses = Counter()
@@ -726,14 +727,20 @@ class ClickInstanceTests(unittest.TestCase):
         agent._prev_grid = previous
         agent._prev_action = "6:11,7"
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
+        agent._commit_shape_curriculum()
 
         repainted = [[0 for _x in range(64)] for _y in range(64)]
+        for y in (10, 11):
+            for x in (10, 11):
+                repainted[y][x] = 5
         repainted[20][25] = repainted[20][26] = 8
-        node = agent._gx_node(
-            99, repainted, {GameAction.ACTION6.value})
-        click = next(a for a in node["actions"] if a.startswith("6:"))
+        options = [
+            ("6:10,10", GameAction.ACTION6, (10, 10)),
+            ("6:25,20", GameAction.ACTION6, (25, 20)),
+        ]
 
-        self.assertEqual(agent._gx_live_tier(node, click), 4)
+        self.assertEqual(
+            agent._gx_afford_rank(repainted, options)[0][0], "6:25,20")
 
     def test_completion_shape_requires_same_observed_interface(self) -> None:
         agent = self._agent()
@@ -742,12 +749,21 @@ class ClickInstanceTests(unittest.TestCase):
         agent._prev_grid = grid
         agent._prev_action = "6:11,7"
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
+        agent._commit_shape_curriculum()
 
-        node = agent._gx_node(
-            99, grid, {GameAction.ACTION6.value, GameAction.ACTION7.value})
-        click = next(a for a in node["actions"] if a.startswith("6:"))
+        repainted = [[0 for _x in range(64)] for _y in range(64)]
+        for y in (10, 11):
+            for x in (10, 11):
+                repainted[y][x] = 5
+        repainted[20][25] = repainted[20][26] = 8
+        options = [
+            ("6:10,10", GameAction.ACTION6, (10, 10)),
+            ("6:25,20", GameAction.ACTION6, (25, 20)),
+        ]
+        agent._avail = {GameAction.ACTION6.value, GameAction.ACTION7.value}
 
-        self.assertEqual(agent._gx_live_tier(node, click), 3)
+        self.assertEqual(
+            agent._gx_afford_rank(repainted, options)[0][0], "6:10,10")
 
     def test_completion_shape_does_not_guess_among_ambiguous_twins(self) -> None:
         agent = self._agent()
@@ -756,17 +772,22 @@ class ClickInstanceTests(unittest.TestCase):
         agent._prev_grid = previous
         agent._prev_action = "6:11,7"
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
+        agent._commit_shape_curriculum()
 
         ambiguous = [[0 for _x in range(64)] for _y in range(64)]
+        for y in (10, 11):
+            for x in (10, 11):
+                ambiguous[y][x] = 5
         ambiguous[20][25] = ambiguous[20][26] = 8
         ambiguous[30][35] = ambiguous[30][36] = 9
-        node = agent._gx_node(
-            99, ambiguous, {GameAction.ACTION6.value})
-        clicks = [a for a in node["actions"] if a.startswith("6:")]
+        options = [
+            ("6:10,10", GameAction.ACTION6, (10, 10)),
+            ("6:25,20", GameAction.ACTION6, (25, 20)),
+            ("6:35,30", GameAction.ACTION6, (35, 30)),
+        ]
 
-        self.assertTrue(clicks)
-        self.assertTrue(all(agent._gx_live_tier(node, click) == 3
-                            for click in clicks))
+        self.assertEqual(
+            agent._gx_afford_rank(ambiguous, options)[0][0], "6:10,10")
 
     def test_completion_shape_never_resurrects_dead_exact_class(self) -> None:
         agent = self._agent()
@@ -779,10 +800,9 @@ class ClickInstanceTests(unittest.TestCase):
             comps, (11, 7))
         profile = frozenset({GameAction.ACTION6.value})
         agent._click_effects[signature] = [0, 4]
-        agent._completion_click_shapes[(profile, geometry)] = 1
+        agent._transfer_shape_effects[(profile, geometry)] = [3, 3]
 
-        self.assertEqual(agent._gx_class_click_tier(
-            signature, geometry, profile), -1)
+        self.assertEqual(agent._gx_class_click_tier(signature), -1)
 
     def test_single_pixel_completion_is_too_ambiguous_to_transfer(self) -> None:
         agent = self._agent()
@@ -792,8 +812,22 @@ class ClickInstanceTests(unittest.TestCase):
         agent._prev_action = "6:11,7"
 
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
+        agent._commit_shape_curriculum()
 
-        self.assertEqual(agent._completion_click_shapes, Counter())
+        self.assertEqual(agent._transfer_shape_effects, {})
+
+    def test_failed_level_effects_are_not_banked_as_curriculum(self) -> None:
+        agent = self._agent()
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        grid[7][11] = grid[8][11] = 3
+        comps = self.agent_class._gx_node.__globals__["components"](grid)
+        key = agent._shape_effect_key(
+            comps, (11, 7), {GameAction.ACTION6.value})
+        agent._click_shape_effects[key] = [0, 4]
+
+        agent._commit_shape_curriculum()
+
+        self.assertEqual(agent._transfer_shape_effects, {})
 
     def test_unknown_twins_are_exposed_one_at_a_time(self) -> None:
         agent = self._agent()

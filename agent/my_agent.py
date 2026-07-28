@@ -3960,12 +3960,17 @@ class MyAgent(Agent):
         # buttons look identical on every level, so what a sprite class
         # DOES transfers even though geography doesn't)
         self._click_effects: dict[int, list[int]] = {}
-        # Direct causal labels from the final settled click before level-up.
-        # Keyed by the advertised action interface plus colorless geometry;
-        # neither game/level ids nor screen coordinates enter the memory.
-        self._completion_click_shapes: Counter[
-            tuple[frozenset[int], tuple[Cell, ...]]
-        ] = Counter()
+        # Position/color-free click effects, keyed by the observed action
+        # interface.  The live store learns continuously, but the transfer
+        # snapshot is refreshed only after a level actually completes; an
+        # unsolved level therefore cannot teach its speculative behavior to
+        # the next one.
+        self._click_shape_effects: dict[
+            tuple[frozenset[int], tuple[Cell, ...]], list[int]
+        ] = {}
+        self._transfer_shape_effects: dict[
+            tuple[frozenset[int], tuple[Cell, ...]], list[int]
+        ] = {}
         self._game_overs = 0
         # ── lattice recolor model (ft09 family): appearance → effect mask ──
         # what a sprite class DOES when clicked is physics (persists across
@@ -4744,6 +4749,7 @@ class MyAgent(Agent):
         self._avail = set(latest_frame.available_actions or [])
         if latest_frame.levels_completed > self._best_levels:
             self._note_completion_click(previous_avail)
+            self._commit_shape_curriculum()
         # may refresh the HUD mask, so learn before keying; the leveled flag
         # stops cross-level repaints from being read as click physics; the
         # animation frames tell blocked-with-animation (gate) from blocked
@@ -5020,7 +5026,21 @@ class MyAgent(Agent):
             previous_avail,
         )
         if key is not None:
-            self._completion_click_shapes[key] += 1
+            # The settled post-action pixels are a new-level repaint, so they
+            # cannot train ordinary effect size.  Level advancement itself is
+            # nevertheless direct evidence that this structural action was
+            # productive; record one binary success before snapshotting.
+            effect = self._click_shape_effects.setdefault(key, [0, 0])
+            effect[0] += 1
+            effect[1] += 1
+
+    def _commit_shape_curriculum(self) -> None:
+        """Snapshot only productive effects after a demonstrated success."""
+        self._transfer_shape_effects = {
+            key: list(effect)
+            for key, effect in self._click_shape_effects.items()
+            if effect[0] > 0 and (effect[0] + 1) / (effect[1] + 2) > 0.5
+        }
 
     def _learn(
         self, grid: Optional[Grid], leveled: bool = False,
@@ -5089,6 +5109,13 @@ class MyAgent(Agent):
                 if changed:
                     eff[0] += 1
                 eff[1] += 1
+                shape_key = self._shape_effect_key(
+                    comps_prev, (x, y), self._avail)
+                if shape_key is not None:
+                    shape_effect = self._click_shape_effects.setdefault(
+                        shape_key, [0, 0])
+                    shape_effect[0] += int(changed)
+                    shape_effect[1] += 1
                 if self._gx_on:
                     self._gx_note_instance(
                         sig, (x, y), changed=changed, comps=comps_prev)
@@ -12241,8 +12268,6 @@ class MyAgent(Agent):
     def _gx_tier(
         self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
         opt: tuple[str, GameAction, Optional[Cell]], *, instance_sigs: set[int],
-        action_profile: frozenset[int],
-        geometry_counts: Counter[tuple[Cell, ...]],
     ) -> int:
         """Salience tier for an untried option (higher = explore first).
         -1 dead (excluded); 0 known-rule moves / background clicks;
@@ -12259,29 +12284,15 @@ class MyAgent(Agent):
                 return 1                         # still learning: high info
             return 0
         sig = signature_under(comps, coords)
-        geometry = geometry_under(comps, coords)
-        geometry_unique = geometry is not None \
-            and geometry_counts[geometry] == 1
-        return (self._gx_click_tier(
-                    sig, coords, geometry, action_profile, geometry_unique)
-                if sig in instance_sigs else self._gx_class_click_tier(
-                    sig, geometry, action_profile, geometry_unique))
+        return (self._gx_click_tier(sig, coords) if sig in instance_sigs
+                else self._gx_class_click_tier(sig))
 
-    def _gx_class_click_tier(
-        self, sig: int, geometry: Optional[tuple[Cell, ...]] = None,
-        action_profile: Optional[frozenset[int]] = None,
-        geometry_unique: bool = False,
-    ) -> int:
+    def _gx_class_click_tier(self, sig: int) -> int:
         """Original graph salience for dense class-deduped boards."""
         if sig == 0:
             return 0
         if self._click_dead(sig) or sig in self._gx_lethal_sig:
             return -1
-        if geometry_unique and geometry is not None \
-                and action_profile is not None \
-                and self._completion_click_shapes.get(
-                    (action_profile, geometry), 0):
-            return 4
         changed, tries = self._click_effects.get(sig, (0, 0))
         if tries == 0:
             return 3
@@ -12289,12 +12300,7 @@ class MyAgent(Agent):
             return 2
         return 0
 
-    def _gx_click_tier(
-        self, sig: int, coords: Cell,
-        geometry: Optional[tuple[Cell, ...]] = None,
-        action_profile: Optional[frozenset[int]] = None,
-        geometry_unique: bool = False,
-    ) -> int:
+    def _gx_click_tier(self, sig: int, coords: Cell) -> int:
         """Live salience for one click instance.
 
         Nodes cache their candidate geometry, but evidence changes after each
@@ -12305,11 +12311,6 @@ class MyAgent(Agent):
             return 0                             # background click
         if self._gx_instance_dead(sig, coords) or sig in self._gx_lethal_sig:
             return -1                            # this instance / class is unsafe
-        if geometry_unique and geometry is not None \
-                and action_profile is not None \
-                and self._completion_click_shapes.get(
-                    (action_profile, geometry), 0):
-            return 4                             # completed a prior level
         changed, tries = self._click_effects.get(sig, (0, 0))
         inst_tries = self._gx_instance_effects.get(
             self._gx_instance_key(sig, coords), (0, 0))[1]
@@ -12325,15 +12326,9 @@ class MyAgent(Agent):
         if coords is None:
             return node["salience"].get(akey, 0)
         sig = node.get("sig", {}).get(akey, 0)
-        geometry = node.get("geometry", {}).get(akey)
-        action_profile = node.get("action_profile")
-        geometry_unique = geometry is not None \
-            and node.get("geometry_counts", {}).get(geometry, 0) == 1
         if sig in node.get("instance_sigs", set()):
-            return self._gx_click_tier(
-                sig, coords, geometry, action_profile, geometry_unique)
-        return self._gx_class_click_tier(
-            sig, geometry, action_profile, geometry_unique)
+            return self._gx_click_tier(sig, coords)
+        return self._gx_class_click_tier(sig)
 
     @staticmethod
     def _gx_instance_sigs(
@@ -12381,21 +12376,15 @@ class MyAgent(Agent):
         node = self._gx_nodes.get(key)
         if node is None:
             comps = components(grid) if grid is not None else []
-            action_profile = self._action_profile(avail)
-            geometry_counts: Counter[tuple[Cell, ...]] = Counter(
-                shape_geometry(cells) for _color, cells in comps)
             instance_sigs = self._gx_instance_sigs(comps, avail)
             options = self._gx_options(grid, avail)
             salience: dict[str, int] = {}
             actions: list[str] = []
             optmap: dict[str, tuple[str, GameAction, Optional[Cell]]] = {}
             sigmap: dict[str, int] = {}
-            geometry_map: dict[str, tuple[Cell, ...]] = {}
             for opt in options:
                 tier = (self._gx_tier(
-                    grid, comps, opt, instance_sigs=instance_sigs,
-                    action_profile=action_profile,
-                    geometry_counts=geometry_counts)
+                    grid, comps, opt, instance_sigs=instance_sigs)
                     if grid is not None else 0)
                 if tier < 0:
                     continue                     # dead signature: never offer
@@ -12404,14 +12393,8 @@ class MyAgent(Agent):
                 optmap[opt[0]] = opt
                 if opt[2] is not None:
                     sigmap[opt[0]] = signature_under(comps, opt[2])
-                    geometry = geometry_under(comps, opt[2])
-                    if geometry is not None:
-                        geometry_map[opt[0]] = geometry
             node = {"actions": actions, "salience": salience,
                     "optmap": optmap, "sig": sigmap,
-                    "geometry": geometry_map,
-                    "geometry_counts": geometry_counts,
-                    "action_profile": action_profile,
                     "instance_sigs": instance_sigs}
             self._gx_nodes[key] = node
         return node
@@ -12660,6 +12643,8 @@ class MyAgent(Agent):
     ) -> list[tuple[str, GameAction, Optional[Cell]]]:
         """Soft click ranking that never hard-vetoes a whole shape class."""
         comps = components(grid)
+        geometry_counts: Counter[tuple[Cell, ...]] = Counter(
+            shape_geometry(cells) for _color, cells in comps)
         scored: list[tuple[float, tuple[str, GameAction, Optional[Cell]]]] = []
         for opt in opts:
             coords = opt[2]
@@ -12671,9 +12656,18 @@ class MyAgent(Agent):
             instance_score = (ich + 2) / (itr + 3)
             changed, tries = self._click_effects.get(sig, (0, 0))
             class_score = (changed + 2) / (tries + 3)
+            shape_key = self._shape_effect_key(comps, coords, self._avail)
+            shape_changed, shape_tries = self._transfer_shape_effects.get(
+                shape_key, (0, 0)) if shape_key is not None else (0, 0)
+            geometry = shape_key[1] if shape_key is not None else None
+            shape_score = ((shape_changed + 2) / (shape_tries + 3)
+                           if shape_tries and geometry is not None
+                           and geometry_counts[geometry] == 1 else 0.0)
             # Fresh instances retain the optimistic prior even when another
-            # same-looking object was inert on an earlier level.
-            scored.append((max(instance_score, class_score), opt))
+            # same-looking object was inert on an earlier level.  A structural
+            # effect may only improve the soft order after a completed level
+            # banked it, and only when the current geometry is unambiguous.
+            scored.append((max(instance_score, class_score, shape_score), opt))
         scored.sort(key=lambda so: -so[0])
         fill = iter(opt for _score, opt in scored)
         return [opt if opt[2] is None else next(fill) for opt in opts]

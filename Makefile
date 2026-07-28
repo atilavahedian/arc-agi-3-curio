@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup verify-runtime play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 smoke-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 package-curio-v7-threadsafe verify-curio-v7-threadsafe smoke-curio-v7-threadsafe submit-curio-v7-threadsafe status-curio-v7-threadsafe verify-local clean _check-kaggle
+.PHONY: help setup verify-runtime play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 smoke-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 package-curio-v7-threadsafe verify-curio-v7-threadsafe smoke-curio-v7-threadsafe submit-curio-v7-threadsafe status-curio-v7-threadsafe package-curio-v7-hardened verify-curio-v7-hardened smoke-curio-v7-hardened submit-curio-v7-hardened status-curio-v7-hardened verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -120,6 +120,26 @@ submit-curio-v7-threadsafe: verify-curio-v7-threadsafe _check-kaggle ## Push the
 
 status-curio-v7-threadsafe: _check-kaggle ## Show the original Curio v7 thread-safe kernel status
 	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/curio-v7-threadsafe/kernel-metadata.json'))['id'])"); \
+	$(KAGGLE) kernels status $$KERNEL_ID
+
+package-curio-v7-hardened: ## Build the fault-contained original Curio v7 ablation
+	$(VENV_PY) scripts/build_curio_v7_hardened_candidate.py
+
+verify-curio-v7-hardened: package-curio-v7-hardened ## Validate the isolated hardened Curio v7 candidate
+	$(VENV_PY) scripts/validate_curio_candidate.py submissions/curio-v7-hardened --source-agent baselines/curio_v7_fault_contained.py --explorer off
+	$(VENV_PY) scripts/smoke_curio_runtime.py submissions/curio-v7-hardened --framework-dir $(FRAMEWORK_DIR) --profile legacy-hardened
+	$(VENV_PY) scripts/check_action_thread_safety.py --agent-source baselines/curio_v7_fault_contained.py --iterations 1000
+
+smoke-curio-v7-hardened: package-curio-v7-hardened ## Import and fault-smoke the embedded hardened v7 agent
+	$(VENV_PY) scripts/smoke_curio_runtime.py submissions/curio-v7-hardened --framework-dir $(FRAMEWORK_DIR) --profile legacy-hardened
+
+submit-curio-v7-hardened: verify-curio-v7-hardened _check-kaggle ## Push hardened original Curio v7 to Kaggle
+	$(KAGGLE) kernels push -p submissions/curio-v7-hardened/
+	@echo ""
+	@echo "Pushed hardened Curio v7. Track it with: make status-curio-v7-hardened"
+
+status-curio-v7-hardened: _check-kaggle ## Show the hardened original Curio v7 kernel status
+	@KERNEL_ID=$$(python3 -c "import json; print(json.load(open('submissions/curio-v7-hardened/kernel-metadata.json'))['id'])"); \
 	$(KAGGLE) kernels status $$KERNEL_ID
 
 clean: ## Remove generated artefacts (venv, downloaded games, vendored repos)

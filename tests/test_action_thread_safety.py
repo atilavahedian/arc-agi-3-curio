@@ -43,6 +43,11 @@ class ActionThreadSafetyTests(unittest.TestCase):
     def test_original_v7_candidate_is_thread_local(self) -> None:
         self.assert_thread_safe(ROOT / "baselines" / "curio_v7_threadsafe.py")
 
+    def test_fault_contained_v7_candidate_is_thread_local(self) -> None:
+        self.assert_thread_safe(
+            ROOT / "baselines" / "curio_v7_fault_contained.py"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

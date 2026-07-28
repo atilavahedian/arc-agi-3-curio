@@ -69,7 +69,7 @@ def main() -> None:
         "--framework-dir", type=Path, default=DEFAULT_FRAMEWORK)
     parser.add_argument(
         "--profile",
-        choices=("graph-hardened", "legacy"),
+        choices=("graph-hardened", "legacy", "legacy-hardened"),
         default="graph-hardened",
         help="runtime assertions appropriate to the embedded Curio generation",
     )
@@ -129,13 +129,44 @@ def main() -> None:
                 if simple is not GameAction.ACTION4:
                     raise SystemExit(
                         f"illegal/non-deterministic simple fallback: {simple}")
-            else:
+            elif args.profile == "legacy":
                 if hasattr(agent, "_gx_on"):
                     raise SystemExit(
                         "legacy candidate unexpectedly contains graph mode")
                 simple = agent.choose_action([], frame([1, 2, 3, 4], grid))
                 if simple.value not in {1, 2, 3, 4}:
                     raise SystemExit(f"legacy agent returned illegal action: {simple}")
+            else:
+                if hasattr(agent, "_gx_on"):
+                    raise SystemExit(
+                        "hardened legacy candidate unexpectedly contains graph mode")
+                normal = agent.choose_action([], frame([1, 2, 3, 4], grid))
+                if normal.value not in {1, 2, 3, 4}:
+                    raise SystemExit(
+                        f"hardened legacy agent returned illegal action: {normal}")
+                if getattr(agent, "_runtime_faults", 0) != 0:
+                    raise SystemExit(
+                        "hardened legacy normal smoke unexpectedly used fallback")
+
+                simple_fault_agent = AgentClass(
+                    card_id="runtime-simple-fault-smoke",
+                    game_id="runtime-simple-fault-smoke",
+                    agent_name="MyAgent.runtime-simple-fault-smoke",
+                    ROOT_URL="",
+                    record=False,
+                    arc_env=None,
+                )
+                simple_fault_agent._choose_action = (
+                    lambda _frames, _latest: (_ for _ in ()).throw(
+                        RuntimeError("legacy simple smoke fault")))
+                simple = simple_fault_agent.choose_action(
+                    [], frame([0, 4, 6], grid))
+                if simple is not GameAction.ACTION4:
+                    raise SystemExit(
+                        f"illegal/non-deterministic simple fallback: {simple}")
+                if getattr(simple_fault_agent, "_runtime_faults", 0) != 1:
+                    raise SystemExit(
+                        "simple exception fallback did not record exactly one fault")
 
             click_agent = AgentClass(
                 card_id="runtime-click-smoke",
@@ -149,12 +180,23 @@ def main() -> None:
                 click_agent._choose_action = (
                     lambda _frames, _latest: (_ for _ in ()).throw(
                         ValueError("click smoke fault")))
+            elif args.profile == "legacy-hardened":
+                click_agent._choose_action = (
+                    lambda _frames, _latest: (_ for _ in ()).throw(
+                        ValueError("legacy click smoke fault")))
             grid[19][37] = 7
             click = click_agent.choose_action([], frame([6], grid))
             coords = (click.action_data.x, click.action_data.y)
-            if click is not GameAction.ACTION6 or coords != (37, 19):
+            expected_coords = (
+                (32, 32) if args.profile == "legacy-hardened" else (37, 19)
+            )
+            if click is not GameAction.ACTION6 or coords != expected_coords:
                 raise SystemExit(
                     f"invalid frame-derived click fallback: {click} {coords}")
+            if args.profile == "legacy-hardened" \
+                    and getattr(click_agent, "_runtime_faults", 0) != 1:
+                raise SystemExit(
+                    "click exception fallback did not record exactly one fault")
         finally:
             if previous is None:
                 os.environ.pop("CURIO_EXPLORER", None)
@@ -169,9 +211,15 @@ def main() -> None:
     if args.profile == "graph-hardened":
         print("graph mode: enabled; simple fallback: ACTION4")
         print("click fallback: ACTION6 at current-frame pixel (37, 19)")
-    else:
+    elif args.profile == "legacy":
         print(f"legacy mode: enabled; legal simple action: ACTION{simple.value}")
         print("legacy click policy: ACTION6 at current-frame pixel (37, 19)")
+    else:
+        print(
+            "legacy-hardened mode: enabled; normal action: "
+            f"ACTION{normal.value}; simple exception fallback: ACTION4"
+        )
+        print("click exception fallback: ACTION6 at frame center (32, 32)")
 
 
 if __name__ == "__main__":

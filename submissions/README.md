@@ -44,3 +44,25 @@ Validation requires a byte-exact match to
 `baselines/curio_v7_threadsafe.py`, no external sources, no graph-mode
 environment override, a legal registry smoke, and the forced threaded action
 payload test.
+
+## Curio v7 Hardened (original ablation)
+
+`curio-v7-hardened/` is a second private kernel identity for the same frozen
+v7 lineage. It embeds `baselines/curio_v7_fault_contained.py`: the thread-safe
+v7 source plus a top-level exception boundary that leaves successful policy
+actions unchanged and emits a deterministic advertised action only when an
+unexpected hidden-game parser fault occurs. The graph explorer remains off.
+
+Build, validate, push, and check it with:
+
+```sh
+make package-curio-v7-hardened
+make verify-curio-v7-hardened
+make submit-curio-v7-hardened
+make status-curio-v7-hardened
+```
+
+Validation requires a byte-exact embedded source, private original-only
+metadata, no external sources or graph-mode override, a registry smoke that
+checks both the untouched legacy path and injected simple/click exceptions,
+and a 1,000-iteration forced threaded payload test.

@@ -99,14 +99,76 @@ from __future__ import annotations
 import os
 import random
 import zlib
+from copy import deepcopy
 from collections import Counter, defaultdict, deque
 from heapq import heappop, heappush
 from itertools import count, permutations
+from threading import local
 from typing import Any, Optional
 
 from arcengine import FrameData, GameAction, GameState
 
 from agents.agent import Agent
+
+
+def _install_thread_local_game_action_payloads() -> None:
+    """Keep mutable ``GameAction`` payloads local to each Swarm thread.
+
+    ``arcengine.GameAction`` members are Enum singletons, but ``set_data``
+    replaces a mutable ``action_data`` attribute on those singletons.  The
+    official framework runs one agent per game in a thread and reads that
+    attribute only after ``choose_action`` returns.  Another game can
+    therefore replace an ACTION6 click between selection and submission.
+
+    A data descriptor preserves the public GameAction API while routing its
+    two mutable payload attributes through ``threading.local``.  No framework
+    code or lock is needed, and single-threaded callers observe the same
+    values and object types as before.
+    """
+    if getattr(GameAction, "_curio_thread_local_payloads", False):
+        return
+
+    data_defaults = {
+        action: action.action_data.model_copy(deep=True)
+        for action in GameAction
+    }
+    reasoning_defaults = {
+        action: deepcopy(getattr(action, "reasoning", None))
+        for action in GameAction
+    }
+    payloads = local()
+
+    def thread_map(name: str) -> dict[GameAction, Any]:
+        values = getattr(payloads, name, None)
+        if values is None:
+            values = {}
+            setattr(payloads, name, values)
+        return values
+
+    def get_action_data(action: GameAction) -> Any:
+        values = thread_map("action_data")
+        if action not in values:
+            values[action] = data_defaults[action].model_copy(deep=True)
+        return values[action]
+
+    def set_action_data(action: GameAction, value: Any) -> None:
+        thread_map("action_data")[action] = value
+
+    def get_reasoning(action: GameAction) -> Any:
+        values = thread_map("reasoning")
+        if action not in values:
+            values[action] = deepcopy(reasoning_defaults[action])
+        return values[action]
+
+    def set_reasoning(action: GameAction, value: Any) -> None:
+        thread_map("reasoning")[action] = value
+
+    GameAction.action_data = property(get_action_data, set_action_data)
+    GameAction.reasoning = property(get_reasoning, set_reasoning)
+    GameAction._curio_thread_local_payloads = True
+
+
+_install_thread_local_game_action_payloads()
 
 GRID = 64
 STUCK_LIMIT = 12

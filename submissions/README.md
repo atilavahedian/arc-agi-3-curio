@@ -23,3 +23,24 @@ make status-curio-graph-v16
 
 The validator requires the embedded agent to exactly match the repository
 source and rejects external solver, model, dataset, and kernel markers.
+
+## Curio v7 Threadsafe (original ablation)
+
+`curio-v7-threadsafe/` isolates the frozen pre-external Curio v7 policy and
+adds only the verified thread-local `GameAction` payload repair. It leaves the
+later graph explorer off and has its own private Kaggle kernel identity, so it
+cannot overwrite the current candidate or its history.
+
+Build, validate, push, and check it with:
+
+```sh
+make package-curio-v7-threadsafe
+make verify-curio-v7-threadsafe
+make submit-curio-v7-threadsafe
+make status-curio-v7-threadsafe
+```
+
+Validation requires a byte-exact match to
+`baselines/curio_v7_threadsafe.py`, no external sources, no graph-mode
+environment override, a legal registry smoke, and the forced threaded action
+payload test.

@@ -1,10 +1,9 @@
-"""Smoke the generated Curio notebook through Kaggle's agent registry shape.
+"""Smoke a generated Curio notebook through Kaggle's agent registry shape.
 
 This deliberately stops before opening an ARC gateway connection.  It proves
 that the exact agent embedded in the candidate notebook can be copied into a
 fresh framework tree, imported through the notebook-generated ``agents``
-registry, instantiated in baked graph mode, and keep returning legal actions
-when its policy raises.
+registry, instantiated in its declared profile, and returns legal actions.
 """
 
 from __future__ import annotations
@@ -68,6 +67,12 @@ def main() -> None:
         "candidate", nargs="?", type=Path, default=DEFAULT_CANDIDATE)
     parser.add_argument(
         "--framework-dir", type=Path, default=DEFAULT_FRAMEWORK)
+    parser.add_argument(
+        "--profile",
+        choices=("graph-hardened", "legacy"),
+        default="graph-hardened",
+        help="runtime assertions appropriate to the embedded Curio generation",
+    )
     args = parser.parse_args()
 
     candidate = args.candidate.resolve()
@@ -98,7 +103,10 @@ def main() -> None:
                 del sys.modules[name]
         sys.path.insert(0, str(sandbox))
         previous = os.environ.get("CURIO_EXPLORER")
-        os.environ["CURIO_EXPLORER"] = "graph"
+        if args.profile == "graph-hardened":
+            os.environ["CURIO_EXPLORER"] = "graph"
+        else:
+            os.environ.pop("CURIO_EXPLORER", None)
         try:
             registry = importlib.import_module("agents")
             AgentClass = registry.AVAILABLE_AGENTS["myagent"]
@@ -110,16 +118,24 @@ def main() -> None:
                 record=False,
                 arc_env=None,
             )
-            if not agent._gx_on:
-                raise SystemExit("candidate did not instantiate in graph mode")
-
             grid = [[0 for _x in range(64)] for _y in range(64)]
-            agent._policy = lambda _grid, _latest: (_ for _ in ()).throw(
-                RuntimeError("registry smoke fault"))
-            simple = agent.choose_action([], frame([0, 4, 6], grid))
-            if simple is not GameAction.ACTION4:
-                raise SystemExit(
-                    f"illegal/non-deterministic simple fallback: {simple}")
+            if args.profile == "graph-hardened":
+                if not agent._gx_on:
+                    raise SystemExit(
+                        "candidate did not instantiate in graph mode")
+                agent._policy = lambda _grid, _latest: (_ for _ in ()).throw(
+                    RuntimeError("registry smoke fault"))
+                simple = agent.choose_action([], frame([0, 4, 6], grid))
+                if simple is not GameAction.ACTION4:
+                    raise SystemExit(
+                        f"illegal/non-deterministic simple fallback: {simple}")
+            else:
+                if hasattr(agent, "_gx_on"):
+                    raise SystemExit(
+                        "legacy candidate unexpectedly contains graph mode")
+                simple = agent.choose_action([], frame([1, 2, 3, 4], grid))
+                if simple.value not in {1, 2, 3, 4}:
+                    raise SystemExit(f"legacy agent returned illegal action: {simple}")
 
             click_agent = AgentClass(
                 card_id="runtime-click-smoke",
@@ -129,9 +145,10 @@ def main() -> None:
                 record=False,
                 arc_env=None,
             )
-            click_agent._choose_action = (
-                lambda _frames, _latest: (_ for _ in ()).throw(
-                    ValueError("click smoke fault")))
+            if args.profile == "graph-hardened":
+                click_agent._choose_action = (
+                    lambda _frames, _latest: (_ for _ in ()).throw(
+                        ValueError("click smoke fault")))
             grid[19][37] = 7
             click = click_agent.choose_action([], frame([6], grid))
             coords = (click.action_data.x, click.action_data.y)
@@ -149,8 +166,12 @@ def main() -> None:
                     del sys.modules[name]
 
     print(f"registry smoke: {metadata['id']} -> myagent/MyAgent")
-    print("graph mode: enabled; simple fallback: ACTION4")
-    print("click fallback: ACTION6 at current-frame pixel (37, 19)")
+    if args.profile == "graph-hardened":
+        print("graph mode: enabled; simple fallback: ACTION4")
+        print("click fallback: ACTION6 at current-frame pixel (37, 19)")
+    else:
+        print(f"legacy mode: enabled; legal simple action: ACTION{simple.value}")
+        print("legacy click policy: ACTION6 at current-frame pixel (37, 19)")
 
 
 if __name__ == "__main__":

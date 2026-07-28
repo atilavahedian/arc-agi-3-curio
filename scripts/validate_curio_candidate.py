@@ -1,4 +1,4 @@
-"""Validate the standalone original Curio graph Kaggle candidate."""
+"""Validate a standalone original Curio Kaggle candidate."""
 
 from __future__ import annotations
 
@@ -26,6 +26,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "submission_dir", nargs="?", type=Path, default=DEFAULT_CANDIDATE)
+    parser.add_argument(
+        "--source-agent",
+        type=Path,
+        default=ROOT / "agent" / "my_agent.py",
+        help="repository source that must exactly match the embedded agent",
+    )
+    parser.add_argument(
+        "--explorer",
+        choices=("graph", "off"),
+        default="graph",
+        help="explorer mode that must be baked into the run cell",
+    )
     args = parser.parse_args()
 
     candidate = args.submission_dir.resolve()
@@ -62,7 +74,7 @@ def main() -> None:
     if metadata.get("enable_internet") is not False:
         fail("competition notebook must have internet disabled")
     if metadata.get("enable_gpu") is not True:
-        fail("Curio graph candidate metadata must enable the Kaggle GPU runtime")
+        fail("Curio candidate metadata must enable the Kaggle GPU runtime")
     if metadata.get("competition_sources") != [
             "arc-prize-2026-arc-agi-3"]:
         fail("competition_sources must contain only the official ARC-AGI-3 source")
@@ -75,9 +87,12 @@ def main() -> None:
     if len(write_cells) != 1:
         fail("expected exactly one /tmp/my_agent.py write cell")
     embedded_agent = write_cells[0][len(WRITE_MARKER):]
-    source_agent = (ROOT / "agent" / "my_agent.py").read_text(encoding="utf-8")
+    source_path = args.source_agent.resolve()
+    if not source_path.is_file():
+        fail(f"missing source agent: {source_path}")
+    source_agent = source_path.read_text(encoding="utf-8")
     if embedded_agent != source_agent:
-        fail("embedded my_agent.py does not exactly match agent/my_agent.py")
+        fail(f"embedded my_agent.py does not exactly match {source_path}")
 
     source = "\n".join(texts)
     run_cells = [text for text in texts
@@ -85,9 +100,11 @@ def main() -> None:
                  and "python main.py --agent myagent" in text]
     if len(run_cells) != 1:
         fail("expected exactly one competition run cell")
-    if "CURIO_EXPLORER=graph python main.py --agent myagent" \
-            not in run_cells[0]:
+    graph_command = "CURIO_EXPLORER=graph python main.py --agent myagent"
+    if args.explorer == "graph" and graph_command not in run_cells[0]:
         fail("competition run cell does not bake CURIO_EXPLORER=graph")
+    if args.explorer == "off" and "CURIO_EXPLORER=" in run_cells[0]:
+        fail("competition run cell must leave CURIO_EXPLORER unset")
     if "CURIO_GENERIC_ONLY=1" in run_cells[0]:
         fail("competition run cell must not enable the generic-only ablation")
 
@@ -116,7 +133,10 @@ def main() -> None:
     print(f"kernel: {metadata['id']}")
     print(f"agent sha256: {agent_sha}")
     print(f"notebook sha256: {notebook_sha}")
-    print(f"external sources: 0; cells: {len(cells)}; graph mode: baked")
+    print(
+        f"external sources: 0; cells: {len(cells)}; "
+        f"graph mode: {'baked' if args.explorer == 'graph' else 'off'}"
+    )
 
 
 if __name__ == "__main__":

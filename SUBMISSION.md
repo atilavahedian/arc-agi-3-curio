@@ -27,8 +27,10 @@ seeds 0, 7, and 42. On all three seeds:
 - `su15`: at least 1 level;
 - `sc25`: unchanged at 0.
 
-The 18-game held safety pass showed no level regression in seed 0. These are
-local measurements, not a promise of a hidden leaderboard score or first place.
+The fixed 18-game regression pass showed no level regression in seed 0. Several
+games in that set have been explicitly tuned, so this is a safety check rather
+than a held-out generalization result. These local measurements are not a
+promise of a hidden leaderboard score or first place.
 
 ## Build and verify
 

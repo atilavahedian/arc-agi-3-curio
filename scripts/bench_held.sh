@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# bench_held.sh — honest scoreboard over the HELD-18 proxy set.
+# bench_held.sh — fixed scoreboard over the historical 18-game proxy set.
 #
-# Runs the Curio agent across all 18 held-out games (never tuned on) for
-# three seeds, printing each game's per-seed level count and the aggregate
-# scorecard score per seed plus a mean. The held set is the honest proxy
-# for generalization; the FIT set is reverse-engineered and excluded here.
+# Runs the Curio agent across the same 18 public games for three seeds,
+# printing each game's per-seed level count and the aggregate scorecard score
+# per seed plus a mean. Several games in this set have since been explicitly
+# tuned, so it is a regression subset, not held-out generalization evidence.
+# The filename is retained for command compatibility.
 #
 # Usage:
 #   scripts/bench_held.sh                 # full agent, seeds 0 1 2
@@ -19,15 +20,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-HELD="tu93 ar25 re86 su15 m0r0 sc25 sp80 ka59 g50t sb26 lf52 bp35 s5i5 r11l sk48 wa30 cd82 tn36"
-CSV="$(echo "$HELD" | tr ' ' ',')"
+REGRESSION="tu93 ar25 re86 su15 m0r0 sc25 sp80 ka59 g50t sb26 lf52 bp35 s5i5 r11l sk48 wa30 cd82 tn36"
+CSV="$(echo "$REGRESSION" | tr ' ' ',')"
 
 STEPS="${STEPS:-4000}"
 SEEDS="${SEEDS:-0 1 2}"
 
 echo "================================================================"
-echo "HELD-18 honest scoreboard"
-echo "  games:  $HELD"
+echo "FIXED-18 regression scoreboard (not held out)"
+echo "  games:  $REGRESSION"
 echo "  steps:  $STEPS   seeds: $SEEDS"
 echo "  CURIO_GENERIC_ONLY=${CURIO_GENERIC_ONLY:-<unset>}"
 echo "================================================================"
@@ -57,8 +58,8 @@ echo
 echo "================================================================"
 if [[ "$agg_n" -gt 0 ]]; then
   mean="$(python3 -c "print(round($agg_sum / $agg_n, 4))")"
-  echo "HELD-18 mean aggregate scorecard over $agg_n seed(s): $mean"
+  echo "FIXED-18 mean aggregate scorecard over $agg_n seed(s): $mean"
 else
-  echo "HELD-18 mean aggregate scorecard: NA (no aggregate lines parsed)"
+  echo "FIXED-18 mean aggregate scorecard: NA (no aggregate lines parsed)"
 fi
 echo "================================================================"

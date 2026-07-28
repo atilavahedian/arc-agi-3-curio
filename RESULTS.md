@@ -39,13 +39,14 @@ against 208) and still scores exactly 100.00%.
 
 Two facts follow, and they set the priorities.
 
-**Scoring heavily favors complete, efficient play.** Every current local win
-sits at the per-game cap of 100 and every current non-win scores under 3. The
+**Scoring heavily favors complete, efficient play.** The seven full wins
+contribute 28.0000 points to the 25-game mean; all partial campaigns together
+contribute the remaining 1.4916 points (5.1% of the measured 29.4916%). The
 metric squares `baseline/actions`, so a level completed in 9,990 actions is
-worth ~0, and a game's score is also capped at
+worth ~0. A game's score is also capped at
 `completed_weight/total_weight*100` — completing 1 of 8 levels caps that game
-at 2.8 no matter how fast it was. Partial progress can move the score, but
-complete wins dominate this public-game development measurement.
+at 2.8 no matter how fast it was. Partial progress matters, but complete wins
+dominate this public-game development measurement.
 
 **The family heads carry the public-game score.** The generic core wins zero
 public games alone and scores 0.1433%, versus 29.4916% for the complete agent.
@@ -58,10 +59,12 @@ invalidates the earlier hidden-variant assumption.
 
 Recorded so none of these is retried on intuition.
 
-The dominant visible symptom is a level-2 wall: 14 of 25 games clear level 1 at
-or below the human baseline, then spend ~9,900 actions on level 2. Instrumented
-with `scripts/diagnose_stall.py`, two mechanisms were confirmed and two fixes
-were measured and rejected.
+The dominant visible symptom is an unsolved-level wall: 17 of 18 non-winning
+games spend at least 8,000 actions on their first unsolved level, including 15
+that spend at least 9,000. Among the 16 non-winners with any completed level,
+only three complete every solved prefix at or below the human baseline.
+Instrumented with `scripts/diagnose_stall.py`, two mechanisms were confirmed
+and two fixes were measured and rejected.
 
 *Novelty trap.* On lp85 level 2 the explorer emits the click key `6:20,16` 610
 times from 134 distinct states. A click that reliably changes the board makes
@@ -258,7 +261,9 @@ Run a single public game:
 CURIO_EXPLORER=graph CURIO_SEED=0 make play-local GAME=cn04 STEPS=1000
 ```
 
-Run the fixed three-seed proxy:
+Run the fixed three-seed regression subset. Despite its historical filename,
+this is not held-out or an unseen-generalization estimate because several games
+in the set have since been explicitly tuned:
 
 ```bash
 CURIO_EXPLORER=graph STEPS=1000 SEEDS="0 7 42" scripts/bench_held.sh

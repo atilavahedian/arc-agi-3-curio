@@ -27,3 +27,21 @@ Verify the forced-interleaving repair with:
 .venv/bin/python scripts/check_action_thread_safety.py \
   --agent-source baselines/curio_v7_threadsafe.py --iterations 10000
 ```
+
+## `curio_v7_fault_contained.py`
+
+- Base policy: the frozen thread-safe v7 source above, SHA-256
+  `9270deee1c6e25ffa8fe537494b05f13e861cece19276019b4b28a8763e9ac68`.
+- Policy changes on healthy calls: none.
+- Runtime change: a top-level exception boundary clears transient plans and
+  returns a deterministic advertised action, so one unexpected policy fault
+  cannot terminate the game thread.
+- Delta from the frozen base: 117 insertions, 0 deletions.
+- Hardened SHA-256:
+  `0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69`.
+- Reproducible evidence: `runs/v7_fault_containment.json`.
+- External datasets, models, kernels, and solver sources: none.
+
+The evidence includes 3,129 action-for-action healthy-path comparisons with
+zero fallbacks, plus a 10,000-iteration forced race probe. These are local
+engineering gates, not a hidden-score claim.

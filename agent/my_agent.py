@@ -4258,6 +4258,186 @@ class MyAgent(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
+        """Run the policy behind a last-resort runtime circuit breaker.
+
+        A hidden board can expose a parser shape that no public game did.  A
+        single uncaught exception would otherwise terminate the environment
+        thread and forfeit every remaining action in the game.  Keep the
+        entire established policy path untouched on success; only a raised
+        exception enters the deterministic advertised-action fallback.
+        """
+        try:
+            return self._choose_action(frames, latest_frame)
+        except Exception as error:
+            try:
+                return self._runtime_fallback(latest_frame, error)
+            except Exception as fallback_error:
+                # The fallback deliberately avoids all perception/model code,
+                # so this is an emergency guard for a malformed framework
+                # object rather than an expected path.  RESET is the only
+                # action whose construction needs neither a frame nor data.
+                action = GameAction.RESET
+                action.reasoning = {
+                    "why": "runtime fallback failed: "
+                    f"{type(error).__name__}/{type(fallback_error).__name__}"
+                }
+                return action
+
+    @staticmethod
+    def _runtime_click_point(latest_frame: FrameData) -> Cell:
+        """Pick one deterministic, in-bounds visible pixel from this frame.
+
+        The emergency path must not depend on learned geography, hard-coded
+        coordinates or any of the parsers that may have raised.  Prefer an
+        actual pixel of the rarest non-background colour, nearest that
+        colour's centroid.  A uniform board falls back to its own geometric
+        centre.  Official frames are rectangular integer grids; the guarded
+        row handling also keeps a ragged/malformed frame contained.
+        """
+        try:
+            rendered = latest_frame.frame
+            grid = rendered[-1]
+            rows = [row for row in grid if len(row) > 0]
+        except (AttributeError, IndexError, TypeError):
+            return (0, 0)
+        if not rows:
+            return (0, 0)
+
+        positions: dict[Any, list[Cell]] = {}
+        first_seen: dict[Any, int] = {}
+        ordinal = 0
+        try:
+            for y, row in enumerate(grid):
+                for x, color in enumerate(row):
+                    if color not in positions:
+                        positions[color] = []
+                        first_seen[color] = ordinal
+                    positions[color].append((x, y))
+                    ordinal += 1
+        except (TypeError, ValueError):
+            # Non-hashable cell values are outside the ARC contract, but the
+            # current frame still supplies a valid coordinate domain.
+            y = next(i for i, row in enumerate(grid) if len(row) > 0)
+            return (len(grid[y]) // 2, y)
+        if not positions:
+            return (0, 0)
+
+        background = min(
+            positions,
+            key=lambda color: (-len(positions[color]), first_seen[color]),
+        )
+        foreground = [color for color in positions if color != background]
+        if not foreground:
+            y = len(grid) // 2
+            if len(grid[y]) == 0:
+                y = next(i for i, row in enumerate(grid) if len(row) > 0)
+            return (len(grid[y]) // 2, y)
+
+        color = min(
+            foreground,
+            key=lambda value: (len(positions[value]), first_seen[value]),
+        )
+        cells = positions[color]
+        sx = sum(x for x, _y in cells)
+        sy = sum(y for _x, y in cells)
+        n = len(cells)
+        # Compare n-scaled distances so this remains exact integer arithmetic.
+        return min(
+            cells,
+            key=lambda cell: (
+                (cell[0] * n - sx) ** 2 + (cell[1] * n - sy) ** 2,
+                cell[1], cell[0],
+            ),
+        )
+
+    def _runtime_fallback(
+        self, latest_frame: FrameData, error: Exception
+    ) -> GameAction:
+        """Contain one policy fault and emit a deterministic legal action."""
+        self._runtime_faults = getattr(self, "_runtime_faults", 0) + 1
+        self._last_runtime_fault = type(error).__name__
+
+        # A fault may have happened after a specialized head consumed part of
+        # a plan.  Discard only transient queues; learned physics and causal
+        # evidence remain available for the next successful policy call.
+        for name in (
+            "_plan", "_lattice_plan", "_sw_plan", "_ov_plan",
+            "_ed_meta_plan", "_sort_plan", "_kp_plan", "_panel_clicks",
+            "_spell_clicks", "_spell_campaign_clicks", "_gx_route",
+        ):
+            queue = getattr(self, name, None)
+            clear = getattr(queue, "clear", None)
+            if clear is not None:
+                try:
+                    clear()
+                except Exception:
+                    pass
+        if hasattr(self, "_wp_replay"):
+            self._wp_replay = None
+
+        state = getattr(latest_frame, "state", None)
+        if state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            # RESET is necessary only when the engine is explicitly outside an
+            # active life.  Do not preserve a dead frame as learning input.
+            self._prev_grid = None
+            self._prev_key = None
+            self._prev_action = None
+            action = GameAction.RESET
+            action.reasoning = {
+                "why": f"runtime recovery reset after {type(error).__name__}"
+            }
+            return action
+
+        known = {action.value: action for action in GameAction}
+        advertised: list[int] = []
+        for raw in getattr(latest_frame, "available_actions", None) or []:
+            value = getattr(raw, "value", raw)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value in known and value not in advertised:
+                advertised.append(value)
+
+        # Prefer a simple non-RESET input.  It cannot carry stale click data
+        # and, unlike RESET, keeps the current life and progress intact.
+        simple = sorted(
+            value for value in advertised
+            if value not in (GameAction.RESET.value, GameAction.ACTION6.value)
+        )
+        if simple:
+            action = known[simple[0]]
+            action_key = str(action.value)
+        elif GameAction.ACTION6.value in advertised:
+            x, y = self._runtime_click_point(latest_frame)
+            action = GameAction.ACTION6
+            action.set_data({"x": x, "y": y})
+            action_key = f"6:{x},{y}"
+        else:
+            # No non-RESET action was advertised.  This is the only active-
+            # frame case where RESET cannot displace a known-valid input.
+            action = GameAction.RESET
+            action_key = "0"
+
+        action.reasoning = {
+            "why": f"runtime fallback after {type(error).__name__}"
+        }
+        try:
+            rendered = latest_frame.frame
+            self._prev_grid = rendered[-1] if rendered else None
+        except (AttributeError, IndexError, TypeError):
+            self._prev_grid = None
+        # The normal path may have failed before or after hashing.  Nulling the
+        # key prevents an edge from being recorded under a stale identity;
+        # the next healthy frame re-keys normally while still learning the
+        # fallback action's visible effect from _prev_grid/_prev_action.
+        self._prev_key = None
+        self._prev_action = action_key
+        return action
+
+    def _choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
             if latest_frame.state is GameState.GAME_OVER \
                     and self._prev_grid is not None:

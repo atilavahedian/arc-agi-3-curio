@@ -20,6 +20,7 @@ of the leaderboard score: Kaggle evaluates 110 separate unseen games.
 Usage:
     .venv/bin/python scripts/sweep.py --max-steps 1000 --jobs 6
     .venv/bin/python scripts/sweep.py --games cn04,ft09 --max-steps 2000
+    .venv/bin/python scripts/sweep.py --agent-source baselines/curio_v7_threadsafe.py
     .venv/bin/python scripts/sweep.py --out runs/baseline.json
 """
 from __future__ import annotations
@@ -49,9 +50,11 @@ ALL_GAMES = [
 ]
 
 
-def _load_agent_class():
+def _load_agent_class(agent_source: Path):
     spec = importlib.util.spec_from_file_location(
-        "user_agent_module", ROOT / "agent" / "my_agent.py")
+        "user_agent_module", agent_source)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load agent source: {agent_source}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.MyAgent
@@ -70,7 +73,7 @@ def game_score(level_scores: list[float], completed: list[bool]) -> float:
 
 
 def run_one(game_id: str, max_steps: int, seed: str,
-            env: dict[str, str]) -> dict[str, Any]:
+            env: dict[str, str], agent_source: str) -> dict[str, Any]:
     """Play one game in this process and return its per-level detail."""
     os.environ.update(env)
     os.environ["CURIO_SEED"] = seed
@@ -84,7 +87,7 @@ def run_one(game_id: str, max_steps: int, seed: str,
 
     started = time.time()
     arc = arc_agi.Arcade(operation_mode=OperationMode.NORMAL)
-    AgentCls = _load_agent_class()
+    AgentCls = _load_agent_class(Path(agent_source))
     AgentCls.MAX_ACTIONS = min(AgentCls.MAX_ACTIONS, max_steps)
 
     # The agent and framework log heavily; keep the sweep output readable.
@@ -129,19 +132,35 @@ def main() -> None:
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2),
                    help="Parallel worker processes.")
     p.add_argument("--seed", default=os.environ.get("CURIO_SEED", "0"))
+    p.add_argument(
+        "--agent-source",
+        type=Path,
+        default=ROOT / "agent" / "my_agent.py",
+        help="standalone agent source to evaluate (default: agent/my_agent.py)",
+    )
     p.add_argument("--out", default=None, help="Write the full result JSON here.")
     p.add_argument("--label", default="", help="Free-text label stored in the JSON.")
     args = p.parse_args()
 
     games = ([g.strip() for g in args.games.split(",") if g.strip()]
              if args.games else list(ALL_GAMES))
+    agent_source = args.agent_source.resolve()
+    if not agent_source.is_file():
+        raise SystemExit(f"--agent-source does not exist: {agent_source}")
     passthrough = {k: v for k, v in os.environ.items() if k.startswith("CURIO_")}
 
     started = time.time()
     results: dict[str, dict[str, Any]] = {}
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run_one, g, args.max_steps, args.seed, passthrough): g
+            pool.submit(
+                run_one,
+                g,
+                args.max_steps,
+                args.seed,
+                passthrough,
+                str(agent_source),
+            ): g
             for g in games
         }
         for fut in as_completed(futures):
@@ -179,6 +198,7 @@ def main() -> None:
             "label": args.label,
             "max_steps": args.max_steps,
             "seed": args.seed,
+            "agent_source": str(agent_source),
             "aggregate": aggregate,
             "public_game_score_percent": aggregate,
             "games": ordered,

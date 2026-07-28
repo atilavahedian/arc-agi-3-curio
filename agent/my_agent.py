@@ -138,9 +138,6 @@ LATTICE_BFS_CAP = 6000  # BFS state budget for neighborhood-mask boards
 GX_RESET_CAP = 4        # graph-explorer RESET-backtracks per level before it
                         # defers to novelty (analog of LATTICE_DEATH_CAP:
                         # bounds wasted opening re-walks; tuned on HELD-18)
-GX_RESET_STALL = 256   # prolonged state-graph stall before branch RESET;
-                        # RESET replays an opening, so require a much stronger
-                        # stall than ordinary random tie-breaking
 GX_LETHAL_HITS = 2      # deaths on the SAME click-class before the graph
                         # explorer bans it (avoids one-off coincident-hazard
                         # false positives, and gives the affordance library a
@@ -12386,21 +12383,37 @@ class MyAgent(Agent):
         # RESET is globally legal in ArcEngine but official environments do
         # not advertise action 0 in ``available_actions``.  Therefore this
         # gate must use active-state context, not membership in ``avail``.
-        if self._steps_since_novelty > GX_RESET_STALL \
-                and self._gx_start is not None and key != self._gx_start \
+        # Do not also gate this on ``_steps_since_novelty``.  A one-way chain
+        # can show a genuinely new frame at every step, keeping that counter
+        # near zero even after it strands the agent in a directed sink.  The
+        # graph searches are the causal condition.  Because RESET can erase
+        # real in-level progress, only pay that cost for a fresh start node or
+        # a start-reachable information frontier (tier > 0), not merely an
+        # untried known movement/background action.
+        if self._gx_start is not None and key != self._gx_start \
                 and self._gx_resets < GX_RESET_CAP:
             start_node = self._gx_nodes.get(self._gx_start)
-            # The start itself may be exhausted while a previously observed
-            # safe edge from it leads to an unfinished branch.  Search the
-            # entire start-reachable component before deciding RESET has no
-            # value; an unseen start node is itself fresh frontier.
-            start_local = start_node is None or bool(
-                self._gx_untried(self._gx_start, start_node))
-            start_remote = not start_local \
-                and self._gx_bfs(self._gx_start) is not None
-            if start_local or start_remote:
+            # An unseen start node is itself fresh frontier.  Otherwise the
+            # start itself or a safe path from it must expose a live action
+            # with information/value salience above the known-rule floor.
+            start_fresh = start_node is None
+            start_local = (self._gx_untried(self._gx_start, start_node)
+                           if start_node is not None else [])
+            local_info = bool(start_local) and self._gx_live_tier(
+                start_node, start_local[0]) > 0
+            start_plan = self._gx_bfs(self._gx_start) \
+                if start_node is not None else None
+            remote_info = False
+            if start_plan is not None:
+                _path, dest = start_plan
+                dest_node = self._gx_nodes.get(dest)
+                dest_untried = (self._gx_untried(dest, dest_node)
+                                  if dest_node is not None else [])
+                remote_info = bool(dest_untried) and self._gx_live_tier(
+                    dest_node, dest_untried[0]) > 0
+            if start_fresh or local_info or remote_info:
                 return self._gx_emit_reset(
-                    key, "graph-explore RESET-backtrack")
+                    key, "graph-explore RESET to information frontier")
 
         # 5. Graph genuinely exhausted (or RESET unavailable / capped):
         # defer to the v7 revisit-ranker so behavior degrades gracefully.

@@ -91,14 +91,13 @@ class GraphResetEdgeTests(unittest.TestCase):
         agent._click_effects = {}
         agent._transitions = {(10, "1"): 20}
         agent._tried = defaultdict(set, {10: {"1"}, 30: {"7"}})
+        agent._gx_nodes[20]["salience"]["2"] = 1
         agent._steps_since_novelty = 0
         agent._masked_hash = lambda _grid: 30
         return agent
 
     def test_reset_reopens_remote_frontier_from_exhausted_start(self) -> None:
         agent = self._policy_agent()
-        reset_stall = agent._gx_bfs.__globals__["GX_RESET_STALL"]
-        agent._steps_since_novelty = reset_stall + 1
         frame = SimpleNamespace(
             available_actions=[GameAction.ACTION7.value]
         )
@@ -109,9 +108,35 @@ class GraphResetEdgeTests(unittest.TestCase):
         self.assertEqual(agent._gx_resets, 1)
         self.assertEqual(agent._gx_pending_reset, (30, "0"))
 
-    def test_remote_frontier_waits_for_a_real_stall_before_reset(self) -> None:
+    def test_novel_irreversible_chain_does_not_block_frontier_reset(self) -> None:
         agent = self._policy_agent()
+        # A just-discovered sink leaves this at zero.  Directed reachability,
+        # not a timer that novelty continually clears, decides backtracking.
+        agent._steps_since_novelty = 0
+        frame = SimpleNamespace(available_actions=[GameAction.ACTION7.value])
+
+        action = agent._graph_explore_policy([[0]], frame)
+
+        self.assertIs(action, GameAction.RESET)
+        self.assertEqual(agent._gx_resets, 1)
+        self.assertEqual(agent._gx_pending_reset, (30, "0"))
+
+    def test_no_reset_for_only_known_rule_frontier_at_start(self) -> None:
+        agent = self._policy_agent()
+        agent._gx_nodes[20]["salience"]["2"] = 0
         agent._gx_safe_novelty_body = lambda _grid, _frame: GameAction.ACTION7
+        frame = SimpleNamespace(available_actions=[GameAction.ACTION7.value])
+
+        action = agent._graph_explore_policy([[0]], frame)
+
+        self.assertIs(action, GameAction.ACTION7)
+        self.assertEqual(agent._gx_resets, 0)
+        self.assertIsNone(agent._gx_pending_reset)
+
+    def test_no_reset_while_current_component_has_remote_frontier(self) -> None:
+        agent = self._policy_agent()
+        agent._gx_nodes[40] = self._node("3")
+        agent._transitions[(30, "7")] = 40
         frame = SimpleNamespace(available_actions=[GameAction.ACTION7.value])
 
         action = agent._graph_explore_policy([[0]], frame)

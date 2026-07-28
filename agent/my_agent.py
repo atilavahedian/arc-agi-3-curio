@@ -12657,7 +12657,13 @@ class MyAgent(Agent):
             changed, tries = self._click_effects.get(sig, (0, 0))
             class_score = (changed + 2) / (tries + 3)
             shape_key = self._shape_effect_key(comps, coords, self._avail)
-            shape_changed, shape_tries = self._transfer_shape_effects.get(
+            # A completed level arms structural generalization; after that
+            # demonstration, current visible effects may refine the prior.
+            # Before the first success the snapshot is empty, so speculative
+            # first-level effects cannot perturb baseline exploration.
+            shape_source = (self._click_shape_effects
+                            if self._transfer_shape_effects else {})
+            shape_changed, shape_tries = shape_source.get(
                 shape_key, (0, 0)) if shape_key is not None else (0, 0)
             geometry = shape_key[1] if shape_key is not None else None
             shape_score = ((shape_changed + 2) / (shape_tries + 3)

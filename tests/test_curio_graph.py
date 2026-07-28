@@ -660,7 +660,6 @@ class ClickInstanceTests(unittest.TestCase):
         agent._gx_instance_effects = {}
         agent._gx_lethal_sig = set()
         agent._click_effects = {}
-        agent._click_shape_effects = {}
         agent._completion_click_shapes = Counter()
         agent._avail = {GameAction.ACTION6.value}
         agent._move_votes = defaultdict(Counter)
@@ -795,27 +794,6 @@ class ClickInstanceTests(unittest.TestCase):
         agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
 
         self.assertEqual(agent._completion_click_shapes, Counter())
-
-    def test_productive_colorless_shape_reorders_fresh_colors(self) -> None:
-        agent = self._agent()
-        grid = [[0 for _x in range(64)] for _y in range(64)]
-        grid[10][10] = grid[11][10] = 2
-        for y in (20, 21):
-            for x in (20, 21):
-                grid[y][x] = 7
-        comps = self.agent_class._gx_node.__globals__["components"](grid)
-        geometry_under = self.agent_class._gx_node.__globals__["geometry_under"]
-        key = (frozenset({GameAction.ACTION6.value}),
-               geometry_under(comps, (20, 20)))
-        agent._click_shape_effects[key] = [3, 3]
-        options = [
-            ("6:10,10", GameAction.ACTION6, (10, 10)),
-            ("6:20,20", GameAction.ACTION6, (20, 20)),
-        ]
-
-        ranked = agent._gx_afford_rank(grid, options)
-
-        self.assertEqual(ranked[0][0], "6:20,20")
 
     def test_unknown_twins_are_exposed_one_at_a_time(self) -> None:
         agent = self._agent()

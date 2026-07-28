@@ -3960,12 +3960,6 @@ class MyAgent(Agent):
         # buttons look identical on every level, so what a sprite class
         # DOES transfers even though geography doesn't)
         self._click_effects: dict[int, list[int]] = {}
-        # Colorless, position-free click physics.  Exact colored signatures
-        # remain authoritative; this weaker prior only orders otherwise-fresh
-        # classes when a recurring control is repainted between levels.
-        self._click_shape_effects: dict[
-            tuple[frozenset[int], tuple[Cell, ...]], list[int]
-        ] = {}
         # Direct causal labels from the final settled click before level-up.
         # Keyed by the advertised action interface plus colorless geometry;
         # neither game/level ids nor screen coordinates enter the memory.
@@ -5095,14 +5089,6 @@ class MyAgent(Agent):
                 if changed:
                     eff[0] += 1
                 eff[1] += 1
-                shape_key = self._shape_effect_key(
-                    comps_prev, (x, y), self._avail)
-                if shape_key is not None:
-                    shape_eff = self._click_shape_effects.setdefault(
-                        shape_key, [0, 0])
-                    if changed:
-                        shape_eff[0] += 1
-                    shape_eff[1] += 1
                 if self._gx_on:
                     self._gx_note_instance(
                         sig, (x, y), changed=changed, comps=comps_prev)
@@ -12674,8 +12660,6 @@ class MyAgent(Agent):
     ) -> list[tuple[str, GameAction, Optional[Cell]]]:
         """Soft click ranking that never hard-vetoes a whole shape class."""
         comps = components(grid)
-        geometry_counts: Counter[tuple[Cell, ...]] = Counter(
-            shape_geometry(cells) for _color, cells in comps)
         scored: list[tuple[float, tuple[str, GameAction, Optional[Cell]]]] = []
         for opt in opts:
             coords = opt[2]
@@ -12687,18 +12671,9 @@ class MyAgent(Agent):
             instance_score = (ich + 2) / (itr + 3)
             changed, tries = self._click_effects.get(sig, (0, 0))
             class_score = (changed + 2) / (tries + 3)
-            shape_key = self._shape_effect_key(comps, coords, self._avail)
-            shape_changed, shape_tries = self._click_shape_effects.get(
-                shape_key, (0, 0)) if shape_key is not None else (0, 0)
-            geometry = shape_key[1] if shape_key is not None else None
-            shape_score = ((shape_changed + 2) / (shape_tries + 3)
-                           if shape_tries and geometry is not None
-                           and geometry_counts[geometry] == 1 else 0.0)
             # Fresh instances retain the optimistic prior even when another
-            # same-looking object was inert on an earlier level.  Productive
-            # colorless geometry can only raise this soft ordering score; it
-            # never bypasses exact dead/lethal pruning.
-            scored.append((max(instance_score, class_score, shape_score), opt))
+            # same-looking object was inert on an earlier level.
+            scored.append((max(instance_score, class_score), opt))
         scored.sort(key=lambda so: -so[0])
         fill = iter(opt for _score, opt in scored)
         return [opt if opt[2] is None else next(fill) for opt in opts]

@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "artifact": "curio_v7_fault_containment",
+  "measured_at_utc": "2026-07-28T02:57:04Z",
+  "status": "promotable_local_ablation",
+  "sources": {
+    "frozen_threadsafe_base": {
+      "path": "baselines/curio_v7_threadsafe.py",
+      "sha256": "9270deee1c6e25ffa8fe537494b05f13e861cece19276019b4b28a8763e9ac68",
+      "commit": "765b145c0a4150541b4cfdaed0df88faff33df82"
+    },
+    "fault_contained_candidate": {
+      "path": "baselines/curio_v7_fault_contained.py",
+      "sha256": "0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69",
+      "commit": "f9ddbd8bff91ec5161ae22531464b05d25a75fd5",
+      "delta_from_frozen_base": {
+        "insertions": 117,
+        "deletions": 0,
+        "normal_policy_edits": 0,
+        "scope": [
+          "provenance note",
+          "top-level choose_action delegate boundary",
+          "deterministic advertised-action fallback",
+          "rename of the unchanged original choose_action body to _choose_action"
+        ]
+      }
+    },
+    "pre_thread_isolation_salvage": {
+      "path": "backups/curio_v7_salvage.py",
+      "sha256": "c45126dfc15719c1ddd6b56718e3075bc53ff7bcab911b1c21d99e81fa9ca0db",
+      "commit": "0708b53d6a670404e2b50396e27f89edd6b2aac8"
+    }
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "arc-agi": "0.9.8",
+    "arcengine": "0.9.3",
+    "arc_agi_3_agents_commit": "135f20aaf44f13341ebc425666bf03b5cac58d3c"
+  },
+  "focused_tests": {
+    "compile_command": ".venv/bin/python -m py_compile baselines/curio_v7_fault_contained.py tests/test_curio_v7_fault_containment.py",
+    "command": ".venv/bin/python -m unittest -v tests.test_curio_v7_fault_containment",
+    "passed": 4,
+    "failed": 0,
+    "errors": 0,
+    "duration_seconds": 11.452,
+    "cases": [
+      "success path returns the exact delegate object and payload",
+      "active failure selects the smallest advertised simple action",
+      "click-only failure selects a deterministic in-bounds coordinate",
+      "terminal failure resets and drops the stale learning edge"
+    ]
+  },
+  "full_suite": {
+    "command": "MPLCONFIGDIR=/tmp/arc3-v7-fault-mpl .venv/bin/python -m unittest discover -s tests -v",
+    "passed": 150,
+    "failed": 0,
+    "errors": 0,
+    "duration_seconds": 61.520
+  },
+  "thread_race": {
+    "command": "MPLCONFIGDIR=/tmp/arc3-v7-fault-mpl .venv/bin/python scripts/check_action_thread_safety.py --agent-source baselines/curio_v7_fault_contained.py --iterations 10000 --json",
+    "iterations": 10000,
+    "unpatched_control": {
+      "first_action_mismatches": 10000,
+      "first_reasoning_mismatches": 10000,
+      "second_action_mismatches": 0,
+      "second_reasoning_mismatches": 0
+    },
+    "candidate": {
+      "first_action_mismatches": 0,
+      "first_reasoning_mismatches": 0,
+      "second_action_mismatches": 0,
+      "second_reasoning_mismatches": 0
+    },
+    "separate_process_control": {
+      "workers": 2,
+      "action_mismatches": 0
+    },
+    "passed": true
+  },
+  "public_normal_path_parity": {
+    "command": ".venv/bin/python /private/tmp/curio_v7_parity_gate.py --games tu93,ft09,tr87,dc22,ka59,lp85 --max-steps 600 --seed 0 --jobs 4",
+    "harness": {
+      "tracked": false,
+      "location_during_run": "/private/tmp/curio_v7_parity_gate.py",
+      "isolation": "one fresh worker process per source and game",
+      "compared_fields": [
+        "terminal state",
+        "levels completed",
+        "action count",
+        "score",
+        "per-level scores",
+        "per-level action counts",
+        "complete action id and click-coordinate trace"
+      ]
+    },
+    "seed": 0,
+    "requested_action_cap": 600,
+    "observed_cap_note": "The official Agent.main loop uses action_counter <= MAX_ACTIONS, so unfinished runs contain 601 actions.",
+    "games": [
+      {
+        "game": "tu93",
+        "state": "GameState.NOT_FINISHED",
+        "levels_completed": 0,
+        "actions": 601,
+        "score": 0.0,
+        "level_actions": [601, 0, 0, 0, 0, 0, 0, 0, 0],
+        "level_scores": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "action_trace_sha256": "c4e122e83eb75a2d4a04e33edd996dc9d6f1a19a046b17edbbfb10ab978e8e3e",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      },
+      {
+        "game": "ft09",
+        "state": "GameState.WIN",
+        "levels_completed": 6,
+        "actions": 124,
+        "score": 100.0,
+        "level_actions": [22, 11, 20, 22, 30, 19],
+        "level_scores": [115.0, 115.0, 115.0, 115.0, 115.0, 115.0],
+        "action_trace_sha256": "7a3bcc6b4a48a4e9ce13bdfd170975e681db5ee4e4f48868f9829ead8ac38d35",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      },
+      {
+        "game": "tr87",
+        "state": "GameState.NOT_FINISHED",
+        "levels_completed": 3,
+        "actions": 601,
+        "score": 28.57142857142857,
+        "level_actions": [42, 30, 39, 490, 0, 0],
+        "level_scores": [115.0, 115.0, 105.19395134779748, 0.0, 0.0, 0.0],
+        "action_trace_sha256": "0acf97c6030da140e49a44ced86843f42141ad3be578758d3bf943520f6d3096",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      },
+      {
+        "game": "dc22",
+        "state": "GameState.NOT_FINISHED",
+        "levels_completed": 3,
+        "actions": 601,
+        "score": 12.633522927689594,
+        "level_actions": [200, 56, 225, 120, 0, 0],
+        "level_scores": [8.702499999999999, 115.0, 8.867160493827159, 0.0, 0.0, 0.0],
+        "action_trace_sha256": "42b59393d0739fa59be7b39164e7c2198db235212bd7d10d4a9b563f021e232c",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      },
+      {
+        "game": "ka59",
+        "state": "GameState.NOT_FINISHED",
+        "levels_completed": 0,
+        "actions": 601,
+        "score": 0.0,
+        "level_actions": [601, 0, 0, 0, 0, 0, 0],
+        "level_scores": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "action_trace_sha256": "33137b04dd3cbb96442ef1272d8ebc44cdbf37bd5c6544994a01bd1e82ea18e2",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      },
+      {
+        "game": "lp85",
+        "state": "GameState.NOT_FINISHED",
+        "levels_completed": 1,
+        "actions": 601,
+        "score": 2.7777777777777777,
+        "level_actions": [14, 587, 0, 0, 0, 0, 0, 0],
+        "level_scores": [115.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "action_trace_sha256": "f6d13022ed89fcfc010edd34ab39f7e83f1ac6ba2c3802a087a8661708ec08d7",
+        "candidate_fallbacks": 0,
+        "exact_parity": true
+      }
+    ],
+    "total_action_trace_length": 3129,
+    "subset_mean_score_percent": 23.997121546149324,
+    "candidate_fallbacks_total": 0,
+    "all_actions_exact": true,
+    "all_results_exact": true,
+    "passed": true
+  },
+  "provenance": {
+    "scope": "Local original Curio-v7 lineage plus independently implemented runtime containment only.",
+    "external_lab_or_competitor_code_used": false,
+    "external_dataset_sources": [],
+    "external_kernel_sources": [],
+    "external_model_sources": [],
+    "forbidden_marker_scan": {
+      "command": "rg -ni 'tufa|duck|qwen|taaf|driessmit|thtennant|vrfai|kagglehub|dataset_sources|kernel_sources|model_sources' baselines/curio_v7_fault_contained.py tests/test_curio_v7_fault_containment.py",
+      "matches": 0
+    },
+    "frozen_base_unchanged": true
+  },
+  "interpretation": {
+    "promotable": true,
+    "expected_effect": "No action change on healthy paths; an unexpected hidden-game policy exception is contained with a deterministic advertised action instead of terminating the game thread.",
+    "leaderboard_claim": "None. Public parity, unit tests, and race probes are local engineering gates and do not establish a hidden Kaggle score."
+  }
+}

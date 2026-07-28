@@ -9,13 +9,25 @@ Last updated: 2026-07-27.
 ## Official Kaggle evidence
 
 The latest completed original-Curio submission (`54980829`, submitted
-2026-07-25) scored **0.18**. A fresh pull of the private Kaggle kernel proved
-that its embedded agent matches the current repository source byte-for-byte:
+2026-07-25) scored **0.18**. A fresh pull of that private Kaggle kernel proved
+that its embedded agent matches repository commit `40f4c57` byte-for-byte:
 SHA-256 `e7132bb6659a48ed84e80c0d73aa5dc09c85ad110b6c701d51a07e6ba4fa61c9`.
 The kernel completed successfully, and the candidate contains no dataset,
 kernel, or model sources beyond the official competition source. The low score
 is therefore a generalization result, not a stale-package or runtime-failure
-artifact.
+artifact. Submission `55042869` (the original thread-isolation and informative-
+frontier candidate) was still pending when this file was updated; it has no
+claimed score yet.
+
+The account's historical **0.86** submission (`54768802`) is deliberately not
+treated as original-Curio evidence. Its pulled notebook is byte-identical to
+Git commit `80edbcc` (SHA-256
+`085bf89e1e8ea81335d36f92734345e144e437c7cfcf3035c90981a6a325275e`),
+explicitly identifies its solver as Tufa Labs' work, and attaches external
+Tufa/Qwen/vLLM datasets. That artifact is excluded from this project and will
+not be restored, copied, or resubmitted. The highest completed original Curio
+score recorded so far is **0.22** (`53644546`, Curio v7); 0.86 remains an
+account-level target to beat with independently built code, not our baseline.
 
 ## Where the score actually is (measured 2026-07-25)
 

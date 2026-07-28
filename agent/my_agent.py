@@ -12268,6 +12268,8 @@ class MyAgent(Agent):
     def _gx_tier(
         self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
         opt: tuple[str, GameAction, Optional[Cell]], *, instance_sigs: set[int],
+        action_profile: frozenset[int],
+        geometry_counts: Counter[tuple[Cell, ...]],
     ) -> int:
         """Salience tier for an untried option (higher = explore first).
         -1 dead (excluded); 0 known-rule moves / background clicks;
@@ -12284,15 +12286,29 @@ class MyAgent(Agent):
                 return 1                         # still learning: high info
             return 0
         sig = signature_under(comps, coords)
-        return (self._gx_click_tier(sig, coords) if sig in instance_sigs
-                else self._gx_class_click_tier(sig))
+        geometry = geometry_under(comps, coords)
+        geometry_unique = geometry is not None \
+            and geometry_counts[geometry] == 1
+        return (self._gx_click_tier(
+                    sig, coords, geometry, action_profile, geometry_unique)
+                if sig in instance_sigs else self._gx_class_click_tier(
+                    sig, geometry, action_profile, geometry_unique))
 
-    def _gx_class_click_tier(self, sig: int) -> int:
+    def _gx_class_click_tier(
+        self, sig: int, geometry: Optional[tuple[Cell, ...]] = None,
+        action_profile: Optional[frozenset[int]] = None,
+        geometry_unique: bool = False,
+    ) -> int:
         """Original graph salience for dense class-deduped boards."""
         if sig == 0:
             return 0
         if self._click_dead(sig) or sig in self._gx_lethal_sig:
             return -1
+        if geometry_unique and geometry is not None \
+                and action_profile is not None \
+                and self._transfer_shape_effects.get(
+                    (action_profile, geometry)):
+            return 4
         changed, tries = self._click_effects.get(sig, (0, 0))
         if tries == 0:
             return 3
@@ -12300,7 +12316,12 @@ class MyAgent(Agent):
             return 2
         return 0
 
-    def _gx_click_tier(self, sig: int, coords: Cell) -> int:
+    def _gx_click_tier(
+        self, sig: int, coords: Cell,
+        geometry: Optional[tuple[Cell, ...]] = None,
+        action_profile: Optional[frozenset[int]] = None,
+        geometry_unique: bool = False,
+    ) -> int:
         """Live salience for one click instance.
 
         Nodes cache their candidate geometry, but evidence changes after each
@@ -12311,6 +12332,11 @@ class MyAgent(Agent):
             return 0                             # background click
         if self._gx_instance_dead(sig, coords) or sig in self._gx_lethal_sig:
             return -1                            # this instance / class is unsafe
+        if geometry_unique and geometry is not None \
+                and action_profile is not None \
+                and self._transfer_shape_effects.get(
+                    (action_profile, geometry)):
+            return 4                             # demonstrated prior success
         changed, tries = self._click_effects.get(sig, (0, 0))
         inst_tries = self._gx_instance_effects.get(
             self._gx_instance_key(sig, coords), (0, 0))[1]
@@ -12326,9 +12352,15 @@ class MyAgent(Agent):
         if coords is None:
             return node["salience"].get(akey, 0)
         sig = node.get("sig", {}).get(akey, 0)
+        geometry = node.get("geometry", {}).get(akey)
+        action_profile = node.get("action_profile")
+        geometry_unique = geometry is not None \
+            and node.get("geometry_counts", {}).get(geometry, 0) == 1
         if sig in node.get("instance_sigs", set()):
-            return self._gx_click_tier(sig, coords)
-        return self._gx_class_click_tier(sig)
+            return self._gx_click_tier(
+                sig, coords, geometry, action_profile, geometry_unique)
+        return self._gx_class_click_tier(
+            sig, geometry, action_profile, geometry_unique)
 
     @staticmethod
     def _gx_instance_sigs(
@@ -12376,15 +12408,21 @@ class MyAgent(Agent):
         node = self._gx_nodes.get(key)
         if node is None:
             comps = components(grid) if grid is not None else []
+            action_profile = self._action_profile(avail)
+            geometry_counts: Counter[tuple[Cell, ...]] = Counter(
+                shape_geometry(cells) for _color, cells in comps)
             instance_sigs = self._gx_instance_sigs(comps, avail)
             options = self._gx_options(grid, avail)
             salience: dict[str, int] = {}
             actions: list[str] = []
             optmap: dict[str, tuple[str, GameAction, Optional[Cell]]] = {}
             sigmap: dict[str, int] = {}
+            geometry_map: dict[str, tuple[Cell, ...]] = {}
             for opt in options:
                 tier = (self._gx_tier(
-                    grid, comps, opt, instance_sigs=instance_sigs)
+                    grid, comps, opt, instance_sigs=instance_sigs,
+                    action_profile=action_profile,
+                    geometry_counts=geometry_counts)
                     if grid is not None else 0)
                 if tier < 0:
                     continue                     # dead signature: never offer
@@ -12393,8 +12431,14 @@ class MyAgent(Agent):
                 optmap[opt[0]] = opt
                 if opt[2] is not None:
                     sigmap[opt[0]] = signature_under(comps, opt[2])
+                    geometry = geometry_under(comps, opt[2])
+                    if geometry is not None:
+                        geometry_map[opt[0]] = geometry
             node = {"actions": actions, "salience": salience,
                     "optmap": optmap, "sig": sigmap,
+                    "geometry": geometry_map,
+                    "geometry_counts": geometry_counts,
+                    "action_profile": action_profile,
                     "instance_sigs": instance_sigs}
             self._gx_nodes[key] = node
         return node

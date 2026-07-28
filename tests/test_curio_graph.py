@@ -738,9 +738,12 @@ class ClickInstanceTests(unittest.TestCase):
             ("6:10,10", GameAction.ACTION6, (10, 10)),
             ("6:25,20", GameAction.ACTION6, (25, 20)),
         ]
+        node = agent._gx_node(
+            99, repainted, {GameAction.ACTION6.value})
 
         self.assertEqual(
             agent._gx_afford_rank(repainted, options)[0][0], "6:25,20")
+        self.assertEqual(agent._gx_live_tier(node, "6:25,20"), 4)
 
     def test_completion_shape_requires_same_observed_interface(self) -> None:
         agent = self._agent()

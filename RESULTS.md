@@ -4,18 +4,18 @@ This file records measured results for the original Curio agent. Local public
 environments are regression and development evidence; they are not a prediction
 of the hidden ARC-AGI-3 leaderboard score.
 
-Last updated: 2026-07-17.
+Last updated: 2026-07-27.
 
 ## Official Kaggle evidence
 
-The latest completed original-Curio submission scored **0.18**. Its submitted
-agent matches repository commit `29e278a`, not the current head. The current
-agent has several later, locally verified capabilities and has not yet received
-an official hidden score.
-
-The existing generated notebook is intentionally considered stale until the
-next capability batch is finished. Rebuild and identity validation are required
-before the next Kaggle push.
+The latest completed original-Curio submission (`54980829`, submitted
+2026-07-25) scored **0.18**. A fresh pull of the private Kaggle kernel proved
+that its embedded agent matches the current repository source byte-for-byte:
+SHA-256 `e7132bb6659a48ed84e80c0d73aa5dc09c85ad110b6c701d51a07e6ba4fa61c9`.
+The kernel completed successfully, and the candidate contains no dataset,
+kernel, or model sources beyond the official competition source. The low score
+is therefore a generalization result, not a stale-package or runtime-failure
+artifact.
 
 ## Where the score actually is (measured 2026-07-25)
 

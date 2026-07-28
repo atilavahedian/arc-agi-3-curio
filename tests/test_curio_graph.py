@@ -750,6 +750,25 @@ class ClickInstanceTests(unittest.TestCase):
 
         self.assertEqual(agent._gx_live_tier(node, click), 3)
 
+    def test_completion_shape_does_not_guess_among_ambiguous_twins(self) -> None:
+        agent = self._agent()
+        previous = [[0 for _x in range(64)] for _y in range(64)]
+        previous[7][11] = previous[8][11] = 3
+        agent._prev_grid = previous
+        agent._prev_action = "6:11,7"
+        agent._note_completion_click(frozenset({GameAction.ACTION6.value}))
+
+        ambiguous = [[0 for _x in range(64)] for _y in range(64)]
+        ambiguous[20][25] = ambiguous[20][26] = 8
+        ambiguous[30][35] = ambiguous[30][36] = 9
+        node = agent._gx_node(
+            99, ambiguous, {GameAction.ACTION6.value})
+        clicks = [a for a in node["actions"] if a.startswith("6:")]
+
+        self.assertTrue(clicks)
+        self.assertTrue(all(agent._gx_live_tier(node, click) == 3
+                            for click in clicks))
+
     def test_completion_shape_never_resurrects_dead_exact_class(self) -> None:
         agent = self._agent()
         grid = [[0 for _x in range(64)] for _y in range(64)]

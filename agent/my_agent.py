@@ -12256,6 +12256,7 @@ class MyAgent(Agent):
         self, grid: Grid, comps: list[tuple[int, frozenset[Cell]]],
         opt: tuple[str, GameAction, Optional[Cell]], *, instance_sigs: set[int],
         action_profile: frozenset[int],
+        geometry_counts: Counter[tuple[Cell, ...]],
     ) -> int:
         """Salience tier for an untried option (higher = explore first).
         -1 dead (excluded); 0 known-rule moves / background clicks;
@@ -12273,21 +12274,25 @@ class MyAgent(Agent):
             return 0
         sig = signature_under(comps, coords)
         geometry = geometry_under(comps, coords)
+        geometry_unique = geometry is not None \
+            and geometry_counts[geometry] == 1
         return (self._gx_click_tier(
-                    sig, coords, geometry, action_profile)
+                    sig, coords, geometry, action_profile, geometry_unique)
                 if sig in instance_sigs else self._gx_class_click_tier(
-                    sig, geometry, action_profile))
+                    sig, geometry, action_profile, geometry_unique))
 
     def _gx_class_click_tier(
         self, sig: int, geometry: Optional[tuple[Cell, ...]] = None,
         action_profile: Optional[frozenset[int]] = None,
+        geometry_unique: bool = False,
     ) -> int:
         """Original graph salience for dense class-deduped boards."""
         if sig == 0:
             return 0
         if self._click_dead(sig) or sig in self._gx_lethal_sig:
             return -1
-        if geometry is not None and action_profile is not None \
+        if geometry_unique and geometry is not None \
+                and action_profile is not None \
                 and self._completion_click_shapes.get(
                     (action_profile, geometry), 0):
             return 4
@@ -12302,6 +12307,7 @@ class MyAgent(Agent):
         self, sig: int, coords: Cell,
         geometry: Optional[tuple[Cell, ...]] = None,
         action_profile: Optional[frozenset[int]] = None,
+        geometry_unique: bool = False,
     ) -> int:
         """Live salience for one click instance.
 
@@ -12313,7 +12319,8 @@ class MyAgent(Agent):
             return 0                             # background click
         if self._gx_instance_dead(sig, coords) or sig in self._gx_lethal_sig:
             return -1                            # this instance / class is unsafe
-        if geometry is not None and action_profile is not None \
+        if geometry_unique and geometry is not None \
+                and action_profile is not None \
                 and self._completion_click_shapes.get(
                     (action_profile, geometry), 0):
             return 4                             # completed a prior level
@@ -12334,10 +12341,13 @@ class MyAgent(Agent):
         sig = node.get("sig", {}).get(akey, 0)
         geometry = node.get("geometry", {}).get(akey)
         action_profile = node.get("action_profile")
+        geometry_unique = geometry is not None \
+            and node.get("geometry_counts", {}).get(geometry, 0) == 1
         if sig in node.get("instance_sigs", set()):
             return self._gx_click_tier(
-                sig, coords, geometry, action_profile)
-        return self._gx_class_click_tier(sig, geometry, action_profile)
+                sig, coords, geometry, action_profile, geometry_unique)
+        return self._gx_class_click_tier(
+            sig, geometry, action_profile, geometry_unique)
 
     @staticmethod
     def _gx_instance_sigs(
@@ -12386,6 +12396,8 @@ class MyAgent(Agent):
         if node is None:
             comps = components(grid) if grid is not None else []
             action_profile = self._action_profile(avail)
+            geometry_counts: Counter[tuple[Cell, ...]] = Counter(
+                shape_geometry(cells) for _color, cells in comps)
             instance_sigs = self._gx_instance_sigs(comps, avail)
             options = self._gx_options(grid, avail)
             salience: dict[str, int] = {}
@@ -12396,7 +12408,8 @@ class MyAgent(Agent):
             for opt in options:
                 tier = (self._gx_tier(
                     grid, comps, opt, instance_sigs=instance_sigs,
-                    action_profile=action_profile)
+                    action_profile=action_profile,
+                    geometry_counts=geometry_counts)
                     if grid is not None else 0)
                 if tier < 0:
                     continue                     # dead signature: never offer
@@ -12411,6 +12424,7 @@ class MyAgent(Agent):
             node = {"actions": actions, "salience": salience,
                     "optmap": optmap, "sig": sigmap,
                     "geometry": geometry_map,
+                    "geometry_counts": geometry_counts,
                     "action_profile": action_profile,
                     "instance_sigs": instance_sigs}
             self._gx_nodes[key] = node
@@ -12660,6 +12674,8 @@ class MyAgent(Agent):
     ) -> list[tuple[str, GameAction, Optional[Cell]]]:
         """Soft click ranking that never hard-vetoes a whole shape class."""
         comps = components(grid)
+        geometry_counts: Counter[tuple[Cell, ...]] = Counter(
+            shape_geometry(cells) for _color, cells in comps)
         scored: list[tuple[float, tuple[str, GameAction, Optional[Cell]]]] = []
         for opt in opts:
             coords = opt[2]
@@ -12674,8 +12690,10 @@ class MyAgent(Agent):
             shape_key = self._shape_effect_key(comps, coords, self._avail)
             shape_changed, shape_tries = self._click_shape_effects.get(
                 shape_key, (0, 0)) if shape_key is not None else (0, 0)
+            geometry = shape_key[1] if shape_key is not None else None
             shape_score = ((shape_changed + 2) / (shape_tries + 3)
-                           if shape_tries else 0.0)
+                           if shape_tries and geometry is not None
+                           and geometry_counts[geometry] == 1 else 0.0)
             # Fresh instances retain the optimistic prior even when another
             # same-looking object was inert on an earlier level.  Productive
             # colorless geometry can only raise this soft ordering score; it

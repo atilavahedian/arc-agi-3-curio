@@ -1,0 +1,102 @@
+{
+  "study": "specialized-head activation and generic fallthrough audit",
+  "base_commit": "e59e78333cc391ae9721e87702569a96d9e16c5f",
+  "candidate_commit": "98da073",
+  "explorer": "graph",
+  "fixed_nonwinner_gate": {
+    "games": [
+      "ar25",
+      "su15",
+      "m0r0",
+      "lp85",
+      "dc22",
+      "sp80",
+      "g50t",
+      "sb26",
+      "lf52",
+      "bp35",
+      "s5i5",
+      "r11l",
+      "sk48",
+      "wa30",
+      "vc33",
+      "ls20",
+      "cd82",
+      "tn36"
+    ],
+    "seeds": [
+      0,
+      7,
+      42
+    ],
+    "max_steps": 2000,
+    "measurement": "direct end-to-end replay of all 54 game-seed pairs on base and candidate",
+    "baseline_by_seed": {
+      "0": 2.073256678391556,
+      "7": 2.1033536882322625,
+      "42": 2.1074801186851886
+    },
+    "candidate_by_seed": {
+      "0": 2.073259076327857,
+      "7": 2.103369561692407,
+      "42": 2.1074789512818928
+    },
+    "baseline_mean": 2.094696828436336,
+    "candidate_mean": 2.094702529767386,
+    "candidate_minus_baseline": 0.0000057013310502,
+    "exactly_unchanged_pairs": 51,
+    "changed_pairs": [
+      {
+        "seed": 0,
+        "game": "bp35",
+        "baseline_score": 0.00039707606154030666,
+        "candidate_score": 0.00044023891496381063,
+        "baseline_level_actions": [1571, 430, 0, 0, 0, 0, 0, 0, 0],
+        "candidate_level_actions": [1492, 509, 0, 0, 0, 0, 0, 0, 0]
+      },
+      {
+        "seed": 7,
+        "game": "bp35",
+        "baseline_score": 0.0,
+        "candidate_score": 0.00028572228260616045,
+        "baseline_level_actions": [2001, 0, 0, 0, 0, 0, 0, 0, 0],
+        "candidate_level_actions": [1852, 149, 0, 0, 0, 0, 0, 0, 0]
+      },
+      {
+        "seed": 42,
+        "game": "bp35",
+        "baseline_score": 0.0003526589223247133,
+        "candidate_score": 0.0003316456630053662,
+        "baseline_level_actions": [1667, 334, 0, 0, 0, 0, 0, 0, 0],
+        "candidate_level_actions": [1719, 282, 0, 0, 0, 0, 0, 0, 0]
+      }
+    ]
+  },
+  "protected_wins": {
+    "seed": 0,
+    "max_steps": 10000,
+    "all_scores": 100.0,
+    "actions": {
+      "tu93": 211,
+      "re86": 552,
+      "cn04": 328,
+      "ft09": 124,
+      "tr87": 242,
+      "sc25": 147,
+      "ka59": 313
+    },
+    "result": "All seven wins and total action counts exactly match the base commit."
+  },
+  "tests": {
+    "command": "MPLCONFIGDIR=/tmp/arc3-matplotlib .venv/bin/python -m unittest discover -s tests -q",
+    "passed": 146,
+    "failed": 0
+  },
+  "runtime": {
+    "arc_agi": "0.9.8",
+    "arcengine": "0.9.3",
+    "framework_commit": "135f20aaf44f13341ebc425666bf03b5cac58d3c"
+  },
+  "scope": "Original repository agent and official public ARC runtime only; no competitor, lab, external kernel, model, or dataset source used.",
+  "interpretation": "This is a small positive public-game regression gate, not an estimate or proof of unseen Kaggle score."
+}

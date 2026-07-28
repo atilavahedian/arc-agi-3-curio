@@ -29,6 +29,18 @@ dataset, model, or kernel sources. A competition submission was attempted at
 allowance on `55042869`. The v7 candidate remains queued for the next UTC
 allowance; no score is claimed.
 
+The stricter replacement kernel
+`atilavahedian/arc3-curio-v7-hardened-original`, Version 1, also completed
+successfully on Kaggle. It embeds the exact thread-safe v7 policy plus a
+top-level fault-containment boundary; 3,129 healthy-path actions were identical
+to the frozen policy, while injected simple-action and click-only failures
+returned deterministic advertised actions instead of terminating a game
+thread. Its embedded agent SHA-256 is
+`0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69`,
+and it has zero external dataset, model, or kernel sources. This hardened
+kernel replaces the plain thread-safe v7 kernel in the next-slot queue. It has
+not yet been submitted to the competition, so no leaderboard score is claimed.
+
 The account's historical **0.86** submission (`54768802`) is deliberately not
 treated as original-Curio evidence. Its pulled notebook is byte-identical to
 Git commit `80edbcc` (SHA-256

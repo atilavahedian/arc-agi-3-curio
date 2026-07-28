@@ -385,6 +385,23 @@ def flood_color(grid: Grid) -> Optional[int]:
     return color if n > GRID * GRID * FLOOD_SHARE else None
 
 
+def switch_action_profile_safe(available_actions: Any) -> bool:
+    """Reject ambiguous click profiles before the switch head probes.
+
+    A remote floor-toggle puzzle needs all four cardinal controls plus click.
+    ACTION5 is a separate transform/selection verb on the observed false-
+    activation games; letting the switch head probe there spends clicks on
+    mechanics already better served by their own model or generic fallthrough.
+    ACTION7 is allowed because it can be an extra/alias alongside the complete
+    cardinal surface and removing that profile regressed partial progress.
+    """
+    avail = {
+        int(getattr(action, "value", action)) for action in available_actions
+    }
+    required = {1, 2, 3, 4, GameAction.ACTION6.value}
+    return required <= avail and GameAction.ACTION5.value not in avail
+
+
 def components(grid: Grid) -> list[tuple[int, frozenset[Cell]]]:
     """4-connected components, skipping the background (most common) color."""
     counts: Counter[int] = Counter()
@@ -6196,6 +6213,8 @@ class MyAgent(Agent):
             return None
         avail = set(latest_frame.available_actions or [])
         if GameAction.ACTION6.value not in avail:
+            return None
+        if not switch_action_profile_safe(avail):
             return None
         # port-mode rule hygiene: alignment needs the four axis moves of
         # one magnitude — collect, per direction, the best-voted act, and

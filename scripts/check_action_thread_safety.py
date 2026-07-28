@@ -9,6 +9,8 @@ official ``Agent.do_action_request`` path with Curio loaded.
 Run from the repository root after ``make setup``::
 
     .venv/bin/python scripts/check_action_thread_safety.py --iterations 1000
+
+An alternate standalone agent source can be checked with ``--agent-source``.
 """
 from __future__ import annotations
 
@@ -60,13 +62,13 @@ class ProbeAgent:
         return raw
 
 
-def load_curio() -> None:
+def load_curio(agent_source: Path) -> None:
     """Import Curio exactly as the notebook does, installing its guard."""
     spec = importlib.util.spec_from_file_location(
-        "curio_action_thread_probe", ROOT / "agent" / "my_agent.py"
+        "curio_action_thread_probe", agent_source
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError("could not load agent/my_agent.py")
+        raise RuntimeError(f"could not load {agent_source}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -82,9 +84,11 @@ def coords_for(role: str, iteration: int) -> tuple[int, int]:
     return 63 - (iteration % 31), 63 - ((iteration * 5) % 32)
 
 
-def threaded_probe(*, patched: bool, iterations: int) -> dict[str, Any]:
+def threaded_probe(
+    *, patched: bool, iterations: int, agent_source: Path
+) -> dict[str, Any]:
     if patched:
-        load_curio()
+        load_curio(agent_source)
 
     first_set = Barrier(2, timeout=15)
     second_set = Barrier(2, timeout=15)
@@ -207,7 +211,9 @@ def process_probe() -> dict[str, Any]:
     }
 
 
-def subprocess_probe(mode: str, iterations: int) -> dict[str, Any]:
+def subprocess_probe(
+    mode: str, iterations: int, agent_source: Path
+) -> dict[str, Any]:
     completed = subprocess.run(
         [
             sys.executable,
@@ -216,6 +222,8 @@ def subprocess_probe(mode: str, iterations: int) -> dict[str, Any]:
             mode,
             "--iterations",
             str(iterations),
+            "--agent-source",
+            str(agent_source),
             "--json",
         ],
         check=True,
@@ -225,12 +233,12 @@ def subprocess_probe(mode: str, iterations: int) -> dict[str, Any]:
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def full_probe(iterations: int) -> dict[str, Any]:
+def full_probe(iterations: int, agent_source: Path) -> dict[str, Any]:
     # Separate interpreters are essential: once Curio replaces the descriptor,
     # it correctly remains installed for the life of that worker process.
-    baseline = subprocess_probe("thread-baseline", iterations)
-    fixed = subprocess_probe("thread-fixed", iterations)
-    processes = subprocess_probe("process-baseline", iterations)
+    baseline = subprocess_probe("thread-baseline", iterations, agent_source)
+    fixed = subprocess_probe("thread-fixed", iterations, agent_source)
+    processes = subprocess_probe("process-baseline", iterations, agent_source)
     passed = (
         baseline["first_action_mismatches"] == iterations
         and baseline["first_reasoning_mismatches"] == iterations
@@ -257,19 +265,37 @@ def main() -> None:
         default="all",
     )
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument(
+        "--agent-source",
+        type=Path,
+        default=ROOT / "agent" / "my_agent.py",
+        help="Curio source whose thread-local payload guard should be loaded",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.iterations < 1:
         raise SystemExit("--iterations must be positive")
 
+    agent_source = args.agent_source.resolve()
+    if not agent_source.is_file():
+        raise SystemExit(f"--agent-source does not exist: {agent_source}")
+
     if args.mode == "thread-baseline":
-        result = threaded_probe(patched=False, iterations=args.iterations)
+        result = threaded_probe(
+            patched=False,
+            iterations=args.iterations,
+            agent_source=agent_source,
+        )
     elif args.mode == "thread-fixed":
-        result = threaded_probe(patched=True, iterations=args.iterations)
+        result = threaded_probe(
+            patched=True,
+            iterations=args.iterations,
+            agent_source=agent_source,
+        )
     elif args.mode == "process-baseline":
         result = process_probe()
     else:
-        result = full_probe(args.iterations)
+        result = full_probe(args.iterations, agent_source)
 
     if args.json:
         print(json.dumps(result, sort_keys=True))

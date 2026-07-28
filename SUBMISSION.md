@@ -37,9 +37,14 @@ promise of a hidden leaderboard score or first place.
 From the repository root:
 
 ```sh
+make verify-runtime
 make package-curio-graph-v16
 make verify-curio-graph-v16
 ```
+
+`make verify-runtime` pins local evaluation to the same `arc-agi==0.9.8`,
+`arcengine==0.9.3`, and official framework commit that the current Kaggle
+competition bundle provides.
 
 The generated notebook is tracked at
 `submissions/curio-graph-v16/submission.ipynb`. Do not edit it manually; edit

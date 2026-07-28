@@ -15,11 +15,12 @@ VENV_PIP        := $(VENV)/bin/pip
 KAGGLE          := KAGGLE_API_TOKEN=$$(cat .kaggle/access_token) $(VENV)/bin/kaggle
 FRAMEWORK_REPO  := https://github.com/arcprize/ARC-AGI-3-Agents.git
 FRAMEWORK_DIR   := vendor/ARC-AGI-3-Agents
+FRAMEWORK_COMMIT := 135f20aaf44f13341ebc425666bf03b5cac58d3c
 COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 verify-local clean _check-kaggle
+.PHONY: help setup verify-runtime play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -37,17 +38,26 @@ help:
 setup: ## One-time install: venv, arc-agi, kaggle CLI, clone framework
 	$(PYTHON) -m venv $(VENV)
 	$(VENV_PIP) install --upgrade pip
-	$(VENV_PIP) install "arc-agi>=0.9.6" "kaggle>=2.2" python-dotenv pandas pyarrow
+	$(VENV_PIP) install "arc-agi==0.9.8" "arcengine==0.9.3" \
+		"kaggle>=2.2" python-dotenv pandas pyarrow
 	@if [ ! -d "$(FRAMEWORK_DIR)/.git" ]; then \
-	    mkdir -p vendor && git clone --depth 1 $(FRAMEWORK_REPO) $(FRAMEWORK_DIR); \
-	else \
-	    git -C $(FRAMEWORK_DIR) pull --ff-only; \
+	    mkdir -p vendor && git clone --no-checkout $(FRAMEWORK_REPO) $(FRAMEWORK_DIR); \
+	    git -C $(FRAMEWORK_DIR) fetch --depth 1 origin $(FRAMEWORK_COMMIT); \
+	    git -C $(FRAMEWORK_DIR) checkout --detach $(FRAMEWORK_COMMIT); \
+	elif [ "$$(git -C $(FRAMEWORK_DIR) rev-parse HEAD)" != "$(FRAMEWORK_COMMIT)" ]; then \
+	    echo "ERROR: $(FRAMEWORK_DIR) is not the Kaggle-bundled framework commit."; \
+	    echo "       Move it aside and rerun make setup; local changes are not overwritten."; \
+	    exit 1; \
 	fi
 	@# Slim agents/__init__.py so we don't need langgraph/langsmith/smolagents/etc.
 	@# (Same trick the official Stochastic Goose sample uses on Kaggle.)
 	@$(VENV_PY) scripts/slim_framework.py
+	@$(VENV_PY) scripts/verify_runtime.py
 	@echo ""
 	@echo "Setup complete. Try:  make play-local"
+
+verify-runtime: ## Check local package/framework parity with Kaggle
+	$(VENV_PY) scripts/verify_runtime.py
 
 play-local: ## Run agent/my_agent.py against ALL games (or GAME=ls20 for a single one)
 	$(VENV_PY) scripts/play_local.py $(if $(GAME),--game $(GAME)) --max-steps $(STEPS)

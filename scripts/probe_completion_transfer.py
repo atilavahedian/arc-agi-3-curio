@@ -117,6 +117,9 @@ def main() -> None:
                     "action": ("click" if self._prev_action.startswith("6:")
                                else self._prev_action),
                     "action_counter": self.action_counter,
+                    "available_actions": sorted(
+                        int(getattr(action, "value", action))
+                        for action in self._avail),
                 }
                 if self._prev_action.startswith("6:"):
                     try:

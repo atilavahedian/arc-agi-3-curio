@@ -20,7 +20,7 @@ COMP_SLUG       := arc-prize-2026-arc-agi-3
 GAME            ?=
 STEPS           ?= 200
 
-.PHONY: help setup verify-runtime play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 verify-local clean _check-kaggle
+.PHONY: help setup verify-runtime play-local notebook submit status package-curio-graph-v16 verify-curio-graph-v16 smoke-curio-graph-v16 submit-curio-graph-v16 status-curio-graph-v16 verify-local clean _check-kaggle
 
 _check-kaggle:
 	@if [ ! -s .kaggle/access_token ]; then \
@@ -86,8 +86,12 @@ status: _check-kaggle ## Show the status of your most recent Kaggle kernel run
 package-curio-graph-v16: ## Build the separate original Curio graph candidate
 	$(VENV_PY) scripts/build_curio_candidate.py
 
-verify-curio-graph-v16: package-curio-graph-v16 ## Validate Curio source identity and Kaggle metadata
+verify-curio-graph-v16: package-curio-graph-v16 ## Validate Curio source, metadata, and runtime registry
 	$(VENV_PY) scripts/validate_curio_candidate.py submissions/curio-graph-v16
+	$(VENV_PY) scripts/smoke_curio_runtime.py submissions/curio-graph-v16 --framework-dir $(FRAMEWORK_DIR)
+
+smoke-curio-graph-v16: package-curio-graph-v16 ## Import embedded agent through Kaggle-style registry and fault-smoke it
+	$(VENV_PY) scripts/smoke_curio_runtime.py submissions/curio-graph-v16 --framework-dir $(FRAMEWORK_DIR)
 
 submit-curio-graph-v16: verify-curio-graph-v16 _check-kaggle ## Push original Curio graph v16 to Kaggle
 	$(KAGGLE) kernels push -p submissions/curio-graph-v16/

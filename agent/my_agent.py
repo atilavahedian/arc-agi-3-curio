@@ -259,6 +259,9 @@ CLICK_WARM_FRAMES = 100  # diffed frames the lattice/attr detectors get
 COMPLETION_SHAPE_MIN_AREA = 2
                         # ignore one-pixel winner shapes: colorless singleton
                         # geometry aliases almost every sparse decoration
+STRUCTURAL_CURRICULUM_ACTIONS = frozenset({1, 2, 3, 4, 6, 7})
+                        # rich reversible interface: four cardinal controls,
+                        # click, and a distinct secondary/undo action
 SW_FRAMES = 30          # diffed frames before the switch planner may engage
                         # (cn04's port pre-vote always wins this race)
 SW_CYCLE_CAP = 8        # longest phase cycle a switch may close
@@ -12705,8 +12708,11 @@ class MyAgent(Agent):
             # demonstration, current visible effects may refine the prior.
             # Before the first success the snapshot is empty, so speculative
             # first-level effects cannot perturb baseline exploration.
+            profile = self._action_profile(self._avail)
+            rich_reversible = profile == STRUCTURAL_CURRICULUM_ACTIONS
             shape_source = (self._click_shape_effects
-                            if self._transfer_shape_effects else {})
+                            if self._transfer_shape_effects
+                            or rich_reversible else {})
             shape_changed, shape_tries = shape_source.get(
                 shape_key, (0, 0)) if shape_key is not None else (0, 0)
             geometry = shape_key[1] if shape_key is not None else None

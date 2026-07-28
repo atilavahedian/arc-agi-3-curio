@@ -852,6 +852,27 @@ class ClickInstanceTests(unittest.TestCase):
 
         self.assertEqual(ranked[0][0], "6:10,10")
 
+    def test_rich_reversible_interface_can_refine_before_success(self) -> None:
+        agent = self._agent()
+        rich = {1, 2, 3, 4, 6, 7}
+        agent._avail = rich
+        grid = [[0 for _x in range(64)] for _y in range(64)]
+        for y in (10, 11):
+            for x in (10, 11):
+                grid[y][x] = 5
+        grid[20][25] = grid[20][26] = 8
+        comps = self.agent_class._gx_node.__globals__["components"](grid)
+        key = agent._shape_effect_key(comps, (25, 20), rich)
+        agent._click_shape_effects[key] = [3, 3]
+        options = [
+            ("6:10,10", GameAction.ACTION6, (10, 10)),
+            ("6:25,20", GameAction.ACTION6, (25, 20)),
+        ]
+
+        ranked = agent._gx_afford_rank(grid, options)
+
+        self.assertEqual(ranked[0][0], "6:25,20")
+
     def test_unknown_twins_are_exposed_one_at_a_time(self) -> None:
         agent = self._agent()
         grid = self._twin_grid()

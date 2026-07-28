@@ -3,7 +3,7 @@
   "max_steps": 10000,
   "seed": "0",
   "aggregate": 28.93608901525148,
-  "leaderboard_estimate": 0.2893608901525148,
+  "public_game_score_percent": 28.93608901525148,
   "games": [
     {
       "game": "tu93",

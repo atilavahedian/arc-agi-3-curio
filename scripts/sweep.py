@@ -13,7 +13,9 @@ Metric recap (arc_agi/scorecard.py):
                       completed_weight / total_weight * 100)     # <= 100
     aggregate   = mean(game_score over games)                    # <= 100
 
-The Kaggle leaderboard number is `aggregate / 100`, so 1.00 is the ceiling.
+The aggregate is already a percentage-point score on the competition's
+0--100 scale.  It is a public-game development measurement, not an estimate
+of the leaderboard score: Kaggle evaluates 110 separate unseen games.
 
 Usage:
     .venv/bin/python scripts/sweep.py --max-steps 1000 --jobs 6
@@ -166,8 +168,7 @@ def main() -> None:
                 zip(r["level_actions"], r["level_baselines"]))) or "-"
         print(f"  {r['game']:6} {r['score']:6.2f}  {detail}")
 
-    print(f"\nAGGREGATE = {aggregate:.4f}   (leaderboard estimate "
-          f"{aggregate / 100:.4f})")
+    print(f"\nPUBLIC-GAME SCORE = {aggregate:.4f}%")
     print(f"games={len(ordered)} cap={args.max_steps} seed={args.seed} "
           f"wall={time.time() - started:.0f}s")
 
@@ -179,7 +180,7 @@ def main() -> None:
             "max_steps": args.max_steps,
             "seed": args.seed,
             "aggregate": aggregate,
-            "leaderboard_estimate": aggregate / 100.0,
+            "public_game_score_percent": aggregate,
             "games": ordered,
         }, indent=2))
         print(f"wrote {out}")

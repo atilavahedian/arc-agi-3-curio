@@ -10,9 +10,10 @@ where the walls are, and what the goal is — then plans toward it.
 
 ## Current evidence
 
-The latest completed competition submission scored **0.18**. Source-hash and timestamp
-auditing tied that run to commit `29e278a`; it predates multiple later solver
-capabilities. The current head has not yet received a leaderboard score.
+The latest completed competition submission scored **0.18%**. A fresh pull of
+the private Kaggle kernel proved that its embedded agent matches the current
+repository source byte-for-byte. The run completed successfully, so 0.18% is
+the current agent's real unseen-game result, not a stale-package artifact.
 
 The current source has independently verified complete local wins on seven
 official campaigns: `tu93` (9 levels, 211 actions), `re86` (8 levels, 552
@@ -25,12 +26,12 @@ The scoring metric squares `human_baseline_actions / agent_actions`, caps the
 per-level value at 1.15, weights later levels more heavily, and averages across
 games. Fast wins are therefore worth much more than slow exploration.
 
-**The leaderboard maximum is 1.00.** A game's score is also capped at
+**The leaderboard maximum is 100%, not 1.00.** A game's score is capped at
 `completed_weight / total_weight * 100`, which is exactly 100 when every level
-is completed, and the leaderboard prints the cross-game mean over 100. In
-practice scoring is close to binary: a win scores ~100, and a game that
-completes a level or two scores under 3, because the squared efficiency term
-crushes anything slow. Only whole-game wins move the number.
+is completed, and the cross-game mean is reported directly in percentage
+points. In practice local scoring is close to binary: a win scores ~100, and a
+game that completes a level or two usually scores under 3 because the squared
+efficiency term crushes anything slow.
 
 ## How it works
 
@@ -60,21 +61,21 @@ The 0.18 result is far below the goal, and the measurements in `RESULTS.md`
 explain why more precisely than "generalization is hard".
 
 Ablation settles which half of the agent matters. With every family head
-disabled (`CURIO_GENERIC_ONLY=1`) the agent scores 0.14 aggregate and wins
-nothing at all, against 29.49 for the full agent. A generic core worth 0.0014
-cannot produce a 0.18 hidden result, so the family heads are already firing on
-hidden games and the hidden set is variants of the public families. Making an
-existing head robust to layout variation therefore transfers; more novelty
-search does not, and two attempts to improve the generic explorer were measured
-and rejected.
+disabled (`CURIO_GENERIC_ONLY=1`) the agent scores 0.14% on the 25 public games
+and wins nothing, against 29.49% for the full agent. Kaggle evaluates a separate
+set of 110 unseen games (55 public-leaderboard and 55 private-leaderboard), so
+the public-game result cannot be used as a leaderboard estimate. The unchanged
+0.18% result after adding public-family wins is evidence that those specialized
+heads did not transfer; it is not evidence that the hidden games are variants
+of the public families.
 
 The remaining wall is not brittleness. Six heads were traced to their exact
 bail-out on the first level they fail, and the games stop on mechanics no head
 models — peg solitaire, conserved-transfer networks, remote manipulators.
-Because a game is capped at `completed_weight/total_weight*100`, partial
-progress cannot compensate: every remaining diagnosed fix together is worth
-about +0.0025 on the leaderboard. Further score requires new gated heads that
-win whole games.
+Because a game is capped at `completed_weight/total_weight*100`, slow partial
+progress contributes little on the public development set. Further unseen-game
+score requires genuinely general online mechanism discovery, while complete
+public-game wins remain useful regression tests rather than hidden-score proof.
 
 No external solver notebook, model, dataset, or kernel is part of the Curio
 candidate; `scripts/validate_curio_candidate.py` enforces that on every build.

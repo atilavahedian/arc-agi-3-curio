@@ -24,33 +24,35 @@ loss can be attributed instead of guessed.
 
 Full official set, seed 0, 10,000-action cap:
 
-| Configuration | Aggregate | Leaderboard estimate |
-|---|---:|---:|
-| head before this work | 28.9361 | 0.2894 |
-| head after the sort-parser fix | 29.4916 | 0.2949 |
-| `CURIO_GENERIC_ONLY=1` | 0.1433 | 0.0014 |
+| Configuration | Public-game score |
+|---|---:|
+| head before this work | 28.9361% |
+| head after the sort-parser fix | 29.4916% |
+| `CURIO_GENERIC_ONLY=1` | 0.1433% |
 
-**The metric cannot exceed 1.00.** A per-game score is
+**The metric tops out at 100%.** A per-game score is
 `min(weighted_level_avg, completed_weight/total_weight*100)`, and that cap is
-exactly 100 when every level is completed, so the aggregate — and the
-leaderboard number, which is the aggregate over 100 — tops out at 1.00. This is
-observed, not just derived: `ft09` beats the human baseline on all six levels
-(124 actions against 208) and still scores exactly 100.00.
+exactly 100 when every level is completed. The cross-game mean is reported
+directly in percentage points; it is not divided by 100. This is observed, not
+just derived: `ft09` beats the human baseline on all six levels (124 actions
+against 208) and still scores exactly 100.00%.
 
 Two facts follow, and they set the priorities.
 
-**Scoring is effectively binary.** Every win sits at the per-game cap of 100
-and every non-win scores under 3. The metric squares `baseline/actions`, so a
-level completed in 9,990 actions is worth ~0, and a game's score is also capped
-at `completed_weight/total_weight*100` — completing 1 of 8 levels caps that
-game at 2.8 no matter how fast it was. Partial progress cannot move the
-aggregate; only wins can.
+**Scoring heavily favors complete, efficient play.** Every current local win
+sits at the per-game cap of 100 and every current non-win scores under 3. The
+metric squares `baseline/actions`, so a level completed in 9,990 actions is
+worth ~0, and a game's score is also capped at
+`completed_weight/total_weight*100` — completing 1 of 8 levels caps that game
+at 2.8 no matter how fast it was. Partial progress can move the score, but
+complete wins dominate this public-game development measurement.
 
-**The family heads carry the entire score.** The generic core wins zero games
-alone. A core worth 0.0014 cannot explain the 0.18 hidden leaderboard result,
-so the family heads are already firing on hidden games: the hidden set is
-variants of the public families. Robustness of those heads to layout variation
-is therefore the transferable work, and more generic search is not.
+**The family heads carry the public-game score.** The generic core wins zero
+public games alone and scores 0.1433%, versus 29.4916% for the complete agent.
+Kaggle evaluates a separate set of 110 unseen games, half for each leaderboard,
+so neither number predicts the hidden result. The unchanged 0.18% Kaggle score
+after adding public-family wins shows that those gains did not transfer and
+invalidates the earlier hidden-variant assumption.
 
 ## Generic-core exploration: measured dead ends
 
@@ -99,9 +101,9 @@ credit:
 The pattern is consistent and worth stating plainly: these games stop on
 *unmodelled mechanics*, not on brittleness. Because a game is capped at
 `completed_weight/total_weight*100`, clearing 3 of 8 levels can never exceed
-16.67, so partial progress cannot move the aggregate materially. Landing every
-remaining item above is worth roughly +0.25 aggregate, i.e. +0.0025 on the
-leaderboard. Further score requires new gated heads that win *whole* games.
+16.67, so slow partial progress moves the public-game mean only slightly.
+Landing every remaining item above is worth roughly +0.25 public percentage
+points. That is useful local evidence, not a hidden-score prediction.
 
 ## Clean 25-game sweep
 

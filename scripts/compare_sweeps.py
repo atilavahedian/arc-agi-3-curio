@@ -57,8 +57,8 @@ def main() -> None:
                   f" {a['actions'] if a else 0:6}{flag}")
 
     ba, aa = before["aggregate"], after["aggregate"]
-    print(f"\nAGGREGATE {ba:.4f} -> {aa:.4f}  ({aa - ba:+.4f})")
-    print(f"leaderboard estimate {ba / 100:.4f} -> {aa / 100:.4f}")
+    print(f"\nPUBLIC-GAME SCORE {ba:.4f}% -> {aa:.4f}% "
+          f"({aa - ba:+.4f} points)")
     if gains:
         print(f"new wins:  {', '.join(gains)}")
     if losses:

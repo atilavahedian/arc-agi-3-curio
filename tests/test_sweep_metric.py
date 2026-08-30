@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import random
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,15 @@ class SweepMetricScaleTests(unittest.TestCase):
             data = json.loads((ROOT / "runs" / name).read_text())
             self.assertNotIn("leaderboard_estimate", data)
             self.assertEqual(data["public_game_score_percent"], data["aggregate"])
+
+    def test_environment_seed_replays_python_and_numpy_streams(self) -> None:
+        import numpy as np
+
+        self.assertEqual(self.sweep.seed_environment(12345), 12345)
+        first = (random.random(), float(np.random.random()))
+        self.sweep.seed_environment(12345)
+        second = (random.random(), float(np.random.random()))
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

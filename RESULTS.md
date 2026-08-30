@@ -300,12 +300,14 @@ Verification at promotion:
 - independent read-only review: no blocker;
 - protected complete wins: unchanged.
 
-## Current-main seed-diversity gate (2026-08-30)
+## Current-main legacy-fallback seed-diversity gate (2026-08-30)
 
 The unchanged original solver was evaluated on the 18 official public games
-that are not protected complete wins, using the current official engine,
-2,000 actions per game, and three deterministic seeds.  This is a development
-proxy only; it is not an estimate of the hidden Kaggle score.
+that are not protected complete wins, using the current official engine with
+`CURIO_EXPLORER` unset, 2,000 actions per game, and three agent seeds.  This is
+a development proxy for the legacy fallback only; it is not a graph-mode gate
+or an estimate of the hidden Kaggle score.  These historical runs predate the
+separate deterministic environment seed added to `scripts/sweep.py`.
 
 | Seed | 18-game aggregate | Notable difference |
 |---:|---:|---|
@@ -313,9 +315,16 @@ proxy only; it is not an estimate of the hidden Kaggle score.
 | 7 | 2.0591% | lower `dc22`; did not complete `m0r0` level 1 |
 | 42 | 2.0565% | lower `dc22`; did not complete `m0r0` level 1 |
 
-Seed 0 remains the production default.  The exact per-game scorecards are in
+Seed 0 remains the legacy/hardened-v7 default.  The exact per-game scorecards are in
 `runs/seed_diversity_current_{0,7,42}_cap2000.json`.  No solver code changed in
 this gate.
+
+All subsequent paired sweeps also pin the game environment with
+`--environment-seed` (default `12345`) in addition to `CURIO_SEED`.  A
+two-process graph-mode replay on randomized `lf52` matched exactly after
+excluding wall-clock seconds: score `0.1420388585`, two completed levels, and
+level action counts `[166, 566, 269]`.  The full suite passed 152/152 after the
+harness change.
 
 ## Next measured targets
 

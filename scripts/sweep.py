@@ -32,6 +32,7 @@ import io
 import json
 import logging
 import os
+import random
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -72,9 +73,27 @@ def game_score(level_scores: list[float], completed: list[bool]) -> float:
     return min(total / total_w, max_w / total_w * 100.0)
 
 
+def seed_environment(seed: int) -> int:
+    """Pin global RNGs used by official game implementations.
+
+    ``CURIO_SEED`` controls the agent's private ``random.Random`` instance,
+    but at least one official game also samples from NumPy's global RNG.
+    Paired baseline/candidate sweeps must therefore pin both global streams or
+    they can compare different game layouts.
+    """
+    import numpy as np
+
+    normalized = int(seed) % (2**32)
+    random.seed(normalized)
+    np.random.seed(normalized)
+    return normalized
+
+
 def run_one(game_id: str, max_steps: int, seed: str,
-            env: dict[str, str], agent_source: str) -> dict[str, Any]:
+            environment_seed: int, env: dict[str, str],
+            agent_source: str) -> dict[str, Any]:
     """Play one game in this process and return its per-level detail."""
+    seed_environment(environment_seed)
     os.environ.update(env)
     os.environ["CURIO_SEED"] = seed
     os.environ.setdefault("MPLBACKEND", "agg")
@@ -133,6 +152,12 @@ def main() -> None:
                    help="Parallel worker processes.")
     p.add_argument("--seed", default=os.environ.get("CURIO_SEED", "0"))
     p.add_argument(
+        "--environment-seed",
+        type=int,
+        default=12345,
+        help="Global Python/NumPy seed for deterministic game layouts.",
+    )
+    p.add_argument(
         "--agent-source",
         type=Path,
         default=ROOT / "agent" / "my_agent.py",
@@ -158,6 +183,7 @@ def main() -> None:
                 g,
                 args.max_steps,
                 args.seed,
+                args.environment_seed,
                 passthrough,
                 str(agent_source),
             ): g
@@ -189,6 +215,7 @@ def main() -> None:
 
     print(f"\nPUBLIC-GAME SCORE = {aggregate:.4f}%")
     print(f"games={len(ordered)} cap={args.max_steps} seed={args.seed} "
+          f"environment_seed={args.environment_seed} "
           f"wall={time.time() - started:.0f}s")
 
     if args.out:
@@ -198,6 +225,7 @@ def main() -> None:
             "label": args.label,
             "max_steps": args.max_steps,
             "seed": args.seed,
+            "environment_seed": args.environment_seed,
             "agent_source": str(agent_source),
             "aggregate": aggregate,
             "public_game_score_percent": aggregate,

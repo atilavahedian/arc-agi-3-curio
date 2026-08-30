@@ -12704,18 +12704,17 @@ class MyAgent(Agent):
             changed, tries = self._click_effects.get(sig, (0, 0))
             class_score = (changed + 2) / (tries + 3)
             shape_key = self._shape_effect_key(comps, coords, self._avail)
-            # A completed level arms structural generalization; after that
-            # demonstration, current visible effects may refine the prior.
-            # Before the first success the snapshot is empty, so speculative
-            # first-level effects cannot perturb baseline exploration.
-            profile = self._action_profile(self._avail)
-            rich_reversible = profile == STRUCTURAL_CURRICULUM_ACTIONS
-            shape_source = (self._click_shape_effects
-                            if self._transfer_shape_effects
-                            or self._completion_click_shapes
-                            or rich_reversible else {})
-            shape_changed, shape_tries = shape_source.get(
-                shape_key, (0, 0)) if shape_key is not None else (0, 0)
+            # A completed level arms structural generalization, but the
+            # completion label is the only source allowed to perturb the
+            # current ordering.  Do not let a productive click observed on a
+            # previous level refine unrelated same-shaped controls: that
+            # broad prior varied by seed and could slow a fresh board.  The
+            # structural tier above still promotes an unambiguous geometry
+            # only when its exact action profile was the demonstrated winner.
+            shape_changed = shape_tries = 0
+            if shape_key is not None and shape_key in self._completion_click_shapes:
+                shape_changed, shape_tries = self._click_shape_effects.get(
+                    shape_key, (0, 0))
             geometry = shape_key[1] if shape_key is not None else None
             shape_score = ((shape_changed + 2) / (shape_tries + 3)
                            if shape_tries and geometry is not None

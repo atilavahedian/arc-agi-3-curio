@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "experiment": "gctv2_completion_curriculum_recheck",
+  "baseline_commit": "6b61ac0",
+  "candidate_commit": "33d74c3",
+  "candidate_description": "Prior completion curriculum rebased onto current main, with unrelated live shape refinement removed",
+  "engine": {
+    "source": "official ARC local engine",
+    "game_version": "lf52/271a04aa",
+    "explorer": "graph",
+    "max_steps": 4000,
+    "numpy_seed": 12345,
+    "agent_seeds": [0, 7, 42]
+  },
+  "comparison": {
+    "baseline_mean_score_percent": 0.11080012808020147,
+    "candidate_mean_score_percent": 0.06649881771711603,
+    "absolute_mean_gain_percent": -0.04430131036308544,
+    "wins_lost": [
+      {"seed": 0, "baseline_levels": 2, "candidate_levels": 1},
+      {"seed": 7, "baseline_levels": 2, "candidate_levels": 1}
+    ],
+    "baseline": [
+      {"seed": 0, "score": 0.14203885854311932, "levels_completed": 2, "actions": [166, 566, 3269]},
+      {"seed": 7, "score": 0.12439574544599057, "levels_completed": 2, "actions": [168, 639, 3194]},
+      {"seed": 42, "score": 0.06596578025149452, "levels_completed": 1, "actions": [168, 3833]}
+    ],
+    "candidate": [
+      {"seed": 0, "score": 0.06756489264835905, "levels_completed": 1, "actions": [166, 3835]},
+      {"seed": 7, "score": 0.06596578025149452, "levels_completed": 1, "actions": [168, 3833]},
+      {"seed": 42, "score": 0.06596578025149452, "levels_completed": 1, "actions": [168, 3833]}
+    ]
+  },
+  "verdict": "reject",
+  "reason": "The completion-geometry tier changes action ordering on a fresh level and loses two second-level completions under a fixed visual RNG; the older positive result does not reproduce on the current engine fixture.",
+  "provenance": {
+    "game_ids_in_production_logic": 0,
+    "fixed_coordinates_in_production_logic": 0,
+    "fixed_colors_in_production_logic": 0,
+    "external_sources": 0,
+    "note": "The listed public game is an evaluation fixture only; no game-specific condition was added to production code."
+  }
+}

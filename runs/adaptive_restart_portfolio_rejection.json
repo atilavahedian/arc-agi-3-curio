@@ -1,0 +1,127 @@
+{
+  "experiment": "adaptive-cross-life-portfolio",
+  "status": "rejected",
+  "base_commit": "6b61ac0",
+  "scope": "generic unseen-game exploration only",
+  "policy": {
+    "toggle": "CURIO_PORTFOLIO=adaptive",
+    "modes": [
+      "incumbent graph explorer",
+      "reseeded top-salience graph tie-breaks after causal failure",
+      "graph-safe legacy revisit policy after a second causal failure"
+    ],
+    "triggers": [
+      "GAME_OVER",
+      "256 steps without a novel masked state"
+    ],
+    "reset_on_level_completion": true,
+    "dispatch_inputs": [
+      "observed GAME_OVER",
+      "observed stagnation",
+      "observed level completion",
+      "observed previous state/action edge"
+    ],
+    "forbidden_dispatches": [
+      "game IDs",
+      "level IDs",
+      "fixed colors",
+      "fixed coordinates",
+      "scripted paths",
+      "competitor or lab code",
+      "external artifacts"
+    ]
+  },
+  "evaluation": {
+    "games": [
+      "ar25",
+      "su15",
+      "m0r0",
+      "lp85",
+      "dc22",
+      "sp80",
+      "g50t",
+      "sb26",
+      "lf52",
+      "bp35",
+      "s5i5",
+      "r11l",
+      "sk48",
+      "wa30",
+      "vc33",
+      "ls20",
+      "cd82",
+      "tn36"
+    ],
+    "max_steps": 2000,
+    "seeds": {
+      "0": {
+        "baseline_percent": 2.073259076327857,
+        "candidate_percent": 2.0849433099655497,
+        "delta_percent": 0.011684233637692554,
+        "verdict": "improved"
+      },
+      "7": {
+        "baseline_percent": 2.103369561692407,
+        "candidate_percent": 2.081453724388308,
+        "delta_percent": -0.021915837304099295,
+        "verdict": "regressed"
+      }
+    },
+    "pooled_mean_percent": {
+      "baseline": 2.088314319010132,
+      "candidate": 2.0831985171769287,
+      "delta": -0.0051158018332033706
+    },
+    "representative_regressions": [
+      {
+        "game": "r11l",
+        "seed": 0,
+        "baseline_score": 0.17734394465696404,
+        "candidate_score": 0.02798093827485953,
+        "delta": -0.1493630063821045
+      },
+      {
+        "game": "r11l",
+        "seed": 7,
+        "baseline_score": 0.17734394465696404,
+        "candidate_score": 0.02798093827485953,
+        "delta": -0.1493630063821045
+      },
+      {
+        "game": "sp80",
+        "seed": 7,
+        "baseline_score": 0.04737578340576751,
+        "candidate_score": 0.011488647765763919,
+        "delta": -0.03588713564000359
+      },
+      {
+        "game": "vc33",
+        "seed": 7,
+        "baseline_score": 0.08299937006890766,
+        "candidate_score": 0.02520215487064911,
+        "delta": -0.05779721519825855
+      }
+    ]
+  },
+  "verification": {
+    "focused_portfolio_tests": {
+      "command": "python -m unittest discover -s tests -p test_adaptive_restart_portfolio.py",
+      "tests": 8,
+      "failures": 0,
+      "errors": 0
+    },
+    "thread_safety": {
+      "command": "python scripts/check_action_thread_safety.py --iterations 2 --agent-source agent/my_agent.py --json",
+      "fixed_mismatches": 0,
+      "processes": 0
+    },
+    "protected_win_gate": "not run after broad gate rejection",
+    "third_nonwinner_seed": "not run after broad gate rejection"
+  },
+  "decision": {
+    "promote": false,
+    "reason": "A seed-0 gain was not robust: seed 7 regressed and the two-seed pooled mean fell by 0.0051158018332033706 percentage points.",
+    "source_commit": null,
+    "submission_or_push": false
+  }
+}

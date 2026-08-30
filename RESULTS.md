@@ -40,8 +40,10 @@ thread. Its embedded agent SHA-256 is
 `0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69`,
 and it has zero external dataset, model, or kernel sources. This hardened
 kernel replaces the plain thread-safe v7 kernel in the next-slot queue. As of
-the 2026-08-30 audit it still had not been submitted to the competition, so no
-leaderboard score is claimed.
+the 2026-08-30 audit it still had not been submitted to the competition.
+Competition submission `55900124` was then accepted at
+2026-08-30T21:12:20Z and is pending; no leaderboard score is claimed until
+Kaggle completes it.
 
 The account's historical **0.86** submission (`54768802`) is deliberately not
 treated as original-Curio evidence. Its pulled notebook is byte-identical to

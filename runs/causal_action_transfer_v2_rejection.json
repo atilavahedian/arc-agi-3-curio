@@ -1,0 +1,45 @@
+{
+  "hypothesis": "weak position-and-color-free component geometry plus prior-frame action-profile causal bonus",
+  "provenance": "original current-engine-native experiment; no completion labels, IDs, fixed coordinates, colors, scripted paths, or external solver code",
+  "branch_base": "6b61ac0",
+  "target_fixture": {
+    "game": "lf52",
+    "engine_version": "271a04aa",
+    "max_actions": 4000,
+    "numpy_seed": 12345,
+    "agent_seeds": ["0", "7", "42"],
+    "baseline": {
+      "0": {"score": 0.14203885854311932, "levels": 2, "level_actions": [166, 566, 3269]},
+      "7": {"score": 0.12439574544599057, "levels": 2, "level_actions": [168, 639, 3194]},
+      "42": {"score": 0.06596578025149452, "levels": 1, "level_actions": [168, 3833]}
+    },
+    "candidate": {
+      "0": {"score": 0.06756489264835905, "levels": 1, "level_actions": [166, 3835]},
+      "7": {"score": 0.12439574544599057, "levels": 2, "level_actions": [168, 639, 3194]},
+      "42": {"score": 0.06596578025149452, "levels": 1, "level_actions": [168, 3833]}
+    },
+    "baseline_mean": 0.11080012808020147,
+    "candidate_mean": 0.08597547278194805,
+    "delta": -0.02482465529825342,
+    "verdict": "reject"
+  },
+  "protected_win_gate": {
+    "max_actions": 1000,
+    "numpy_seed": 12345,
+    "games": {
+      "tu93": {"baseline_actions": 211, "candidate_actions": 211, "baseline_score": 100.0, "candidate_score": 100.0},
+      "re86": {"baseline_actions": 552, "candidate_actions": 552, "baseline_score": 100.0, "candidate_score": 100.0},
+      "cn04": {"baseline_actions": 328, "candidate_actions": 328, "baseline_score": 100.0, "candidate_score": 100.0},
+      "ft09": {"baseline_actions": 124, "candidate_actions": 124, "baseline_score": 100.0, "candidate_score": 100.0},
+      "tr87": {"baseline_actions": 242, "candidate_actions": 242, "baseline_score": 100.0, "candidate_score": 100.0},
+      "sc25": {"baseline_actions": 147, "candidate_actions": 147, "baseline_score": 100.0, "candidate_score": 100.0},
+      "ka59": {"baseline_actions": 313, "candidate_actions": 313, "baseline_score": 100.0, "candidate_score": 100.0}
+    },
+    "verdict": "no protected regression"
+  },
+  "raw_logs": {
+    "target": "/private/tmp/causal-action-transfer-v2-{baseline,candidate}-{0,7,42}.log",
+    "protected": "/private/tmp/causal-action-transfer-v2-{baseline,candidate}-{tu93,re86,cn04,ft09,tr87,sc25,ka59}.log"
+  },
+  "decision": "Do not package or promote the causal transfer changes; seed 0 loses the second completion and the three-seed mean regresses."
+}

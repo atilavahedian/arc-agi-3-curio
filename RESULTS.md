@@ -4,20 +4,21 @@ This file records measured results for the original Curio agent. Local public
 environments are regression and development evidence; they are not a prediction
 of the hidden ARC-AGI-3 leaderboard score.
 
-Last updated: 2026-07-28 UTC.
+Last updated: 2026-08-30 UTC.
 
 ## Official Kaggle evidence
 
-The latest completed original-Curio submission (`54980829`, submitted
-2026-07-25) scored **0.18**. A fresh pull of that private Kaggle kernel proved
+The latest completed original-Curio submission (`55042869`, submitted
+2026-07-28) scored **0.18**. It added thread-local Swarm action payloads and an
+informative frontier reset, but did not improve the hidden score. The preceding
+submission (`54980829`, submitted 2026-07-25) also scored **0.18**. A fresh pull
+of that private Kaggle kernel proved
 that its embedded agent matches repository commit `40f4c57` byte-for-byte:
 SHA-256 `e7132bb6659a48ed84e80c0d73aa5dc09c85ad110b6c701d51a07e6ba4fa61c9`.
 The kernel completed successfully, and the candidate contains no dataset,
 kernel, or model sources beyond the official competition source. The low score
 is therefore a generalization result, not a stale-package or runtime-failure
-artifact. Submission `55042869` (the original thread-isolation and informative-
-frontier candidate) was still pending when this file was updated; it has no
-claimed score yet.
+artifact.
 
 The separate private kernel
 `atilavahedian/arc3-curio-v7-threadsafe-original`, Version 1, completed
@@ -38,8 +39,9 @@ returned deterministic advertised actions instead of terminating a game
 thread. Its embedded agent SHA-256 is
 `0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69`,
 and it has zero external dataset, model, or kernel sources. This hardened
-kernel replaces the plain thread-safe v7 kernel in the next-slot queue. It has
-not yet been submitted to the competition, so no leaderboard score is claimed.
+kernel replaces the plain thread-safe v7 kernel in the next-slot queue. As of
+the 2026-08-30 audit it still had not been submitted to the competition, so no
+leaderboard score is claimed.
 
 The account's historical **0.86** submission (`54768802`) is deliberately not
 treated as original-Curio evidence. Its pulled notebook is byte-identical to

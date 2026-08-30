@@ -326,6 +326,21 @@ excluding wall-clock seconds: score `0.1420388585`, two completed levels, and
 level action counts `[166, 566, 269]`.  The full suite passed 152/152 after the
 harness change.
 
+The exact hardened-v7 source submitted as Kaggle ref `55900124` (SHA-256
+`0153b60a69647fb4dee093cbc41c1a464e348e58ea73a72d1757e3b9c113be69`)
+was then rerun on the same 18-game, 2,000-action gate with environment seed
+`12345`:
+
+| Agent seed | 18-game aggregate |
+|---:|---:|
+| **0** | **1.0212%** |
+| 42 | 1.0195% |
+| 7 | 0.9954% |
+
+The deterministic result confirms seed 0 as the strongest tested setting for
+the exact submitted lineage.  Per-game scorecards are stored in
+`runs/v7_hardened_seed_{0,7,42}_env12345_cap2000.json`.
+
 ## Next measured targets
 
 - `dc22`: current clean sweep is 4 levels. An original, frame-derived remote

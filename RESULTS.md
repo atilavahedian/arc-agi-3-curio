@@ -300,6 +300,23 @@ Verification at promotion:
 - independent read-only review: no blocker;
 - protected complete wins: unchanged.
 
+## Current-main seed-diversity gate (2026-08-30)
+
+The unchanged original solver was evaluated on the 18 official public games
+that are not protected complete wins, using the current official engine,
+2,000 actions per game, and three deterministic seeds.  This is a development
+proxy only; it is not an estimate of the hidden Kaggle score.
+
+| Seed | 18-game aggregate | Notable difference |
+|---:|---:|---|
+| **0** | **2.1404%** | best `dc22` partial; retained `m0r0` level 1 |
+| 7 | 2.0591% | lower `dc22`; did not complete `m0r0` level 1 |
+| 42 | 2.0565% | lower `dc22`; did not complete `m0r0` level 1 |
+
+Seed 0 remains the production default.  The exact per-game scorecards are in
+`runs/seed_diversity_current_{0,7,42}_cap2000.json`.  No solver code changed in
+this gate.
+
 ## Next measured targets
 
 - `dc22`: current clean sweep is 4 levels. An original, frame-derived remote
